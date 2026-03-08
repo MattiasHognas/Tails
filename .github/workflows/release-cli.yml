@@ -1,0 +1,192 @@
+name: Release CLI
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build-cli:
+    name: Build CLI for ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact_name: rag-cli
+            asset_name: rag-cli-linux-x86_64
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            artifact_name: rag-cli
+            asset_name: rag-cli-linux-aarch64
+          #- os: macos-latest
+          #  target: x86_64-apple-darwin
+          #  artifact_name: rag-cli
+          #  asset_name: rag-cli-macos-x86_64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact_name: rag-cli
+            asset_name: rag-cli-macos-aarch64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact_name: rag-cli.exe
+            asset_name: rag-cli-windows-x86_64.exe
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.90.0
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+          cache-all-crates: true
+
+      - name: Build CLI
+        uses: ClementTsang/cargo-action@v0.0.7
+        with:
+          command: build
+          args: --package rag-cli --release --target ${{ matrix.target }}
+          use-cross: true
+          cross-version: 0.2.5
+
+      #- name: Strip binary (Linux/macOS)
+      #  if: matrix.os != 'windows-latest'
+      #  run: strip target/${{ matrix.target }}/release/${{ matrix.artifact_name }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}
+          path: target/${{ matrix.target }}/release/${{ matrix.artifact_name }}
+          if-no-files-found: error
+
+  create-release:
+    name: Create Release
+    needs: build-cli
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v5
+        with:
+          path: artifacts
+
+      - name: Copy installer scripts to artifacts
+        run: |
+          cp install.sh artifacts/
+          cp install.ps1 artifacts/
+
+      - name: Generate Release Documentation
+        id: generate_docs
+        env:
+          GH_TOKEN: ${{ secrets.CUSTOM_GITHUB_TOKEN }}
+        run: |
+          # Get the current tag
+          CURRENT_TAG="${GITHUB_REF#refs/tags/}"
+          echo "Current tag: $CURRENT_TAG"
+          
+          # Get the previous tag
+          PREVIOUS_TAG=$(git describe --tags --abbrev=0 "${CURRENT_TAG}^" 2>/dev/null || true)
+          
+          if [ -z "$PREVIOUS_TAG" ] || [ "$PREVIOUS_TAG" = "$CURRENT_TAG" ]; then
+            echo "No previous tag found, using first commit"
+            PREVIOUS_TAG=$(git rev-list --max-parents=0 HEAD)
+          fi
+          
+          echo "Previous tag: $PREVIOUS_TAG"
+          
+          # Create release notes file
+          cat > artifacts/RELEASE_NOTES.md << 'EOF'
+          # Release Notes
+          
+          This release includes the following changes from merged pull requests.
+          
+          ## What's Changed
+          
+          EOF
+          
+          # Get all merged PRs between the tags
+          echo "Fetching PRs between $PREVIOUS_TAG and $CURRENT_TAG..."
+          
+          # Get commit range
+          COMMITS=$(git log --no-decorate "$PREVIOUS_TAG".."$CURRENT_TAG" --grep="Merge pull request" --format="%H %s")
+          
+          if [ -z "$COMMITS" ]; then
+            echo "No merged PRs found in this release." >> artifacts/RELEASE_NOTES.md
+          else
+            # Parse PR numbers from commit messages and fetch PR details
+            # Use process substitution to avoid subshell issue with pipe
+            while IFS= read -r commit_line; do
+              if [ -z "$commit_line" ]; then
+                continue
+              fi
+              
+              # Extract PR number using sed - only match "Merge pull request #N" pattern
+              PR_NUMBER=$(echo "$commit_line" | sed -n 's/^Merge pull request #\([0-9]\+\).*/\1/p')
+              
+              if [ -n "$PR_NUMBER" ]; then
+                echo "Fetching details for PR #$PR_NUMBER..."
+                
+                # Fetch PR details using GitHub CLI (available in GitHub Actions)
+                PR_TITLE=$(gh pr view "$PR_NUMBER" --json title -q .title 2>/dev/null || echo "")
+                PR_URL="${{ github.server_url }}/${{ github.repository }}/pull/$PR_NUMBER"
+                PR_AUTHOR=$(gh pr view "$PR_NUMBER" --json author -q .author.login 2>/dev/null || echo "unknown")
+                PR_BODY=$(gh pr view "$PR_NUMBER" --json body -q .body 2>/dev/null || echo "")
+                
+                # If gh pr view failed, extract title from commit message as fallback
+                if [ -z "$PR_TITLE" ]; then
+                  COMMIT_MSG=$(echo "$commit_line" | sed 's/^[^ ]* //')
+                  PR_TITLE=$(echo "$COMMIT_MSG" | sed -E 's/Merge pull request #[0-9]+ from [^ ]+\/[^ ]+ //')
+                fi
+                
+                # Add to release notes with improved formatting
+                echo "### $PR_TITLE" >> artifacts/RELEASE_NOTES.md
+                echo "" >> artifacts/RELEASE_NOTES.md
+                echo "**Author:** @$PR_AUTHOR  " >> artifacts/RELEASE_NOTES.md
+                echo "**PR:** [#$PR_NUMBER]($PR_URL)" >> artifacts/RELEASE_NOTES.md
+                echo "" >> artifacts/RELEASE_NOTES.md
+                
+                if [ -n "$PR_BODY" ]; then
+                  echo "$PR_BODY" >> artifacts/RELEASE_NOTES.md
+                  echo "" >> artifacts/RELEASE_NOTES.md
+                fi
+                
+                echo "---" >> artifacts/RELEASE_NOTES.md
+                echo "" >> artifacts/RELEASE_NOTES.md
+              fi
+            done < <(echo "$COMMITS")
+          fi
+          
+          # Add footer
+          cat >> artifacts/RELEASE_NOTES.md << EOF
+          
+          ## Full Changelog
+          
+          **Full Changelog**: ${{ github.server_url }}/${{ github.repository }}/compare/$PREVIOUS_TAG...$CURRENT_TAG
+          EOF
+          
+          echo "Release notes generated successfully!"
+          cat artifacts/RELEASE_NOTES.md
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/**/*
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          token: ${{ secrets.CUSTOM_GITHUB_TOKEN }}

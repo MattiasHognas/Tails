@@ -1,0 +1,30 @@
+# Build artifacts (keep target/release for pre-built binaries)
+target/debug/
+Cargo.lock
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Git
+.git/
+.github/
+
+# Documentation and configs
+README.md
+*.md
+
+# Temporary files
+*.tmp
+tmp/
+
+# Coverage reports
+lcov.info
+*.profraw
+*.profdata

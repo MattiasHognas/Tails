@@ -1,0 +1,3 @@
+[workspace]
+members = ["crates/rag-core", "crates/rag-api", "crates/rag-cli", "crates/rag-indexer"]
+resolver = "2"

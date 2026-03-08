@@ -1,0 +1,33 @@
+# cargo-mutants configuration
+# See https://mutants.rs/configuration.html for details
+
+# Exclude directories from mutation testing
+exclude_globs:
+  - "target/**"
+  - "**/tests/**"
+  - "**/*test*.rs"
+
+# Test timeout (auto-detected by default)
+# timeout: 20
+
+# Minimum test time to run
+# minimum_test_time: 1
+
+# Additional cargo build arguments
+# build_args: []
+
+# Additional cargo test arguments  
+# test_args: []
+
+# Exclude specific mutants (can be added as we identify false positives)
+# exclude_mutants:
+#   - "crates/rag-core/src/chunk.rs:18:28"  # Known timeout issue
+
+# Jobs to run in parallel (defaults to CPU count)
+# jobs: 4
+
+# Show caught mutants in output
+# show_caught: false
+
+# Show unviable mutants in output
+# show_unviable: false
