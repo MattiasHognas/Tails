@@ -45,8 +45,8 @@ The server chooses `K` dynamically — no `--k` flag needed.
 
 - Rust (latest stable)
 - Docker (for containerization)
-- NASM (for cryptographic aws_lc_rs feature)
-- CMake (for cryptographic aws_lc_rs feature).
+- ~~NASM (for cryptographic aws_lc_rs feature)~~ - NO LONGER REQUIRED, using native-tls instead, leaving this here in case I decide to move back to rustls in the future for better performance
+- ~~CMake (for cryptographic aws_lc_rs feature)~~ - NO LONGER REQUIRED, using native-tls instead, leaving this here in case I decide to move back to rustls in the future for better performance
 
 ## Environment Variables
 
