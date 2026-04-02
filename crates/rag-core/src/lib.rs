@@ -38,6 +38,9 @@ pub(crate) mod test_support {
     impl Drop for EnvVarGuard {
         fn drop(&mut self) {
             unsafe {
+                // SAFETY: All tests that mutate process environment variables hold
+                // `ENV_LOCK` for their full duration, including this guard's drop.
+                // That serialization prevents concurrent env access from these tests.
                 match &self.value {
                     Some(value) => std::env::set_var(self.key, value),
                     None => std::env::remove_var(self.key),
