@@ -167,9 +167,12 @@ impl Qdrant {
 mod tests {
     use super::*;
     use crate::domain::SourceKind;
+    use crate::test_support::lock_env;
 
     #[test]
     fn test_qdrant_new_from_env_defaults() {
+        let _env_lock = lock_env();
+
         unsafe {
             std::env::remove_var("QDRANT_ENDPOINT");
             std::env::remove_var("QDRANT_COLLECTION");
@@ -182,6 +185,8 @@ mod tests {
 
     #[test]
     fn test_qdrant_new_from_env_custom() {
+        let _env_lock = lock_env();
+
         unsafe {
             std::env::set_var("QDRANT_ENDPOINT", "http://custom:6333");
             std::env::set_var("QDRANT_COLLECTION", "custom_collection");
