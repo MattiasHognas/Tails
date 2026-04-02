@@ -196,9 +196,12 @@ impl OpenAiClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{EnvVarGuard, lock_env};
 
     #[test]
     fn test_openai_client_new_from_env_defaults() {
+        let _env_lock = lock_env();
+
         unsafe {
             std::env::remove_var("OPENAI_BASE_URL");
             std::env::remove_var("OPENAI_EMBEDDING_MODEL");
@@ -219,6 +222,8 @@ mod tests {
 
     #[test]
     fn test_openai_client_new_from_env_custom() {
+        let _env_lock = lock_env();
+
         unsafe {
             std::env::set_var("OPENAI_API_KEY", "custom_key");
             std::env::set_var("OPENAI_BASE_URL", "https://custom.openai.com");
@@ -243,6 +248,9 @@ mod tests {
 
     #[test]
     fn test_openai_client_new_from_env_missing_api_key() {
+        let _env_lock = lock_env();
+        let _api_key_guard = EnvVarGuard::preserve("OPENAI_API_KEY");
+
         unsafe {
             std::env::remove_var("OPENAI_API_KEY");
         }
@@ -270,6 +278,8 @@ mod tests {
 
     #[test]
     fn test_openai_client_custom_base_url() {
+        let _env_lock = lock_env();
+
         unsafe {
             std::env::set_var("OPENAI_API_KEY", "test");
             std::env::set_var("OPENAI_BASE_URL", "https://custom-llm-gateway.example.com");
