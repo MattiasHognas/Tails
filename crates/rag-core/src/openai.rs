@@ -196,7 +196,7 @@ impl OpenAiClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::lock_env;
+    use crate::test_support::{EnvVarGuard, lock_env};
 
     #[test]
     fn test_openai_client_new_from_env_defaults() {
@@ -249,6 +249,7 @@ mod tests {
     #[test]
     fn test_openai_client_new_from_env_missing_api_key() {
         let _env_lock = lock_env();
+        let _api_key_guard = EnvVarGuard::preserve("OPENAI_API_KEY");
 
         unsafe {
             std::env::remove_var("OPENAI_API_KEY");
