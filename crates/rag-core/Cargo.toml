@@ -18,7 +18,7 @@ itertools = "0.14.0"
 jsonwebtoken = { version = "10.3.0", features = ["rust_crypto"] }
 async-trait = "0.1.89"
 sha2 = "0.11.0"
-hex   = "0.4.3"
+hex = "0.4.3"
 chrono = "0.4.44"
 
 [dev-dependencies]
