@@ -128,6 +128,59 @@ impl OpenAiClient {
         }
     }
 
+    /// Embed `texts` in one request using the array form of `input`. Embeddings are
+    /// returned in input order, mapped back by the response `index` field; a missing,
+    /// duplicate, out-of-range or empty embedding is an [`RagError::EmbeddingFailed`].
+    /// The caller keeps the request within the provider's limits, for example with
+    /// [`embedding_batches`].
+    pub async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, RagError> {
+        #[derive(Serialize)]
+        struct Req<'a> {
+            input: &'a [String],
+            model: &'a str,
+        }
+        #[derive(Deserialize)]
+        struct Resp {
+            data: Vec<Item>,
+        }
+        #[derive(Deserialize)]
+        struct Item {
+            index: usize,
+            embedding: Vec<f32>,
+        }
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+        let v: Resp = self
+            .post_json(
+                Stage::Embedding,
+                "/v1/embeddings",
+                &Req {
+                    input: texts,
+                    model: &self.embedding_model,
+                },
+            )
+            .await?;
+        let invalid =
+            |msg: String| RagError::failed(Stage::Embedding, UpstreamError::InvalidResponse(msg));
+        let mut out: Vec<Option<Vec<f32>>> = vec![None; texts.len()];
+        for item in v.data {
+            let slot = out
+                .get_mut(item.index)
+                .ok_or_else(|| invalid(format!("embedding index {} out of range", item.index)))?;
+            if item.embedding.is_empty() {
+                return Err(invalid(format!("empty embedding at index {}", item.index)));
+            }
+            if slot.replace(item.embedding).is_some() {
+                return Err(invalid(format!("duplicate embedding index {}", item.index)));
+            }
+        }
+        out.into_iter()
+            .enumerate()
+            .map(|(i, e)| e.ok_or_else(|| invalid(format!("missing embedding for input {i}"))))
+            .collect()
+    }
+
     pub async fn chat_complete(&self, system: &str, user: &str) -> Result<String, RagError> {
         #[derive(Serialize)]
         struct Req<'a> {
@@ -200,10 +253,197 @@ impl OpenAiClient {
     }
 }
 
+/// Splits `texts` into consecutive index ranges for [`OpenAiClient::embed_batch`]: each
+/// range holds at most `max_inputs` texts and at most `max_chars` characters in total (a
+/// rough stand-in for the per-request token limit). A single text longer than `max_chars`
+/// gets a range of its own. Limits below 1 are treated as 1.
+pub fn embedding_batches(
+    texts: &[String],
+    max_inputs: usize,
+    max_chars: usize,
+) -> Vec<std::ops::Range<usize>> {
+    let (max_inputs, max_chars) = (max_inputs.max(1), max_chars.max(1));
+    let mut batches = Vec::new();
+    let (mut start, mut chars) = (0, 0);
+    for (i, text) in texts.iter().enumerate() {
+        let len = text.chars().count();
+        if i > start && (i - start >= max_inputs || chars + len > max_chars) {
+            batches.push(start..i);
+            (start, chars) = (i, 0);
+        }
+        chars += len;
+    }
+    if start < texts.len() {
+        batches.push(start..texts.len());
+    }
+    batches
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_support::{EnvVarGuard, lock_env};
+
+    fn mock_client(base_url: String, retry: RetryPolicy) -> OpenAiClient {
+        OpenAiClient {
+            api_key: "test_key".to_string(),
+            base_url,
+            embedding_model: "test-model".to_string(),
+            chat_model: "test-chat".to_string(),
+            http: reqwest::Client::new(),
+            retry,
+        }
+    }
+
+    fn texts(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn embedding_batches_respect_input_and_char_limits() {
+        let t = texts(&["aaaa", "bb", "cccccc", "d", "e", "ffffffffff", "g"]);
+        // At most 3 inputs and 8 chars per batch; the 10-char text is alone.
+        let batches = embedding_batches(&t, 3, 8);
+        assert_eq!(batches, [0..2, 2..5, 5..6, 6..7]);
+        for b in &batches {
+            let chars: usize = t[b.clone()].iter().map(|s| s.len()).sum();
+            assert!(b.len() <= 3);
+            assert!(chars <= 8 || b.len() == 1);
+        }
+        // Every text lands in exactly one batch, in order.
+        let flat: Vec<usize> = batches.into_iter().flatten().collect();
+        assert_eq!(flat, (0..t.len()).collect::<Vec<_>>());
+
+        assert_eq!(embedding_batches(&t, 100, 1000), vec![0..7]);
+        assert_eq!(embedding_batches(&t, 0, 0).len(), t.len());
+        assert!(embedding_batches(&[], 3, 8).is_empty());
+        // Characters, not bytes.
+        assert_eq!(
+            embedding_batches(&texts(&["åäö", "åäö"]), 10, 6),
+            vec![0..2]
+        );
+    }
+
+    #[tokio::test]
+    async fn embed_batch_sends_array_input_and_maps_by_index() {
+        use wiremock::matchers::{body_json, header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .and(header("authorization", "Bearer test_key"))
+            .and(body_json(serde_json::json!({
+                "input": ["first", "second", "third"],
+                "model": "test-model"
+            })))
+            // Out of order: the index field, not the position, decides.
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [
+                    {"index": 2, "embedding": [3.0]},
+                    {"index": 0, "embedding": [1.0]},
+                    {"index": 1, "embedding": [2.0]}
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = mock_client(server.uri(), RetryPolicy::none());
+        let out = client
+            .embed_batch(&texts(&["first", "second", "third"]))
+            .await
+            .unwrap();
+        assert_eq!(out, [vec![1.0], vec![2.0], vec![3.0]]);
+        assert!(client.embed_batch(&[]).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn embed_batch_rejects_missing_duplicate_or_out_of_range_indexes() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        for data in [
+            serde_json::json!([{"index": 0, "embedding": [1.0]}]),
+            serde_json::json!([{"index": 0, "embedding": [1.0]}, {"index": 0, "embedding": [2.0]}]),
+            serde_json::json!([{"index": 0, "embedding": [1.0]}, {"index": 5, "embedding": [2.0]}]),
+            serde_json::json!([{"index": 0, "embedding": [1.0]}, {"index": 1, "embedding": []}]),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/embeddings"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({"data": data})),
+                )
+                .mount(&server)
+                .await;
+            let client = mock_client(server.uri(), RetryPolicy::none());
+            let err = client
+                .embed_batch(&texts(&["a", "b"]))
+                .await
+                .expect_err(&data.to_string());
+            assert!(matches!(err, RagError::EmbeddingFailed { .. }), "{err:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn embed_batch_retries_transient_failures() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .respond_with(ResponseTemplate::new(429).insert_header("retry-after-ms", "1"))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{"index": 0, "embedding": [0.5]}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let retry = RetryPolicy {
+            max_attempts: 3,
+            base_delay: std::time::Duration::from_millis(1),
+            max_delay: std::time::Duration::from_millis(50),
+        };
+        let client = mock_client(server.uri(), retry);
+        assert_eq!(
+            client.embed_batch(&texts(&["a"])).await.unwrap(),
+            [vec![0.5]]
+        );
+    }
+
+    #[tokio::test]
+    async fn embed_batch_does_not_retry_client_errors() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .respond_with(ResponseTemplate::new(400))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let retry = RetryPolicy {
+            max_attempts: 3,
+            base_delay: std::time::Duration::from_millis(1),
+            max_delay: std::time::Duration::from_millis(50),
+        };
+        let err = mock_client(server.uri(), retry)
+            .embed_batch(&texts(&["a"]))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RagError::EmbeddingFailed { .. }), "{err:?}");
+    }
 
     #[test]
     fn test_openai_client_new_from_env_defaults() {
