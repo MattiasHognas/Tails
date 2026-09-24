@@ -1,6 +1,7 @@
-use crate::domain::{Hit, RagDocument};
+use crate::domain::{Hit, RagDocument, SourceKind};
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 #[derive(Debug, Clone)]
 pub struct Qdrant {
@@ -11,23 +12,80 @@ pub struct Qdrant {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct QPoint {
-    pub id: String,
+    pub id: Uuid,
     pub vector: Vec<f32>,
-    pub payload: serde_json::Value,
+    pub payload: QdrantPayload,
 }
 
-pub fn payload_from(doc: &RagDocument) -> serde_json::Value {
-    serde_json::json!({
-      "Title": doc.title,
-      "Text": doc.text,
-      "SourceUri": doc.source_uri,
-      "Kind": doc.kind,
-      "Timestamp": doc.timestamp,
-      "Service": doc.service,
-      "Environment": doc.environment,
-      "Metadata": doc.metadata,
-      "id": doc.id
-    })
+/// Storage schema shared by ingestion and retrieval. PascalCase keys match
+/// Qdrant filters; the public RagDocument uses camelCase.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct QdrantPayload {
+    #[serde(rename = "id")]
+    pub id: String,
+    pub title: String,
+    pub text: String,
+    pub source_uri: String,
+    pub kind: SourceKind,
+    pub timestamp: Option<String>,
+    pub service: String,
+    pub environment: String,
+    #[serde(default)]
+    pub metadata: serde_json::Map<String, serde_json::Value>,
+}
+
+impl From<&RagDocument> for QdrantPayload {
+    fn from(doc: &RagDocument) -> Self {
+        Self {
+            id: doc.id.clone(),
+            title: doc.title.clone(),
+            text: doc.text.clone(),
+            source_uri: doc.source_uri.clone(),
+            kind: doc.kind.clone(),
+            timestamp: doc.timestamp.clone(),
+            service: doc.service.clone(),
+            environment: doc.environment.clone(),
+            metadata: doc.metadata.clone(),
+        }
+    }
+}
+
+impl From<QdrantPayload> for RagDocument {
+    fn from(payload: QdrantPayload) -> Self {
+        Self {
+            id: payload.id,
+            title: payload.title,
+            text: payload.text,
+            source_uri: payload.source_uri,
+            kind: payload.kind,
+            timestamp: payload.timestamp,
+            service: payload.service,
+            environment: payload.environment,
+            metadata: payload.metadata,
+        }
+    }
+}
+
+impl QPoint {
+    /// A chunk keeps the same point ID across retries and content updates.
+    /// Preserve the logical chunk ID and chunk_of metadata in the payload.
+    pub fn from_document(doc: &RagDocument, vector: Vec<f32>) -> Self {
+        // This namespace is part of the persisted ID contract: do not change it.
+        let namespace = Uuid::new_v5(
+            &Uuid::NAMESPACE_URL,
+            b"https://github.com/MattiasHognas/Tails",
+        );
+        Self {
+            id: Uuid::new_v5(&namespace, doc.id.as_bytes()),
+            vector,
+            payload: payload_from(doc),
+        }
+    }
+}
+
+pub fn payload_from(doc: &RagDocument) -> QdrantPayload {
+    QdrantPayload::from(doc)
 }
 
 impl Qdrant {
@@ -82,7 +140,7 @@ impl Qdrant {
         #[derive(Deserialize)]
         struct Item {
             score: f32,
-            payload: serde_json::Value,
+            payload: QdrantPayload,
             #[allow(dead_code)]
             id: serde_json::Value,
         }
@@ -105,61 +163,13 @@ impl Qdrant {
             return Err(anyhow!("qdrant search status {}", r.status()));
         }
         let v: Resp = r.json().await?;
-        let mut hits = Vec::new();
-        for it in v.result {
-            let p = it.payload;
-            let doc = RagDocument {
-                id: p
-                    .get("id")
-                    .and_then(|x| x.as_str())
-                    .unwrap_or_default()
-                    .to_string(),
-                title: p
-                    .get("Title")
-                    .and_then(|x| x.as_str())
-                    .unwrap_or_default()
-                    .to_string(),
-                text: p
-                    .get("Text")
-                    .and_then(|x| x.as_str())
-                    .unwrap_or_default()
-                    .to_string(),
-                source_uri: p
-                    .get("SourceUri")
-                    .and_then(|x| x.as_str())
-                    .unwrap_or_default()
-                    .to_string(),
-                kind: serde_json::from_value(
-                    p.get("Kind")
-                        .cloned()
-                        .unwrap_or_else(|| serde_json::Value::String("Logs".into())),
-                )?,
-                timestamp: p
-                    .get("Timestamp")
-                    .and_then(|x| x.as_str())
-                    .map(|s| s.to_string()),
-                service: p
-                    .get("Service")
-                    .and_then(|x| x.as_str())
-                    .unwrap_or_default()
-                    .to_string(),
-                environment: p
-                    .get("Environment")
-                    .and_then(|x| x.as_str())
-                    .unwrap_or_default()
-                    .to_string(),
-                metadata: p
-                    .get("Metadata")
-                    .and_then(|x| x.as_object())
-                    .cloned()
-                    .unwrap_or_default(),
-            };
-            hits.push(Hit {
-                doc,
+        Ok(v.result
+            .into_iter()
+            .map(|it| Hit {
+                doc: it.payload.into(),
                 score: it.score,
-            });
-        }
-        Ok(hits)
+            })
+            .collect())
     }
 }
 
@@ -168,6 +178,81 @@ mod tests {
     use super::*;
     use crate::domain::SourceKind;
     use crate::test_support::lock_env;
+
+    fn contract_document() -> RagDocument {
+        RagDocument {
+            id: "monitor_123#c0".into(),
+            title: "Återkommande fel".into(),
+            text: "Connection failed".into(),
+            source_uri: "https://app.datadoghq.eu/monitors/123".into(),
+            kind: SourceKind::Monitor,
+            timestamp: None,
+            service: "payments".into(),
+            environment: "prod".into(),
+            metadata: serde_json::json!({"chunk_of": "monitor_123", "chunk_index": 0})
+                .as_object()
+                .unwrap()
+                .clone(),
+        }
+    }
+
+    #[test]
+    fn point_ids_are_stable_namespaced_uuids() {
+        let mut doc = contract_document();
+        let first = QPoint::from_document(&doc, vec![1.0]);
+        // Pin the persisted mapping so refactors cannot silently duplicate points.
+        assert_eq!(first.id.to_string(), "21aca85b-31bc-5c36-bd5f-32403cb008d2");
+        doc.text = "Changed content".into();
+        assert_eq!(first.id, QPoint::from_document(&doc, vec![0.5]).id);
+        doc.id = "monitor_123#c1".into();
+        assert_ne!(first.id, QPoint::from_document(&doc, vec![1.0]).id);
+        doc.id = "incident_123#c0".into();
+        assert_ne!(first.id, QPoint::from_document(&doc, vec![1.0]).id);
+        assert_eq!(first.payload.id, "monitor_123#c0");
+        assert_eq!(first.payload.metadata["chunk_of"], "monitor_123");
+    }
+
+    #[test]
+    fn typed_payload_roundtrips_every_source_kind() {
+        for kind in [
+            SourceKind::Logs,
+            SourceKind::Metrics,
+            SourceKind::Monitor,
+            SourceKind::Incident,
+            SourceKind::Dashboard,
+            SourceKind::SLO,
+            SourceKind::Git,
+        ] {
+            let mut doc = contract_document();
+            doc.kind = kind;
+            let value = serde_json::to_value(payload_from(&doc)).unwrap();
+            let payload: QdrantPayload = serde_json::from_value(value).unwrap();
+            let restored = RagDocument::from(payload);
+            assert_eq!(
+                serde_json::to_value(restored).unwrap(),
+                serde_json::to_value(doc).unwrap()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn search_rejects_incomplete_payloads_instead_of_returning_empty_evidence() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let mut payload = serde_json::to_value(payload_from(&contract_document())).unwrap();
+        payload.as_object_mut().unwrap().remove("Text");
+        Mock::given(method("POST"))
+            .and(path("/collections/test/points/search"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [{"id": 1, "score": 0.9, "payload": payload}]
+            })))
+            .mount(&server)
+            .await;
+        let qdrant = Qdrant::new(server.uri(), "test".into());
+        assert!(qdrant.search(vec![1.0], 10, None).await.is_err());
+    }
 
     #[test]
     fn test_qdrant_new_from_env_defaults() {
@@ -223,7 +308,7 @@ mod tests {
             metadata,
         };
 
-        let payload = payload_from(&doc);
+        let payload = serde_json::to_value(payload_from(&doc)).unwrap();
 
         assert_eq!(
             payload.get("Title").unwrap().as_str().unwrap(),
@@ -272,21 +357,8 @@ mod tests {
             metadata: serde_json::Map::new(),
         };
 
-        let payload = payload_from(&doc);
+        let payload = serde_json::to_value(payload_from(&doc)).unwrap();
         assert!(payload.get("Timestamp").unwrap().is_null());
-    }
-
-    #[test]
-    fn test_qpoint_structure() {
-        let point = QPoint {
-            id: "point123".to_string(),
-            vector: vec![0.1, 0.2, 0.3],
-            payload: serde_json::json!({"key": "value"}),
-        };
-
-        assert_eq!(point.id, "point123");
-        assert_eq!(point.vector.len(), 3);
-        assert_eq!(point.payload.get("key").unwrap().as_str().unwrap(), "value");
     }
 
     #[test]
@@ -394,11 +466,7 @@ mod tests {
             metadata: serde_json::Map::new(),
         };
 
-        let point = QPoint {
-            id: doc.id.clone(),
-            vector: vec![0.1, 0.2, 0.3],
-            payload: payload_from(&doc),
-        };
+        let point = QPoint::from_document(&doc, vec![0.1, 0.2, 0.3]);
 
         let result = qdrant.upsert(vec![point]).await;
         assert!(result.is_ok());
@@ -459,11 +527,7 @@ mod tests {
             metadata: serde_json::Map::new(),
         };
 
-        let point = QPoint {
-            id: doc.id.clone(),
-            vector: vec![0.1, 0.2, 0.3],
-            payload: payload_from(&doc),
-        };
+        let point = QPoint::from_document(&doc, vec![0.1, 0.2, 0.3]);
 
         let result = qdrant.upsert(vec![point]).await;
         assert!(result.is_err());
