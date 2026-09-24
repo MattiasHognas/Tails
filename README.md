@@ -74,7 +74,55 @@ INDEXER_OVERLAP_MINUTES=10               # re-read before each checkpoint for la
 RAG_TOPK_DEFAULT=16
 RAG_TOPK_MAX=32
 RAG_SEARCH_CANDIDATES=64
+
+# Timeouts, deadlines and retries (optional; milliseconds)
+RAG_HTTP_CONNECT_TIMEOUT_MS=5000     # per connection attempt (OpenAI + Qdrant clients)
+RAG_HTTP_REQUEST_TIMEOUT_MS=60000    # per HTTP attempt
+RAG_ASK_DEADLINE_MS=90000            # overall deadline for one /ask request
+RAG_PLAN_TIMEOUT_MS=30000            # /ask/plan planning stage
+RAG_EMBED_TIMEOUT_MS=15000           # embedding stage (incl. retries)
+RAG_SEARCH_TIMEOUT_MS=15000          # Qdrant search stage (incl. retries)
+RAG_GENERATE_TIMEOUT_MS=60000        # answer generation stage (incl. retries)
+RAG_RETRY_MAX_ATTEMPTS=3             # total attempts per upstream call (1 = no retries)
+RAG_RETRY_BASE_DELAY_MS=200          # first backoff; doubles per retry, with jitter
+RAG_RETRY_MAX_DELAY_MS=10000         # backoff cap; a longer Retry-After fails fast
 ```
+
+---
+
+## API errors and evidence
+
+`/ask` and `/ask/plan` never turn an infrastructure failure into an answer.
+If embedding, retrieval, planning or generation fails, the API returns an
+error status with a stable JSON body, and the LLM is not asked to answer
+after an embedding or retrieval failure:
+
+```json
+{"error": {"code": "retrieval_failed", "message": "retrieval failed: upstream returned HTTP 404", "stage": "retrieval", "retryable": false}}
+```
+
+| Status | `code` | When |
+|--------|--------|------|
+| 400 | `invalid_request` | Malformed JSON, missing or empty `question` |
+| 502 | `embedding_failed`, `retrieval_failed`, `generation_failed`, `planning_failed` | Upstream (OpenAI/Qdrant) rejected the call or returned an invalid response; not retried |
+| 503 | `upstream_unavailable` | Transient upstream failure (connect error, 429, 5xx) persisted after all retries |
+| 504 | `timeout` | A stage timeout or the overall `/ask` deadline was exceeded |
+| 500 | `internal` | Unexpected internal error |
+
+`stage` is one of `planning`, `embedding`, `retrieval`, `generation` or
+`request` (`null` for invalid requests). Messages never include upstream
+response bodies, URLs or credentials; details are logged server-side.
+
+A successful search that matches nothing is **not** an error: `/ask` returns
+200 with `"evidence": "none"` and a fixed "No matching evidence was found in the
+indexed data" answer, without calling the LLM (so it cannot invent evidence).
+Answers backed by retrieved documents have `"evidence": "found"`.
+
+Retries apply only to transient failures (connect errors, timeouts, HTTP 429
+honoring `Retry-After`/`retry-after-ms`, and 5xx) with exponential backoff and
+jitter; other 4xx responses are never retried. No retry starts if its backoff
+would end past the stage or request deadline. The CLI prints typed errors as
+`error [code] at stage '...' (HTTP status): message` and exits non-zero.
 
 ---
 
