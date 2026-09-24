@@ -1,0 +1,604 @@
+{
+  "data": {
+    "type": "incidents_search_results",
+    "attributes": {
+      "total": 1703,
+      "facets": {},
+      "incidents": [
+        {
+          "data": {
+            "type": "incidents",
+            "attributes": {
+              "customer_impact_end": null,
+              "time_to_detect": 0,
+              "customer_impact_start": null,
+              "created_by_uuid": null,
+              "title": "Test-Go-Update_an_incident_todo_returns_OK_response-1679962375",
+              "non_datadog_creator": null,
+              "last_modified_by_uuid": null,
+              "state": "active",
+              "commander": null,
+              "case_id": null,
+              "creation_idempotency_key": null,
+              "fields": {
+                "severity": {
+                  "type": "dropdown",
+                  "value": "UNKNOWN"
+                },
+                "state": {
+                  "type": "dropdown",
+                  "value": "active"
+                },
+                "root_cause": {
+                  "type": "textbox",
+                  "value": null
+                },
+                "teams": {
+                  "type": "autocomplete",
+                  "value": null
+                },
+                "detection_method": {
+                  "type": "dropdown",
+                  "value": "unknown"
+                },
+                "summary": {
+                  "type": "textbox",
+                  "value": null
+                },
+                "services": {
+                  "type": "autocomplete",
+                  "value": null
+                }
+              },
+              "last_modified_by": {
+                "data": {
+                  "type": "users",
+                  "attributes": {
+                    "icon": "https://secure.gravatar.com/avatar/b7c189b5b4c2c429d7c1e0bc3749330e?s=48&d=retro",
+                    "email": "team-intg-tools-libs-spam@datadoghq.com",
+                    "name": "CI Account",
+                    "uuid": "9919ec9b-ebc7-49ee-8dc8-03626e717cca",
+                    "handle": "9919ec9b-ebc7-49ee-8dc8-03626e717cca"
+                  },
+                  "id": "9919ec9b-ebc7-49ee-8dc8-03626e717cca"
+                }
+              },
+              "time_to_resolve": 0,
+              "resolved": null,
+              "created": "2023-03-28T00:12:55+00:00",
+              "time_to_repair": 0,
+              "customer_impact_scope": "",
+              "detected": "2023-03-28T00:12:55+00:00",
+              "created_by": {
+                "data": {
+                  "type": "users",
+                  "attributes": {
+                    "icon": "https://secure.gravatar.com/avatar/b7c189b5b4c2c429d7c1e0bc3749330e?s=48&d=retro",
+                    "email": "team-intg-tools-libs-spam@datadoghq.com",
+                    "name": "CI Account",
+                    "uuid": "9919ec9b-ebc7-49ee-8dc8-03626e717cca",
+                    "handle": "9919ec9b-ebc7-49ee-8dc8-03626e717cca"
+                  },
+                  "id": "9919ec9b-ebc7-49ee-8dc8-03626e717cca"
+                }
+              },
+              "field_analytics": {
+                "state": {
+                  "active": {
+                    "duration": 0,
+                    "spans": [
+                      {
+                        "start": 1679962375,
+                        "end": null
+                      }
+                    ]
+                  }
+                }
+              },
+              "public_id": 128961,
+              "time_to_internal_response": 0,
+              "modified": "2023-03-28T00:12:55+00:00",
+              "severity": "UNKNOWN",
+              "notification_handles": null,
+              "visibility": "organization",
+              "customer_impacted": false,
+              "customer_impact_duration": 0
+            },
+            "relationships": {
+              "commander_user": {
+                "data": null
+              },
+              "responders": {
+                "data": [
+                  {
+                    "type": "incident_responders",
+                    "id": "fbc19b87-ff03-5b2a-915d-75501ad44917"
+                  }
+                ]
+              },
+              "attachments": {
+                "data": []
+              },
+              "impacts": {
+                "data": []
+              },
+              "last_modified_by_user": {
+                "data": {
+                  "type": "users",
+                  "id": "9919ec9b-ebc7-49ee-8dc8-03626e717cca"
+                }
+              },
+              "user_defined_fields": {
+                "data": []
+              },
+              "created_by_user": {
+                "data": {
+                  "type": "users",
+                  "id": "9919ec9b-ebc7-49ee-8dc8-03626e717cca"
+                }
+              },
+              "integrations": {
+                "data": []
+              }
+            },
+            "id": "aa819dbd-9016-5c31-84c5-48ff15b845cf"
+          }
+        },
+        {
+          "data": {
+            "type": "incidents",
+            "attributes": {
+              "customer_impact_end": null,
+              "time_to_detect": 0,
+              "customer_impact_start": null,
+              "created_by_uuid": null,
+              "title": "Test-Go-Update_an_existing_incident_returns_OK_response-1679962372-updated",
+              "non_datadog_creator": null,
+              "last_modified_by_uuid": null,
+              "state": "resolved",
+              "commander": null,
+              "case_id": null,
+              "creation_idempotency_key": null,
+              "fields": {
+                "severity": {
+                  "type": "dropdown",
+                  "value": "UNKNOWN"
+                },
+                "detection_method": {
+                  "type": "dropdown",
+                  "value": "unknown"
+                },
+                "root_cause": {
+                  "type": "textbox",
+                  "value": null
+                },
+                "teams": {
+                  "type": "autocomplete",
+                  "value": null
+                },
+                "services": {
+                  "type": "autocomplete",
+                  "value": null
+                },
+                "summary": {
+                  "type": "textbox",
+                  "value": null
+                },
+                "state": {
+                  "type": "dropdown",
+                  "value": "resolved"
+                }
+              },
+              "last_modified_by": {
+                "data": {
+                  "type": "users",
+                  "attributes": {
+                    "icon": "https://secure.gravatar.com/avatar/b7c189b5b4c2c429d7c1e0bc3749330e?s=48&d=retro",
+                    "email": "team-intg-tools-libs-spam@datadoghq.com",
+                    "name": "CI Account",
+                    "uuid": "9919ec9b-ebc7-49ee-8dc8-03626e717cca",
+                    "handle": "9919ec9b-ebc7-49ee-8dc8-03626e717cca"
+                  },
+                  "id": "9919ec9b-ebc7-49ee-8dc8-03626e717cca"
+                }
+              },
+              "time_to_resolve": 2,
+              "resolved": "2023-03-28T00:12:54+00:00",
+              "created": "2023-03-28T00:12:52+00:00",
+              "time_to_repair": 0,
+              "customer_impact_scope": "",
+              "detected": "2023-03-28T00:12:52+00:00",
+              "created_by": {
+                "data": {
+                  "type": "users",
+                  "attributes": {
+                    "icon": "https://secure.gravatar.com/avatar/b7c189b5b4c2c429d7c1e0bc3749330e?s=48&d=retro",
+                    "email": "team-intg-tools-libs-spam@datadoghq.com",
+                    "name": "CI Account",
+                    "uuid": "9919ec9b-ebc7-49ee-8dc8-03626e717cca",
+                    "handle": "9919ec9b-ebc7-49ee-8dc8-03626e717cca"
+                  },
+                  "id": "9919ec9b-ebc7-49ee-8dc8-03626e717cca"
+                }
+              },
+              "field_analytics": {
+                "state": {
+                  "active": {
+                    "duration": 3,
+                    "spans": [
+                      {
+                        "start": 1679962372,
+                        "end": 1679962375
+                      }
+                    ]
+                  },
+                  "resolved": {
+                    "duration": 0,
+                    "spans": [
+                      {
+                        "start": 1679962375,
+                        "end": null
+                      }
+                    ]
+                  }
+                }
+              },
+              "public_id": 128960,
+              "time_to_internal_response": 0,
+              "modified": "2023-03-28T00:12:54+00:00",
+              "severity": "UNKNOWN",
+              "notification_handles": null,
+              "visibility": "organization",
+              "customer_impacted": false,
+              "customer_impact_duration": 0
+            },
+            "relationships": {
+              "commander_user": {
+                "data": null
+              },
+              "responders": {
+                "data": [
+                  {
+                    "type": "incident_responders",
+                    "id": "35badb8c-6ee1-50d5-9ff9-19cacc137d90"
+                  }
+                ]
+              },
+              "attachments": {
+                "data": []
+              },
+              "impacts": {
+                "data": []
+              },
+              "last_modified_by_user": {
+                "data": {
+                  "type": "users",
+                  "id": "9919ec9b-ebc7-49ee-8dc8-03626e717cca"
+                }
+              },
+              "user_defined_fields": {
+                "data": []
+              },
+              "created_by_user": {
+                "data": {
+                  "type": "users",
+                  "id": "9919ec9b-ebc7-49ee-8dc8-03626e717cca"
+                }
+              },
+              "integrations": {
+                "data": []
+              }
+            },
+            "id": "6f648ab1-026d-5e82-a49a-6b88e098b018"
+          }
+        }
+      ]
+    },
+    "relationships": {
+      "incidents_relationship": {
+        "data": [
+          {
+            "type": "incidents",
+            "id": "aa819dbd-9016-5c31-84c5-48ff15b845cf"
+          },
+          {
+            "type": "incidents",
+            "id": "6f648ab1-026d-5e82-a49a-6b88e098b018"
+          }
+        ]
+      }
+    }
+  },
+  "included": [
+    {
+      "type": "incidents",
+      "id": "aa819dbd-9016-5c31-84c5-48ff15b845cf",
+      "attributes": {
+        "public_id": 128961,
+        "title": "Test-Go-Update_an_incident_todo_returns_OK_response-1679962375",
+        "resolved": null,
+        "customer_impact_scope": "",
+        "customer_impact_start": null,
+        "customer_impact_end": null,
+        "customer_impacted": false,
+        "notification_handles": null,
+        "last_modified_by": {
+          "data": {
+            "type": "users",
+            "id": "9919ec9b-ebc7-49ee-8dc8-03626e717cca",
+            "attributes": {
+              "uuid": "9919ec9b-ebc7-49ee-8dc8-03626e717cca",
+              "handle": "9919ec9b-ebc7-49ee-8dc8-03626e717cca",
+              "email": "team-intg-tools-libs-spam@datadoghq.com",
+              "name": "CI Account",
+              "icon": "https://secure.gravatar.com/avatar/b7c189b5b4c2c429d7c1e0bc3749330e?s=48&d=retro"
+            }
+          }
+        },
+        "last_modified_by_uuid": null,
+        "created": "2023-03-28T00:12:55+00:00",
+        "modified": "2023-03-28T00:12:55+00:00",
+        "commander": null,
+        "detected": "2023-03-28T00:12:55+00:00",
+        "created_by": {
+          "data": {
+            "type": "users",
+            "id": "9919ec9b-ebc7-49ee-8dc8-03626e717cca",
+            "attributes": {
+              "uuid": "9919ec9b-ebc7-49ee-8dc8-03626e717cca",
+              "handle": "9919ec9b-ebc7-49ee-8dc8-03626e717cca",
+              "email": "team-intg-tools-libs-spam@datadoghq.com",
+              "name": "CI Account",
+              "icon": "https://secure.gravatar.com/avatar/b7c189b5b4c2c429d7c1e0bc3749330e?s=48&d=retro"
+            }
+          }
+        },
+        "created_by_uuid": null,
+        "creation_idempotency_key": null,
+        "customer_impact_duration": 0,
+        "time_to_detect": 0,
+        "time_to_repair": 0,
+        "time_to_internal_response": 0,
+        "time_to_resolve": 0,
+        "fields": {
+          "severity": {
+            "type": "dropdown",
+            "value": "UNKNOWN"
+          },
+          "state": {
+            "type": "dropdown",
+            "value": "active"
+          },
+          "root_cause": {
+            "type": "textbox",
+            "value": null
+          },
+          "teams": {
+            "type": "autocomplete",
+            "value": null
+          },
+          "detection_method": {
+            "type": "dropdown",
+            "value": "unknown"
+          },
+          "summary": {
+            "type": "textbox",
+            "value": null
+          },
+          "services": {
+            "type": "autocomplete",
+            "value": null
+          }
+        },
+        "field_analytics": {
+          "state": {
+            "active": {
+              "duration": 0,
+              "spans": [
+                {
+                  "start": 1679962375,
+                  "end": null
+                }
+              ]
+            }
+          }
+        },
+        "severity": "UNKNOWN",
+        "state": "active",
+        "non_datadog_creator": null,
+        "visibility": "organization",
+        "case_id": null
+      },
+      "relationships": {
+        "created_by_user": {
+          "data": {
+            "type": "users",
+            "id": "9919ec9b-ebc7-49ee-8dc8-03626e717cca"
+          }
+        },
+        "last_modified_by_user": {
+          "data": {
+            "type": "users",
+            "id": "9919ec9b-ebc7-49ee-8dc8-03626e717cca"
+          }
+        },
+        "commander_user": {
+          "data": null
+        },
+        "user_defined_fields": {
+          "data": []
+        },
+        "integrations": {
+          "data": []
+        },
+        "attachments": {
+          "data": []
+        },
+        "responders": {
+          "data": [
+            {
+              "type": "incident_responders",
+              "id": "fbc19b87-ff03-5b2a-915d-75501ad44917"
+            }
+          ]
+        },
+        "impacts": {
+          "data": []
+        }
+      }
+    },
+    {
+      "type": "incidents",
+      "id": "6f648ab1-026d-5e82-a49a-6b88e098b018",
+      "attributes": {
+        "public_id": 128960,
+        "title": "Test-Go-Update_an_existing_incident_returns_OK_response-1679962372-updated",
+        "resolved": "2023-03-28T00:12:54+00:00",
+        "customer_impact_scope": "",
+        "customer_impact_start": null,
+        "customer_impact_end": null,
+        "customer_impacted": false,
+        "notification_handles": null,
+        "last_modified_by": {
+          "data": {
+            "type": "users",
+            "id": "9919ec9b-ebc7-49ee-8dc8-03626e717cca",
+            "attributes": {
+              "uuid": "9919ec9b-ebc7-49ee-8dc8-03626e717cca",
+              "handle": "9919ec9b-ebc7-49ee-8dc8-03626e717cca",
+              "email": "team-intg-tools-libs-spam@datadoghq.com",
+              "name": "CI Account",
+              "icon": "https://secure.gravatar.com/avatar/b7c189b5b4c2c429d7c1e0bc3749330e?s=48&d=retro"
+            }
+          }
+        },
+        "last_modified_by_uuid": null,
+        "created": "2023-03-28T00:12:52+00:00",
+        "modified": "2023-03-28T00:12:54+00:00",
+        "commander": null,
+        "detected": "2023-03-28T00:12:52+00:00",
+        "created_by": {
+          "data": {
+            "type": "users",
+            "id": "9919ec9b-ebc7-49ee-8dc8-03626e717cca",
+            "attributes": {
+              "uuid": "9919ec9b-ebc7-49ee-8dc8-03626e717cca",
+              "handle": "9919ec9b-ebc7-49ee-8dc8-03626e717cca",
+              "email": "team-intg-tools-libs-spam@datadoghq.com",
+              "name": "CI Account",
+              "icon": "https://secure.gravatar.com/avatar/b7c189b5b4c2c429d7c1e0bc3749330e?s=48&d=retro"
+            }
+          }
+        },
+        "created_by_uuid": null,
+        "creation_idempotency_key": null,
+        "customer_impact_duration": 0,
+        "time_to_detect": 0,
+        "time_to_repair": 0,
+        "time_to_internal_response": 0,
+        "time_to_resolve": 2,
+        "fields": {
+          "severity": {
+            "type": "dropdown",
+            "value": "UNKNOWN"
+          },
+          "detection_method": {
+            "type": "dropdown",
+            "value": "unknown"
+          },
+          "root_cause": {
+            "type": "textbox",
+            "value": null
+          },
+          "teams": {
+            "type": "autocomplete",
+            "value": null
+          },
+          "services": {
+            "type": "autocomplete",
+            "value": null
+          },
+          "summary": {
+            "type": "textbox",
+            "value": null
+          },
+          "state": {
+            "type": "dropdown",
+            "value": "resolved"
+          }
+        },
+        "field_analytics": {
+          "state": {
+            "active": {
+              "duration": 3,
+              "spans": [
+                {
+                  "start": 1679962372,
+                  "end": 1679962375
+                }
+              ]
+            },
+            "resolved": {
+              "duration": 0,
+              "spans": [
+                {
+                  "start": 1679962375,
+                  "end": null
+                }
+              ]
+            }
+          }
+        },
+        "severity": "UNKNOWN",
+        "state": "resolved",
+        "non_datadog_creator": null,
+        "visibility": "organization",
+        "case_id": null
+      },
+      "relationships": {
+        "created_by_user": {
+          "data": {
+            "type": "users",
+            "id": "9919ec9b-ebc7-49ee-8dc8-03626e717cca"
+          }
+        },
+        "last_modified_by_user": {
+          "data": {
+            "type": "users",
+            "id": "9919ec9b-ebc7-49ee-8dc8-03626e717cca"
+          }
+        },
+        "commander_user": {
+          "data": null
+        },
+        "user_defined_fields": {
+          "data": []
+        },
+        "integrations": {
+          "data": []
+        },
+        "attachments": {
+          "data": []
+        },
+        "responders": {
+          "data": [
+            {
+              "type": "incident_responders",
+              "id": "35badb8c-6ee1-50d5-9ff9-19cacc137d90"
+            }
+          ]
+        },
+        "impacts": {
+          "data": []
+        }
+      }
+    }
+  ],
+  "meta": {
+    "pagination": {
+      "offset": 0,
+      "next_offset": 2,
+      "size": 2
+    }
+  }
+}

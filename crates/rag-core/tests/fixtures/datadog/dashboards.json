@@ -1,0 +1,16 @@
+{
+  "dashboards": [
+    {
+      "id": "npw-6di-usv",
+      "title": "Test-Get_all_dashboards_returns_OK_response-1676584070 with Profile Metrics Query",
+      "description": null,
+      "layout_type": "ordered",
+      "url": "/dashboard/npw-6di-usv/test-getalldashboardsreturnsokresponse-1676584070-with-profile-metrics-query",
+      "is_read_only": false,
+      "created_at": "2023-02-16T21:47:50.216943+00:00",
+      "modified_at": "2023-02-16T21:47:50.216943+00:00",
+      "author_handle": "frog@datadoghq.com",
+      "deleted_at": null
+    }
+  ]
+}
