@@ -6,56 +6,66 @@ on:
   pull_request:
     branches: [ main ]
 
+permissions:
+  contents: read
+
 jobs:
   build:
     runs-on: ubuntu-latest
-    
+
+    # Real Qdrant for the storage contract tests (ignored by default locally).
+    services:
+      qdrant:
+        image: qdrant/qdrant:v1.19.1
+        ports:
+          - 6333:6333
+
+    env:
+      QDRANT_TEST_ENDPOINT: http://localhost:6333
+
     steps:
     - uses: actions/checkout@v7
-    
+
     - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@stable
       with:
         toolchain: 1.90
         components: rustfmt, clippy
-    
+
     - name: Cache cargo dependencies
       uses: Swatinem/rust-cache@v2
       with:
         cache-all-crates: true
-    
-    - name: Build rag-core
-      run: cargo build --package rag-core --release
-    
-    - name: Test rag-core
-      run: cargo test --package rag-core
-    
-    - name: Build rag-api
-      run: cargo build --package rag-api --release
-    
-    - name: Test rag-api
-      run: cargo test --package rag-api
-    
-    - name: Build rag-indexer
-      run: cargo build --package rag-indexer --release
-    
-    - name: Test rag-indexer
-      run: cargo test --package rag-indexer
-    
-    - name: Build rag-cli
-      run: cargo build --package rag-cli --release
-    
-    - name: Test rag-cli
-      run: cargo test --package rag-cli
-    
+
+    - name: Build release binaries
+      run: cargo build --workspace --release --locked
+
     - name: Install cargo-llvm-cov
       uses: taiki-e/install-action@v2
       with:
         tool: cargo-llvm-cov
-    
+
+    # Every test runs once, instrumented; a failing test fails this step.
+    - name: Test workspace
+      run: cargo llvm-cov --workspace --all-features --locked --no-report
+
+    - name: Wait for Qdrant
+      run: |
+        for attempt in $(seq 1 30); do
+          if curl --fail --silent http://localhost:6333/readyz; then
+            exit 0
+          fi
+          sleep 1
+        done
+        echo "Qdrant did not become ready" >&2
+        exit 1
+
+    - name: Test against real Qdrant
+      run: cargo llvm-cov --package rag-core --test qdrant_roundtrip --all-features --locked --no-report -- --ignored
+
     - name: Generate code coverage
-      run: cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info
-    
+      run: cargo llvm-cov report --lcov --output-path lcov.info
+
     - name: Upload coverage to Codecov
       uses: codecov/codecov-action@v7
       with:

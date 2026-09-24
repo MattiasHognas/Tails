@@ -224,8 +224,10 @@ cargo test -- --nocapture
 
 ### Qdrant contract test
 
-The `Qdrant contract` CI workflow runs an upsert/search test against real Qdrant.
-To run it locally, start an isolated Qdrant instance, then run:
+The `Build` CI workflow starts a real Qdrant (v1.19.1) as a service container and,
+after the regular test run, runs the ignored `qdrant_roundtrip` upsert/search test
+against it. Both runs are instrumented, so the coverage report includes the Qdrant
+client paths. To run it locally, start an isolated Qdrant instance, then run:
 
 ```bash
 QDRANT_TEST_ENDPOINT=http://localhost:6333 cargo test --locked -p rag-core --test qdrant_roundtrip -- --ignored
