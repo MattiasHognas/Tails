@@ -1,5 +1,8 @@
 use crate::domain::RagDocument;
+use crate::error::{RagError, Stage, UpstreamError};
+use crate::resilience::{RetryPolicy, send_with_retry};
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 use urlencoding;
 
 /// Incidents are fetched in every state; the indexing window is applied to `created`.
@@ -24,6 +27,31 @@ pub struct Datadog {
     /// Base URL for API requests, `https://api.{site}` unless overridden.
     pub api_base: String,
     pub http: reqwest::Client,
+    /// Retry budget for the live-evidence queries ([`Self::query_metrics`],
+    /// [`Self::search_log_events`]). Indexing calls are not retried here.
+    pub retry: RetryPolicy,
+}
+
+/// One series from `GET /api/v1/query`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MetricSeries {
+    /// The expression Datadog evaluated, e.g. `avg:trace.http.request.duration{service:auth-api}`.
+    pub expression: String,
+    pub metric: String,
+    /// Comma-separated tags identifying the series.
+    pub scope: String,
+    /// Seconds between points (the rollup Datadog chose), when reported.
+    pub interval_secs: Option<u64>,
+    /// `(unix millis, value)`; `None` is a point Datadog returned as `null`.
+    pub points: Vec<(i64, Option<f64>)>,
+}
+
+/// Error/warning logs matching a live-evidence query.
+#[derive(Debug, Clone)]
+pub struct LogEvents {
+    pub events: Vec<RagDocument>,
+    /// More events matched than the cap allowed to fetch.
+    pub truncated: bool,
 }
 
 impl Datadog {
@@ -34,6 +62,7 @@ impl Datadog {
             app_key,
             site,
             http: reqwest::Client::new(),
+            retry: RetryPolicy::default(),
         }
     }
 
@@ -273,20 +302,13 @@ impl Datadog {
         let mut docs = Vec::new();
         let mut cursor: Option<String> = None;
         loop {
-            let mut page = serde_json::json!({ "limit": LOG_PAGE_LIMIT });
-            if let Some(cursor) = &cursor {
-                page["cursor"] = serde_json::Value::String(cursor.clone());
-            }
-            // Ascending order makes progress through the window monotonic.
-            let query = serde_json::json!({
-                "filter": {
-                    "from": from_iso,
-                    "to": to_iso,
-                    "query": LOG_SEARCH_QUERY
-                },
-                "page": page,
-                "sort": "timestamp"
-            });
+            let query = log_search_body(
+                from_iso,
+                to_iso,
+                LOG_SEARCH_QUERY,
+                LOG_PAGE_LIMIT,
+                cursor.as_deref(),
+            );
 
             let response = self
                 .http
@@ -373,6 +395,127 @@ impl Datadog {
             environment,
             metadata,
         }
+    }
+
+    /// Fetches up to `max_events` logs matching `query` in `[from, to]` with
+    /// `POST /api/v2/logs/events/search`, oldest first, following the cursor like
+    /// [`Self::search_logs`]. Transient failures are retried per `self.retry`;
+    /// failures are attributed to [`Stage::LiveEvidence`].
+    pub async fn search_log_events(
+        &self,
+        query: &str,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+        max_events: usize,
+    ) -> Result<LogEvents, RagError> {
+        let url = format!("{}/api/v2/logs/events/search", self.api_base);
+        let (from_iso, to_iso) = (
+            crate::planner::format_utc(from),
+            crate::planner::format_utc(to),
+        );
+        let mut events = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let limit = (max_events.saturating_sub(events.len()) as u64).clamp(1, LOG_PAGE_LIMIT);
+            let body = log_search_body(&from_iso, &to_iso, query, limit, cursor.as_deref());
+            let r = send_with_retry(&self.retry, "datadog logs search", || {
+                self.http
+                    .post(&url)
+                    .header("DD-API-KEY", &self.api_key)
+                    .header("DD-APPLICATION-KEY", &self.app_key)
+                    .json(&body)
+            })
+            .await
+            .map_err(|f| RagError::upstream(Stage::LiveEvidence, f))?;
+            let result: serde_json::Value = r.json().await.map_err(|e| {
+                RagError::failed(Stage::LiveEvidence, UpstreamError::from_reqwest(e))
+            })?;
+            let logs = result["data"]
+                .as_array()
+                .ok_or_else(|| invalid("log search response has no data"))?;
+            events.extend(logs.iter().map(|log| self.log_document(log)));
+
+            let next = result["meta"]["page"]["after"]
+                .as_str()
+                .filter(|_| !logs.is_empty());
+            match next {
+                Some(_) if events.len() >= max_events => {
+                    return Ok(LogEvents {
+                        events,
+                        truncated: true,
+                    });
+                }
+                Some(after) => {
+                    if cursor.as_deref() == Some(after) {
+                        return Err(invalid("log search returned the same cursor twice"));
+                    }
+                    cursor = Some(after.to_string());
+                }
+                None => {
+                    return Ok(LogEvents {
+                        events,
+                        truncated: false,
+                    });
+                }
+            }
+        }
+    }
+
+    /// Queries timeseries points with `GET /api/v1/query` (`from`/`to` in Unix
+    /// seconds). Transient failures are retried per `self.retry`; failures are
+    /// attributed to [`Stage::LiveEvidence`]. A 200 response whose `status` is
+    /// not `ok` is an invalid response, not an empty result.
+    pub async fn query_metrics(
+        &self,
+        query: &str,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+    ) -> Result<Vec<MetricSeries>, RagError> {
+        let url = format!("{}/api/v1/query", self.api_base);
+        let params = [
+            ("from", from.timestamp().to_string()),
+            ("to", to.timestamp().to_string()),
+            ("query", query.to_string()),
+        ];
+        let r = send_with_retry(&self.retry, "datadog metrics query", || {
+            self.http
+                .get(&url)
+                .header("DD-API-KEY", &self.api_key)
+                .header("DD-APPLICATION-KEY", &self.app_key)
+                .query(&params)
+        })
+        .await
+        .map_err(|f| RagError::upstream(Stage::LiveEvidence, f))?;
+        let result: serde_json::Value = r
+            .json()
+            .await
+            .map_err(|e| RagError::failed(Stage::LiveEvidence, UpstreamError::from_reqwest(e)))?;
+        if let Some(status) = result["status"].as_str()
+            && status != "ok"
+        {
+            tracing::warn!(status, error = %result["error"], "datadog metrics query returned an error status");
+            return Err(invalid("metrics query status is not ok"));
+        }
+        let series = result["series"]
+            .as_array()
+            .ok_or_else(|| invalid("metrics query response has no series"))?;
+        Ok(series
+            .iter()
+            .map(|s| MetricSeries {
+                expression: s["expression"].as_str().unwrap_or(query).to_string(),
+                metric: s["metric"].as_str().unwrap_or("").to_string(),
+                scope: s["scope"].as_str().unwrap_or("").to_string(),
+                interval_secs: s["interval"].as_u64(),
+                points: s["pointlist"]
+                    .as_array()
+                    .map(|pl| {
+                        pl.iter()
+                            .filter_map(|p| Some((p.get(0)?.as_f64()? as i64, p.get(1)?.as_f64())))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            })
+            .collect())
     }
 
     /// Fetches all dashboards with `GET /api/v1/dashboard`, following `start`/`count`
@@ -604,6 +747,37 @@ impl Datadog {
             metadata,
         }
     }
+}
+
+fn invalid(msg: &str) -> RagError {
+    RagError::failed(
+        Stage::LiveEvidence,
+        UpstreamError::InvalidResponse(msg.into()),
+    )
+}
+
+/// Body for `POST /api/v2/logs/events/search`. Ascending order makes progress
+/// through the window monotonic.
+fn log_search_body(
+    from_iso: &str,
+    to_iso: &str,
+    query: &str,
+    limit: u64,
+    cursor: Option<&str>,
+) -> serde_json::Value {
+    let mut page = serde_json::json!({ "limit": limit });
+    if let Some(cursor) = cursor {
+        page["cursor"] = serde_json::Value::String(cursor.to_string());
+    }
+    serde_json::json!({
+        "filter": {
+            "from": from_iso,
+            "to": to_iso,
+            "query": query
+        },
+        "page": page,
+        "sort": "timestamp"
+    })
 }
 
 /// Reads an incident field (`{"type": ..., "value": ...}`) as a string, taking the
@@ -1375,5 +1549,149 @@ mod tests {
 
         assert_eq!(docs.len(), 1001);
         assert_eq!(docs[1000].id, "slo_c2ce7fb6030c5c0b8035d1ce94dec12c");
+    }
+
+    fn utc(s: &str) -> DateTime<Utc> {
+        s.parse().unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_query_metrics_sends_documented_request_and_parses_fixture() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/query"))
+            .and(header("DD-API-KEY", "test_api_key"))
+            .and(header("DD-APPLICATION-KEY", "test_app_key"))
+            .and(query_param("from", "1641343852"))
+            .and(query_param("to", "1641430252"))
+            .and(query_param("query", "system.cpu.idle{*}"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(fixture("metrics_query.json")))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let series = mock_client(&server)
+            .query_metrics(
+                "system.cpu.idle{*}",
+                utc("2022-01-05T00:50:52Z"),
+                utc("2022-01-06T00:50:52Z"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(series.len(), 1);
+        let s = &series[0];
+        assert_eq!(s.metric, "system.cpu.idle");
+        assert_eq!(s.expression, "system.cpu.idle{*}");
+        assert_eq!(s.interval_secs, Some(300));
+        assert_eq!(s.points.len(), 288);
+        assert_eq!(s.points[0], (1641344100000, Some(91.4583840476142)));
+    }
+
+    #[tokio::test]
+    async fn test_query_metrics_retries_5xx_and_rejects_error_status() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/query"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/query"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"status": "error", "error": "bad query"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut dd = mock_client(&server);
+        dd.retry = RetryPolicy {
+            max_attempts: 2,
+            base_delay: std::time::Duration::from_millis(1),
+            max_delay: std::time::Duration::from_millis(10),
+        };
+        let err = dd
+            .query_metrics(
+                "x{*}",
+                utc("2022-01-05T00:00:00Z"),
+                utc("2022-01-06T00:00:00Z"),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), "live_evidence_failed");
+        assert_eq!(err.stage(), Some(Stage::LiveEvidence));
+    }
+
+    #[tokio::test]
+    async fn test_search_log_events_sends_query_and_stops_at_cap() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v2/logs/events/search"))
+            .and(header("DD-API-KEY", "test_api_key"))
+            .and(header("DD-APPLICATION-KEY", "test_app_key"))
+            .and(body_partial_json(serde_json::json!({
+                "filter": {
+                    "from": "2022-04-11T16:00:00Z",
+                    "to": "2022-04-11T17:00:00Z",
+                    "query": "service:auth-api status:(error OR warn)"
+                },
+                "page": {"limit": 2},
+                "sort": "timestamp"
+            })))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(fixture("logs_search_page1.json")),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let logs = mock_client(&server)
+            .search_log_events(
+                "service:auth-api status:(error OR warn)",
+                utc("2022-04-11T16:00:00Z"),
+                utc("2022-04-11T17:00:00Z"),
+                2,
+            )
+            .await
+            .unwrap();
+        // The page carried a next cursor, but the cap was reached.
+        assert_eq!(logs.events.len(), 2);
+        assert!(logs.truncated);
+    }
+
+    #[tokio::test]
+    async fn test_search_log_events_follows_cursor_until_last_page() {
+        let server = MockServer::start().await;
+        log_search(None)
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(fixture("logs_search_page1.json")),
+            )
+            .mount(&server)
+            .await;
+        log_search(Some(LOGS_CURSOR_1))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(fixture("logs_search_page2.json")),
+            )
+            .mount(&server)
+            .await;
+        log_search(Some(LOGS_CURSOR_2))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(fixture("logs_search_page3.json")),
+            )
+            .mount(&server)
+            .await;
+        let logs = mock_client(&server)
+            .search_log_events(
+                "status:error OR status:warn",
+                utc("2022-04-11T16:00:00Z"),
+                utc("2022-04-11T17:00:00Z"),
+                5000,
+            )
+            .await
+            .unwrap();
+        assert_eq!(logs.events.len(), 3);
+        assert!(!logs.truncated);
     }
 }

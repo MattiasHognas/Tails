@@ -25,6 +25,9 @@ enum Cmd {
         /// IANA timezone for relative times like "yesterday" (default: local zone)
         #[arg(long)]
         tz: Option<String>,
+        /// Don't query live Datadog metrics/logs for this question
+        #[arg(long)]
+        no_live_evidence: bool,
     },
     /// Just view the plan (intent + inferred fields)
     Plan {
@@ -53,6 +56,7 @@ fn ask_payload(
     service: Option<String>,
     kinds: Vec<String>,
     timezone: Option<String>,
+    no_live_evidence: bool,
 ) -> serde_json::Value {
     let mut payload = serde_json::json!({
         "question": question,
@@ -63,7 +67,67 @@ fn ask_payload(
     if !kinds.is_empty() {
         payload["kinds"] = serde_json::json!(kinds);
     }
+    if no_live_evidence {
+        payload["live_evidence"] = serde_json::json!(false);
+    }
     payload
+}
+
+/// Render the `/ask` response's live-evidence `timeline` as three sections:
+/// observed facts, hypotheses and missing evidence. `None` when live evidence
+/// was not relevant (non-diagnostic question) or absent.
+fn format_timeline(t: &serde_json::Value) -> Option<String> {
+    use std::fmt::Write;
+    if !t.is_object() || t["skipReason"] == "not_diagnostic" {
+        return None;
+    }
+    let s = |v: &serde_json::Value| v.as_str().unwrap_or("").to_string();
+    let list = |v: &serde_json::Value| v.as_array().cloned().unwrap_or_default();
+    let mut out = String::from("Live evidence");
+    if let Some(w) = t["window"].as_object() {
+        let _ = write!(out, " ({} to {})", s(&w["fromUtc"]), s(&w["toUtc"]));
+    }
+    out.push_str(":\n");
+    out.push_str("  Observed:\n");
+    let obs = list(&t["observations"]);
+    if obs.is_empty() {
+        out.push_str("    (none)\n");
+    }
+    for o in obs {
+        let _ = writeln!(
+            out,
+            "    [{}] {} .. {}  {}\n         {}",
+            s(&o["id"]),
+            s(&o["startUtc"]),
+            s(&o["endUtc"]),
+            s(&o["summary"]),
+            s(&o["link"])
+        );
+    }
+    out.push_str("  Hypotheses (unverified):\n");
+    let hyp = list(&t["hypotheses"]);
+    if hyp.is_empty() {
+        out.push_str("    (none)\n");
+    }
+    for h in hyp {
+        let ids: Vec<String> = list(&h["observationIds"]).iter().map(s).collect();
+        let _ = writeln!(out, "    - {} [{}]", s(&h["statement"]), ids.join(", "));
+    }
+    out.push_str("  Missing evidence:\n");
+    let missing = list(&t["missingEvidence"]);
+    if missing.is_empty() {
+        out.push_str("    (none)\n");
+    }
+    for m in missing {
+        let _ = writeln!(
+            out,
+            "    - {} ({}): {}",
+            s(&m["subject"]),
+            s(&m["reason"]),
+            s(&m["detail"])
+        );
+    }
+    Some(out)
 }
 
 /// Render a non-2xx API response. Typed errors look like
@@ -129,10 +193,18 @@ async fn main() -> Result<()> {
             service,
             kinds,
             tz,
+            no_live_evidence,
         } => {
             // The server plans (service/env/time inference) and applies the plan to
             // retrieval; explicit flags take precedence over inferred values.
-            let payload = ask_payload(question, env, service, kinds, timezone(tz));
+            let payload = ask_payload(
+                question,
+                env,
+                service,
+                kinds,
+                timezone(tz),
+                no_live_evidence,
+            );
             let mut req = http.post(format!("{}/ask", base)).json(&payload);
             if let Some(t) = token.as_ref() {
                 req = req.bearer_auth(t);
@@ -141,6 +213,9 @@ async fn main() -> Result<()> {
 
             // If the planner needs more info, print questions (soft guidance)
             if let Ok(resp) = serde_json::from_str::<serde_json::Value>(&text) {
+                if let Some(timeline) = format_timeline(&resp["timeline"]) {
+                    eprintln!("{timeline}");
+                }
                 let plan = &resp["plan"];
                 if plan["missingFields"]
                     .as_array()
@@ -195,6 +270,7 @@ mod tests {
             Some("auth-api".into()),
             vec![],
             Some("Europe/Stockholm".into()),
+            false,
         );
         assert_eq!(
             p,
@@ -205,8 +281,39 @@ mod tests {
                 "timezone": "Europe/Stockholm",
             })
         );
-        let p = ask_payload("q".into(), None, None, vec!["logs".into()], None);
+        let p = ask_payload("q".into(), None, None, vec!["logs".into()], None, true);
         assert_eq!(p["kinds"], serde_json::json!(["logs"]));
+        assert_eq!(p["live_evidence"], false);
+    }
+
+    #[test]
+    fn formats_timeline_sections() {
+        let t = serde_json::json!({
+            "status": "collected",
+            "window": {"fromUtc": "2026-09-22T22:00:00Z", "toUtc": "2026-09-23T22:00:00Z"},
+            "observations": [{
+                "id": "obs-1", "kind": "spike", "startUtc": "2026-09-23T10:00:00Z",
+                "endUtc": "2026-09-23T11:00:00Z", "summary": "latency above baseline",
+                "link": "https://app.datadoghq.eu/metric/explorer?x"
+            }],
+            "hypotheses": [{"statement": "pool exhaustion", "observationIds": ["obs-1"]}],
+            "missingEvidence": [{"subject": "metrics for billing", "reason": "no_metrics_discovered", "detail": "only logs checked"}]
+        });
+        let out = format_timeline(&t).unwrap();
+        assert!(out.starts_with("Live evidence (2026-09-22T22:00:00Z to 2026-09-23T22:00:00Z):"));
+        assert!(out.contains("  Observed:\n    [obs-1] 2026-09-23T10:00:00Z .. 2026-09-23T11:00:00Z  latency above baseline"));
+        assert!(out.contains("  Hypotheses (unverified):\n    - pool exhaustion [obs-1]"));
+        assert!(
+            out.contains("    - metrics for billing (no_metrics_discovered): only logs checked")
+        );
+
+        assert!(
+            format_timeline(
+                &serde_json::json!({"status": "skipped", "skipReason": "not_diagnostic"})
+            )
+            .is_none()
+        );
+        assert!(format_timeline(&serde_json::Value::Null).is_none());
     }
 
     #[test]

@@ -7,13 +7,15 @@ use axum::{
     routing::post,
 };
 use rag_core::{
-    domain::SourceKind,
+    datadog::Datadog,
+    domain::{Hit, SourceKind},
     error::{RagError, Stage},
+    live_evidence::{self, GateInput, LiveEvidenceConfig, LiveEvidenceRequest, Timeline},
     openai::OpenAiClient,
     planner::{self, Clock, PlanContext, QueryPlan, SystemClock, Window},
     qdrant::Qdrant,
-    rag_service::{StageTimeouts, retrieve_and_answer},
-    resilience::{env_duration_ms, run_stage},
+    rag_service::{StageTimeouts, answer_candidates, retrieve},
+    resilience::{HttpConfig, RetryPolicy, env_duration_ms, run_stage},
     retrieval::{ExplicitScope, RetrievalScope, normalize_filters},
 };
 use serde::{Deserialize, Serialize};
@@ -29,6 +31,9 @@ struct AppState {
     qd: Qdrant,
     limits: Limits,
     clock: Arc<dyn Clock>,
+    /// Datadog client for live evidence; `None` without `DD_API_KEY`/`DD_APP_KEY`.
+    dd: Option<Arc<Datadog>>,
+    live: LiveEvidenceConfig,
 }
 
 /// Request deadlines. Retry budgets live on the clients (`RetryPolicy`).
@@ -68,7 +73,8 @@ impl ApiError {
             | RagError::RetrievalFailed { .. }
             | RagError::GenerationFailed { .. }
             | RagError::PlanningFailed { .. }
-            | RagError::IndexingFailed { .. } => StatusCode::BAD_GATEWAY,
+            | RagError::IndexingFailed { .. }
+            | RagError::LiveEvidenceFailed { .. } => StatusCode::BAD_GATEWAY,
             RagError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -146,6 +152,9 @@ struct AskReq {
     /// A plan from `/ask/plan`. When present the planner is not called again; it is
     /// still validated like planner output.
     plan: Option<Value>,
+    /// Live Datadog evidence: `false` disables it, `true` runs it even for a
+    /// question not classified as diagnostic. Omitted: diagnostic questions only.
+    live_evidence: Option<bool>,
 }
 
 fn bad_request(msg: impl std::fmt::Display) -> ApiError {
@@ -283,6 +292,90 @@ fn choose_topk(q: &str) -> usize {
     choose_topk_with_config(q, &TopKConfig::from_env())
 }
 
+/// Datadog client for live evidence, if credentials are configured. Missing
+/// credentials disable live evidence (reported per request); they never fail startup.
+fn datadog_from_env() -> Option<Arc<Datadog>> {
+    match Datadog::new_from_env() {
+        Ok(mut dd) => {
+            dd.http = HttpConfig::from_env().build_client();
+            dd.retry = RetryPolicy::from_env();
+            Some(Arc::new(dd))
+        }
+        Err(_) => {
+            tracing::warn!("DD_API_KEY/DD_APP_KEY not set; live evidence is disabled");
+            None
+        }
+    }
+}
+
+/// Live Datadog evidence for the question, from the resolved scope and the
+/// retrieved hits. Never fails the request: problems are in `missingEvidence`.
+async fn live_timeline(
+    st: &AppState,
+    req: &AskReq,
+    plan: &QueryPlan,
+    scope: &RetrievalScope,
+    hits: &[Hit],
+) -> Timeline {
+    let window = match live_evidence::gate(GateInput {
+        config: &st.live,
+        configured: st.dd.is_some(),
+        requested: req.live_evidence,
+        diagnostic: live_evidence::is_diagnostic(&plan.intent, &req.question),
+        from: scope.from_utc,
+        to: scope.to_utc,
+        now: st.clock.now(),
+    }) {
+        Ok(window) => window,
+        Err(skipped) => {
+            tracing::info!(reason = ?skipped.skip_reason, "live evidence skipped");
+            return *skipped;
+        }
+    };
+    // `gate` already skipped when no client is configured.
+    let Some(dd) = st.dd.as_deref() else {
+        return Timeline::skipped(
+            live_evidence::SkipReason::NotConfigured,
+            "no Datadog client",
+        );
+    };
+    let found = live_evidence::discovery::discover(
+        hits,
+        scope.service.as_deref(),
+        plan.metric.as_deref(),
+        st.live.caps,
+    );
+    if found.services.is_empty() && found.metrics.is_empty() {
+        return Timeline::skipped(
+            live_evidence::SkipReason::NothingToQuery,
+            "no service or metric could be identified from the question or the retrieved documents",
+        );
+    }
+    let request = LiveEvidenceRequest {
+        question: req.question.clone(),
+        services: found.services,
+        environment: scope.environment.clone(),
+        metrics: found.metrics,
+        window,
+        missing: found.missing,
+    };
+    let timeline = live_evidence::collect_timeline(
+        dd,
+        Some(&st.oa),
+        request,
+        &st.live,
+        st.limits.stages.live_evidence,
+    )
+    .await;
+    tracing::info!(
+        observations = timeline.observations.len(),
+        hypotheses = timeline.hypotheses.len(),
+        missing = timeline.missing_evidence.len(),
+        "live evidence collected"
+    );
+    timeline
+}
+
 fn app(state: AppState) -> Router {
     Router::new()
         .route("/ask/plan", post(plan))
@@ -302,6 +395,8 @@ async fn main() -> Result<()> {
         qd: Qdrant::new_from_env()?,
         limits: Limits::from_env(),
         clock: Arc::new(SystemClock),
+        dd: datadog_from_env(),
+        live: LiveEvidenceConfig::from_env(),
     };
 
     let addr: SocketAddr = "0.0.0.0:5191".parse().unwrap();
@@ -355,29 +450,42 @@ async fn ask(
             .unwrap_or(64);
         let top_k = choose_topk(&req.question);
 
-        // Embedding/retrieval failures are errors, never empty evidence; the LLM
-        // is only called when retrieval succeeded with at least one hit.
-        let outcome = retrieve_and_answer(
+        // Embedding/retrieval failures are errors, never empty evidence.
+        let hits = retrieve(
             &st.oa,
             &st.qd,
             &query,
-            &req.question,
             scope.to_qdrant_filter(),
             search_limit,
-            top_k,
             &st.limits.stages,
         )
         .await?;
-        Ok((outcome, plan, scope))
+
+        let timeline = live_timeline(&st, &req, &plan, &scope, &hits).await;
+        // The LLM is only called with at least one hit or live observation.
+        let live_context = timeline
+            .prompt_context()
+            .filter(|_| !hits.is_empty() || timeline.has_observations());
+        let outcome = answer_candidates(
+            &st.oa,
+            hits,
+            top_k,
+            &req.question,
+            live_context.as_deref(),
+            &st.limits.stages,
+        )
+        .await?;
+        Ok((outcome, plan, scope, timeline))
     })
     .await;
-    let (outcome, plan, scope) = result?;
+    let (outcome, plan, scope, timeline) = result?;
 
     Ok(Json(json!({
         "answer": outcome.answer,
         "evidence": outcome.evidence,
         "plan": plan,
         "scope": scope.to_json(),
+        "timeline": timeline,
     })))
 }
 
@@ -494,7 +602,7 @@ mod tests {
         use super::super::*;
         use chrono::{DateTime, Utc};
         use rag_core::planner::FixedClock;
-        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::matchers::{body_partial_json, method, path, query_param};
         use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
         struct Harness {
@@ -505,6 +613,17 @@ mod tests {
 
         /// Starts the API against mocked OpenAI and Qdrant with a fixed clock.
         async fn harness(now: &str, llm_plan: Value) -> Harness {
+            harness_with(now, llm_plan, vec![], None, LiveEvidenceConfig::default()).await
+        }
+
+        /// Like [`harness`], with extra Qdrant hits and optionally a mocked Datadog.
+        async fn harness_with(
+            now: &str,
+            llm_plan: Value,
+            extra_hits: Vec<Value>,
+            datadog: Option<&MockServer>,
+            live: LiveEvidenceConfig,
+        ) -> Harness {
             let openai = MockServer::start().await;
             Mock::given(method("POST"))
                 .and(path("/v1/chat/completions"))
@@ -534,22 +653,24 @@ mod tests {
                 .await;
 
             let qdrant = MockServer::start().await;
+            let mut hits = vec![json!({
+                "id": 1,
+                "score": 0.9,
+                "payload": {
+                    "id": "incident_1#c0",
+                    "Title": "auth-api 5xx spike",
+                    "Text": "Error rate above 5%",
+                    "SourceUri": "https://app.datadoghq.eu/incidents/1",
+                    "Kind": "incident",
+                    "Timestamp": "2026-09-23T10:00:00Z",
+                    "Service": "auth-api",
+                    "Environment": "prod"
+                }
+            })];
+            hits.extend(extra_hits);
             Mock::given(method("POST"))
                 .and(path("/collections/test/points/search"))
-                .respond_with(ResponseTemplate::new(200).set_body_json(json!({"result": [{
-                    "id": 1,
-                    "score": 0.9,
-                    "payload": {
-                        "id": "incident_1#c0",
-                        "Title": "auth-api 5xx spike",
-                        "Text": "Error rate above 5%",
-                        "SourceUri": "https://app.datadoghq.eu/incidents/1",
-                        "Kind": "incident",
-                        "Timestamp": "2026-09-23T10:00:00Z",
-                        "Service": "auth-api",
-                        "Environment": "prod"
-                    }
-                }]})))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({"result": hits})))
                 .mount(&qdrant)
                 .await;
 
@@ -559,9 +680,19 @@ mod tests {
                 qd: Qdrant::new(qdrant.uri(), "test".into()),
                 limits: Limits {
                     ask_deadline: Duration::from_secs(10),
-                    stages: StageTimeouts::default(),
+                    stages: StageTimeouts {
+                        live_evidence: Duration::from_millis(500),
+                        ..StageTimeouts::default()
+                    },
                 },
                 clock: Arc::new(FixedClock(now)),
+                dd: datadog.map(|server| {
+                    let mut dd = Datadog::new("api".into(), "app".into(), "datadoghq.eu".into());
+                    dd.api_base = server.uri();
+                    dd.retry = RetryPolicy::none();
+                    Arc::new(dd)
+                }),
+                live,
             };
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
@@ -772,6 +903,344 @@ mod tests {
             assert_eq!(plan["filters"], json!([]));
             assert_eq!(plan["window"]["fromUtc"], "2026-09-22T22:00:00Z");
         }
+
+        /// Datadog mock for "yesterday" in Stockholm asked at 2026-09-24T08:00Z:
+        /// window 2026-09-22T22:00Z..2026-09-23T22:00Z, baseline the day before.
+        async fn datadog_with_spike() -> MockServer {
+            let dd = MockServer::start().await;
+            // Hourly points: flat 0.2s, 1.5s at 10:00 and 11:00 UTC on the 23rd.
+            let start = 1_790_028_000_000_i64; // 2026-09-21T22:00:00Z
+            let points: Vec<Value> = (0..48)
+                .map(|i| {
+                    let t = start + i * 3_600_000;
+                    let v = if i == 36 || i == 37 { 1.5 } else { 0.2 };
+                    json!([t, v])
+                })
+                .collect();
+            Mock::given(method("GET"))
+                .and(path("/api/v1/query"))
+                .and(query_param("from", "1790028000"))
+                .and(query_param("to", "1790200800"))
+                .and(query_param(
+                    "query",
+                    "avg:trace.http.request.duration{service:auth-api,env:prod}",
+                ))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "status": "ok",
+                    "series": [{
+                        "metric": "trace.http.request.duration",
+                        "expression": "avg:trace.http.request.duration{env:prod,service:auth-api}",
+                        "scope": "env:prod,service:auth-api",
+                        "interval": 3600,
+                        "pointlist": points
+                    }]
+                })))
+                .expect(1)
+                .mount(&dd)
+                .await;
+            let logs: Vec<Value> = (0..6)
+                .map(|i| {
+                    json!({"id": format!("log{i}"), "attributes": {
+                        "service": "auth-api",
+                        "status": "error",
+                        "timestamp": format!("2026-09-23T10:1{i}:00.000Z"),
+                        "message": format!("db connection pool exhausted after {i}00ms"),
+                        "tags": ["env:prod"]
+                    }})
+                })
+                .collect();
+            Mock::given(method("POST"))
+                .and(path("/api/v2/logs/events/search"))
+                .and(body_partial_json(json!({"filter": {
+                    "from": "2026-09-22T22:00:00Z",
+                    "to": "2026-09-23T22:00:00Z",
+                    "query": "service:auth-api env:prod status:(error OR warn)"
+                }})))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(json!({"data": logs, "meta": {"page": {}}})),
+                )
+                .expect(1)
+                .mount(&dd)
+                .await;
+            dd
+        }
+
+        fn monitor_hit() -> Value {
+            json!({
+                "id": 2,
+                "score": 0.8,
+                "payload": {
+                    "id": "monitor_7#c0",
+                    "Title": "auth-api latency",
+                    "Text": "auth-api latency\n\nQuery: avg(last_5m):avg:trace.http.request.duration{service:auth-api} > 1",
+                    "SourceUri": "https://app.datadoghq.eu/monitors/7",
+                    "Kind": "monitor",
+                    "Timestamp": null,
+                    "Service": "auth-api",
+                    "Environment": "prod",
+                    "Metadata": {"query": "avg(last_5m):avg:trace.http.request.duration{service:auth-api} > 1"}
+                }
+            })
+        }
+
+        /// A plan supplied with the request, so the only JSON-mode LLM call is
+        /// hypothesis generation.
+        fn diagnostic_ask() -> Value {
+            json!({
+                "question": "why did auth-api fail yesterday?",
+                "timezone": "Europe/Stockholm",
+                "plan": {"intent": "rootCauseWindow", "service": "auth-api", "environment": "prod"}
+            })
+        }
+
+        #[tokio::test]
+        async fn diagnostic_ask_returns_live_timeline_and_grounds_the_answer() {
+            let dd = datadog_with_spike().await;
+            let hypotheses = json!({"hypotheses": [
+                {"statement": "Pool exhaustion slowed requests", "observationIds": ["obs-2", "obs-3"]},
+                {"statement": "Unrelated deploy", "observationIds": ["obs-99"]}
+            ]});
+            let h = harness_with(
+                "2026-09-24T08:00:00Z",
+                hypotheses,
+                vec![monitor_hit()],
+                Some(&dd),
+                LiveEvidenceConfig::default(),
+            )
+            .await;
+
+            let (status, resp) = post(&h.base, "/ask", diagnostic_ask()).await;
+            assert_eq!(status, StatusCode::OK, "{resp}");
+            assert_eq!(resp["answer"], "the answer");
+            assert!(resp["plan"].is_object() && resp["scope"].is_object());
+
+            let t = &resp["timeline"];
+            assert_eq!(t["status"], "collected");
+            assert_eq!(
+                t["window"],
+                json!({"fromUtc": "2026-09-22T22:00:00Z", "toUtc": "2026-09-23T22:00:00Z"})
+            );
+            assert_eq!(
+                t["baseline"],
+                json!({"fromUtc": "2026-09-21T22:00:00Z", "toUtc": "2026-09-22T22:00:00Z"})
+            );
+            let obs = t["observations"].as_array().unwrap();
+            let kinds: Vec<(&str, &str)> = obs
+                .iter()
+                .map(|o| (o["id"].as_str().unwrap(), o["kind"].as_str().unwrap()))
+                .collect();
+            assert_eq!(
+                kinds,
+                vec![
+                    ("obs-1", "seriesSummary"),
+                    ("obs-2", "spike"),
+                    ("obs-3", "logBurst"),
+                    ("obs-4", "logSummary"),
+                ]
+            );
+            let spike = &obs[1];
+            for key in [
+                "id", "kind", "source", "service", "query", "startUtc", "endUtc", "summary",
+                "values", "link",
+            ] {
+                assert!(spike.get(key).is_some(), "observation lacks {key}: {spike}");
+            }
+            assert_eq!(spike["source"], "metricQuery");
+            assert_eq!(spike["service"], "auth-api");
+            assert_eq!(spike["startUtc"], "2026-09-23T10:00:00Z");
+            assert_eq!(spike["endUtc"], "2026-09-23T11:00:00Z");
+            assert_eq!(spike["values"]["peak"], 1.5);
+            assert!(
+                spike["link"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("https://app.datadoghq.eu/metric/explorer?")
+            );
+            assert_eq!(obs[2]["source"], "logQuery");
+            assert_eq!(obs[2]["values"]["count"], 6);
+            assert_eq!(
+                t["hypotheses"],
+                json!([{"statement": "Pool exhaustion slowed requests", "observationIds": ["obs-2", "obs-3"]}])
+            );
+            assert_eq!(t["missingEvidence"], json!([]));
+
+            // The final answer prompt carries the timeline and the instruction to
+            // keep observed facts apart from hypotheses.
+            let reqs = h.openai.received_requests().await.unwrap();
+            let answer_req = reqs
+                .iter()
+                .find(|r| {
+                    r.url.path() == "/v1/chat/completions"
+                        && body(r).get("response_format").is_none()
+                })
+                .unwrap();
+            let user = body(answer_req)["messages"][1]["content"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            assert!(user.contains("Live evidence timeline"));
+            assert!(user.contains("[obs-2]"));
+            assert!(user.contains("Pool exhaustion slowed requests [obs-2, obs-3]"));
+            assert!(!user.contains("Unrelated deploy"));
+            assert!(user.contains("separate from 'Hypotheses'"));
+        }
+
+        #[tokio::test]
+        async fn datadog_failure_is_missing_evidence_and_ask_still_succeeds() {
+            let dd = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/api/v1/query"))
+                .respond_with(ResponseTemplate::new(503))
+                .expect(1)
+                .mount(&dd)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/api/v2/logs/events/search"))
+                .respond_with(ResponseTemplate::new(500))
+                .expect(1)
+                .mount(&dd)
+                .await;
+            let h = harness_with(
+                "2026-09-24T08:00:00Z",
+                json!({}),
+                vec![monitor_hit()],
+                Some(&dd),
+                LiveEvidenceConfig::default(),
+            )
+            .await;
+            let (status, resp) = post(&h.base, "/ask", diagnostic_ask()).await;
+            assert_eq!(status, StatusCode::OK, "{resp}");
+            assert_eq!(resp["answer"], "the answer");
+            let t = &resp["timeline"];
+            assert_eq!(t["status"], "collected");
+            assert_eq!(t["observations"], json!([]));
+            assert_eq!(t["hypotheses"], json!([]));
+            let missing = t["missingEvidence"].as_array().unwrap();
+            assert_eq!(missing.len(), 2);
+            assert!(missing.iter().all(|m| m["reason"] == "query_failed"));
+            assert!(missing[0]["detail"].as_str().unwrap().contains("HTTP 503"));
+            // No observations, so no hypothesis call was made.
+            assert_eq!(planner_calls(&h).await, 0);
+        }
+
+        #[tokio::test]
+        async fn datadog_timeout_is_missing_evidence_within_the_stage_budget() {
+            let dd = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/api/v1/query"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(json!({"status": "ok", "series": []}))
+                        .set_delay(Duration::from_secs(5)),
+                )
+                .mount(&dd)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/api/v2/logs/events/search"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(json!({"data": []}))
+                        .set_delay(Duration::from_secs(5)),
+                )
+                .mount(&dd)
+                .await;
+            let h = harness_with(
+                "2026-09-24T08:00:00Z",
+                json!({}),
+                vec![monitor_hit()],
+                Some(&dd),
+                LiveEvidenceConfig::default(),
+            )
+            .await;
+            // The harness gives live evidence 500ms; the answer still comes back.
+            let started = std::time::Instant::now();
+            let (status, resp) = post(&h.base, "/ask", diagnostic_ask()).await;
+            assert_eq!(status, StatusCode::OK, "{resp}");
+            assert!(started.elapsed() < Duration::from_secs(3));
+            assert_eq!(resp["answer"], "the answer");
+            let reasons: Vec<&str> = resp["timeline"]["missingEvidence"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|m| m["reason"].as_str().unwrap())
+                .collect();
+            assert_eq!(reasons, vec!["timed_out", "timed_out"]);
+        }
+
+        #[tokio::test]
+        async fn live_evidence_is_skipped_without_window_or_when_disabled() {
+            let dd = MockServer::start().await;
+            Mock::given(wiremock::matchers::any())
+                .respond_with(ResponseTemplate::new(500))
+                .expect(0)
+                .mount(&dd)
+                .await;
+            let h = harness_with(
+                "2026-09-24T08:00:00Z",
+                json!({}),
+                vec![monitor_hit()],
+                Some(&dd),
+                LiveEvidenceConfig::default(),
+            )
+            .await;
+
+            // No window: the question has no relative time and none is supplied.
+            let (status, resp) = post(
+                &h.base,
+                "/ask",
+                json!({"question": "why does auth-api fail?", "plan": {"intent": "rootCauseWindow"}}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(resp["timeline"]["status"], "skipped");
+            assert_eq!(resp["timeline"]["skipReason"], "window_not_specified");
+            assert_eq!(resp["timeline"]["missingEvidence"][0]["reason"], "skipped");
+
+            // Disabled by the request.
+            let mut req = diagnostic_ask();
+            req["live_evidence"] = json!(false);
+            let (_, resp) = post(&h.base, "/ask", req).await;
+            assert_eq!(resp["timeline"]["skipReason"], "disabled_by_request");
+
+            // Not diagnostic.
+            let (_, resp) = post(
+                &h.base,
+                "/ask",
+                json!({"question": "list dashboards yesterday", "timezone": "Europe/Stockholm",
+                       "plan": {"intent": "dashboardLookup"}}),
+            )
+            .await;
+            assert_eq!(resp["timeline"]["skipReason"], "not_diagnostic");
+            assert_eq!(resp["timeline"]["missingEvidence"], json!([]));
+
+            // Disabled by configuration (RAG_LIVE_EVIDENCE=off).
+            let off = harness_with(
+                "2026-09-24T08:00:00Z",
+                json!({}),
+                vec![],
+                Some(&dd),
+                LiveEvidenceConfig {
+                    enabled: false,
+                    ..LiveEvidenceConfig::default()
+                },
+            )
+            .await;
+            let (_, resp) = post(&off.base, "/ask", diagnostic_ask()).await;
+            assert_eq!(resp["timeline"]["skipReason"], "disabled");
+        }
+
+        #[tokio::test]
+        async fn missing_datadog_credentials_are_reported_not_fatal() {
+            let h = harness("2026-09-24T08:00:00Z", json!({})).await;
+            let (status, resp) = post(&h.base, "/ask", diagnostic_ask()).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(resp["timeline"]["skipReason"], "not_configured");
+            assert_eq!(
+                resp["timeline"]["missingEvidence"][0]["subject"],
+                "live Datadog data"
+            );
+        }
     }
 }
 
@@ -803,6 +1272,7 @@ mod http_tests {
                 embedding: Duration::from_secs(2),
                 retrieval: Duration::from_secs(2),
                 generation: Duration::from_secs(2),
+                live_evidence: Duration::from_secs(2),
             },
         }
     }
@@ -823,6 +1293,8 @@ mod http_tests {
             qd,
             limits,
             clock: Arc::new(SystemClock),
+            dd: None,
+            live: LiveEvidenceConfig::default(),
         };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();

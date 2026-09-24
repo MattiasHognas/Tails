@@ -1311,6 +1311,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "chrono-tz",
+ "futures",
  "hex",
  "itertools",
  "reqwest",

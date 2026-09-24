@@ -17,6 +17,9 @@ pub enum Stage {
     Retrieval,
     Generation,
     Indexing,
+    /// Live Datadog queries for diagnostic questions. Failures here are
+    /// reported as missing evidence in the timeline, not as request errors.
+    LiveEvidence,
     /// The overall per-request deadline, not attributable to one stage.
     Request,
 }
@@ -29,6 +32,7 @@ impl Stage {
             Stage::Retrieval => "retrieval",
             Stage::Generation => "generation",
             Stage::Indexing => "indexing",
+            Stage::LiveEvidence => "live_evidence",
             Stage::Request => "request",
         }
     }
@@ -40,7 +44,7 @@ impl fmt::Display for Stage {
     }
 }
 
-/// A failed call to an upstream HTTP dependency (OpenAI, Qdrant).
+/// A failed call to an upstream HTTP dependency (OpenAI, Qdrant, Datadog).
 ///
 /// `Display` never contains upstream response bodies or request URLs, so it is
 /// safe to return to API clients; details are logged server-side instead.
@@ -134,6 +138,11 @@ pub enum RagError {
         #[source]
         source: UpstreamError,
     },
+    #[error("live evidence query failed: {source}")]
+    LiveEvidenceFailed {
+        #[source]
+        source: UpstreamError,
+    },
     #[error("{stage} timed out")]
     Timeout { stage: Stage },
     #[error("{stage} upstream unavailable after {attempts} attempt(s): {source}")]
@@ -178,6 +187,7 @@ impl RagError {
             Stage::Generation => RagError::GenerationFailed { source },
             Stage::Planning => RagError::PlanningFailed { source },
             Stage::Indexing => RagError::IndexingFailed { source },
+            Stage::LiveEvidence => RagError::LiveEvidenceFailed { source },
             Stage::Request => RagError::Internal(source.to_string()),
         }
     }
@@ -190,6 +200,7 @@ impl RagError {
             RagError::GenerationFailed { .. } => "generation_failed",
             RagError::PlanningFailed { .. } => "planning_failed",
             RagError::IndexingFailed { .. } => "indexing_failed",
+            RagError::LiveEvidenceFailed { .. } => "live_evidence_failed",
             RagError::Timeout { .. } => "timeout",
             RagError::UpstreamUnavailable { .. } => "upstream_unavailable",
             RagError::InvalidRequest(_) => "invalid_request",
@@ -204,6 +215,7 @@ impl RagError {
             RagError::GenerationFailed { .. } => Some(Stage::Generation),
             RagError::PlanningFailed { .. } => Some(Stage::Planning),
             RagError::IndexingFailed { .. } => Some(Stage::Indexing),
+            RagError::LiveEvidenceFailed { .. } => Some(Stage::LiveEvidence),
             RagError::Timeout { stage } | RagError::UpstreamUnavailable { stage, .. } => {
                 Some(*stage)
             }
@@ -218,7 +230,8 @@ impl RagError {
             | RagError::RetrievalFailed { source }
             | RagError::GenerationFailed { source }
             | RagError::PlanningFailed { source }
-            | RagError::IndexingFailed { source } => source.is_transient(),
+            | RagError::IndexingFailed { source }
+            | RagError::LiveEvidenceFailed { source } => source.is_transient(),
             RagError::Timeout { .. } | RagError::UpstreamUnavailable { .. } => true,
             RagError::InvalidRequest(_) | RagError::Internal(_) => false,
         }

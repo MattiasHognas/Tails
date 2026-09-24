@@ -34,7 +34,7 @@ The server chooses `K` dynamically — no `--k` flag needed.
 | Crate | Description |
 |-------|--------------|
 | `rag-core` | Domain models, OpenAI, Qdrant (search + upsert), Datadog client (monitors, incidents, logs, dashboards, metrics, SLOs), chunker, planner, reranker, RAG service. |
-| `rag-api` | Axum REST API — `/ask/plan` (intent + inferred filters) and `/ask` (server-side planning + filtered retrieval + answer). |
+| `rag-api` | Axum REST API — `/ask/plan` (intent + inferred filters) and `/ask` (server-side planning + filtered retrieval + live Datadog evidence for diagnostic questions + answer). |
 | `rag-cli` | CLI that calls the API. The server plans (service/env/time) and decides top-K. |
 | `rag-indexer` | One-shot, resumable indexer for Datadog → Qdrant with per-source checkpoints. Perfect for Kubernetes CronJob. |
 
@@ -87,7 +87,21 @@ RAG_GENERATE_TIMEOUT_MS=60000        # answer generation stage (incl. retries)
 RAG_RETRY_MAX_ATTEMPTS=3             # total attempts per upstream call (1 = no retries)
 RAG_RETRY_BASE_DELAY_MS=200          # first backoff; doubles per retry, with jitter
 RAG_RETRY_MAX_DELAY_MS=10000         # backoff cap; a longer Retry-After fails fast
+
+# Live evidence (optional; API). Uses DD_API_KEY/DD_APP_KEY/DD_SITE above; without
+# them live evidence is disabled and reported per request, and the API still starts.
+RAG_LIVE_EVIDENCE=on                 # on|off: query live Datadog data for diagnostic questions
+RAG_LIVE_EVIDENCE_TIMEOUT_MS=20000   # budget for all live queries of one question (incl. retries)
+RAG_LIVE_MAX_SERVICES=3              # services queried per question (logs + metric scope)
+RAG_LIVE_MAX_METRICS=5               # metric queries per question
+RAG_LIVE_MAX_LOG_EVENTS=1000         # error/warn logs fetched per service
+RAG_LIVE_MAX_WINDOW_HOURS=168        # longer windows are not queried live
 ```
+
+For live evidence the API's Datadog application key needs the `timeseries_query`
+(`GET /api/v1/query`) and `logs_read_data` (`POST /api/v2/logs/events/search`)
+permissions/scopes. The indexer additionally needs read access to monitors,
+dashboards, SLOs, incidents and metrics.
 
 ---
 
@@ -196,6 +210,10 @@ cargo run -- ask "auth-api latency spikes" --env prod --service auth-api --kind 
 
 `--tz` defaults to `TZ` (when it is an IANA name) or the system timezone.
 
+For diagnostic questions the CLI prints the live-evidence timeline to stderr in
+three sections (observed facts with links, hypotheses citing them, and missing
+evidence) before the JSON response. `--no-live-evidence` skips the live queries.
+
 ### Indexer (manual run)
 ```
 cd crates/rag-indexer
@@ -246,13 +264,15 @@ independently and records its progress in the checkpoint file at `INDEXER_WATERM
   "kinds": null,
   "filters": null,
   "rewritten_query": null,
-  "plan": null
+  "plan": null,
+  "live_evidence": null
 }
 ```
 
 Only `question` is required. The response is
-`{"answer": "...", "evidence": "found" | "none", "plan": {...}, "scope": {"service", "environment", "fromUtc", "toUtc", "kinds"}}`,
-where `plan` is the validated plan and `scope` is what was actually applied to retrieval.
+`{"answer": "...", "evidence": "found" | "none", "plan": {...}, "scope": {"service", "environment", "fromUtc", "toUtc", "kinds"}, "timeline": {...}}`,
+where `plan` is the validated plan, `scope` is what was actually applied to retrieval and
+`timeline` is the live evidence (see [Live evidence](#live-evidence-timeline)).
 
 - **Planning is server-side.** Unless `plan` is supplied (for example, one returned by
   `/ask/plan`), the server calls the planner. A supplied `plan` is validated exactly like
@@ -288,6 +308,71 @@ where `plan` is the validated plan and `scope` is what was actually applied to r
   Documents with no timestamp, and monitors, dashboards and SLOs (whose timestamp, if any,
   is a creation date), always pass the time condition, so "yesterday" still surfaces the
   relevant monitor or SLO. Incidents are filtered by creation time.
+
+### Live evidence (`timeline`)
+
+Indexed documents say which monitors and metrics exist; they cannot show whether latency
+actually spiked. For diagnostic questions `/ask` also queries Datadog for the question's
+window and returns what it measured:
+
+- **When it runs.** The planner intent is `rootCauseWindow` or `metricQuestion` (a keyword
+  heuristic such as "why", "spike", "latency" applies only when the intent is `unknown`),
+  the resolved `scope` has a window (explicit `from_utc`/`to_utc` or an inferred one such as
+  "yesterday"; an open end is "now"), `RAG_LIVE_EVIDENCE` is on and Datadog credentials are
+  configured. `"live_evidence": false` in the request disables it; `true` runs it for any
+  question with a window.
+- **Discovery.** Services come from the scope's service and the retrieved hits; metrics
+  from the plan's `metric`, metric documents and monitor queries (the name before the
+  `{...}` scope, e.g. `trace.http.request.duration` in
+  `avg(last_5m):avg:trace.http.request.duration{service:auth-api} > 2`, keeping `avg`/`sum`/
+  `min`/`max`). Both are ranked by summed retrieval score, the scope's service and planned
+  metric first, and capped (`RAG_LIVE_MAX_SERVICES`, `RAG_LIVE_MAX_METRICS`).
+- **Queries.** Each metric: `GET /api/v1/query` as
+  `avg:<metric>{service:<svc>,env:<env>}` over the window plus an equal-length baseline just
+  before it. Each service: `POST /api/v2/logs/events/search` for
+  `service:<svc> env:<env> status:(error OR warn)` in the window (up to
+  `RAG_LIVE_MAX_LOG_EVENTS`). Queries run concurrently with bounded retries and share
+  `RAG_LIVE_EVIDENCE_TIMEOUT_MS`, inside the overall `/ask` deadline.
+- **Analysis (in code).** Per series: count/min/max/mean/stddev/p5/p50/p95 for window and
+  baseline. A *spike* is at least two consecutive points above
+  `p95 + max(0.5·|p95|, 3·stddev)` of the baseline (one point if above
+  `p95 + max(2·|p95|, 3·stddev)`); a *drop* mirrors this below
+  `p5 - max(|p5|/3, 3·stddev)` (`p5 - max(2·|p5|/3, 3·stddev)` for one point). Three or more missing intervals are a *gap*. Fewer than 5 baseline points
+  disables spike/drop detection. Logs are counted per ~1/24 of the window (at least one
+  minute); a *burst* is a run of buckets with at least `max(5, 3 × median)` events. Top
+  messages are grouped with digits masked.
+- **Hypotheses** are requested from the LLM only when there are observations, and every one
+  must cite observation IDs; hypotheses citing none or unknown IDs are dropped. The answer
+  prompt receives the timeline and must separate observed facts from hypotheses.
+- **Failures never fail `/ask`.** A failed or timed-out query, an empty series, a missing
+  baseline or a cap is logged and listed in `missingEvidence`. Observations are never
+  fabricated. With no retrieved documents but live observations, the answer is generated
+  from the observations (`"evidence": "found"`).
+
+```json
+"timeline": {
+  "status": "collected",
+  "window": {"fromUtc": "2026-09-22T22:00:00Z", "toUtc": "2026-09-23T22:00:00Z"},
+  "baseline": {"fromUtc": "2026-09-21T22:00:00Z", "toUtc": "2026-09-22T22:00:00Z"},
+  "observations": [{
+    "id": "obs-2", "kind": "spike", "source": "metricQuery", "service": "auth-api",
+    "query": "avg:trace.http.request.duration{env:prod,service:auth-api}",
+    "startUtc": "2026-09-23T10:00:00Z", "endUtc": "2026-09-23T11:00:00Z",
+    "summary": "…: 2 point(s) above the baseline band (0.3); extreme 1.5 at 2026-09-23T10:00:00Z vs baseline p95 0.2",
+    "values": {"points": 2, "peak": 1.5, "threshold": 0.3, "baselineReference": 0.2, "ratioToBaseline": 7.5},
+    "link": "https://app.datadoghq.eu/metric/explorer?exp_metric=trace.http.request.duration&…"
+  }],
+  "hypotheses": [{"statement": "Connection pool exhaustion slowed requests", "observationIds": ["obs-2", "obs-3"]}],
+  "missingEvidence": [{"subject": "metrics for payments", "reason": "no_metrics_discovered", "detail": "…"}]
+}
+```
+
+`kind` is `spike`, `drop`, `gap`, `seriesSummary`, `logBurst` or `logSummary`; `source` is
+`metricQuery` or `logQuery`. `reason` is one of `skipped`, `no_metrics_discovered`,
+`query_failed`, `timed_out`, `series_empty`, `no_baseline`, `capped`, `hypotheses_failed`.
+When nothing ran, `status` is `skipped` with `skipReason` `not_diagnostic`, `disabled`,
+`disabled_by_request`, `not_configured`, `window_not_specified`, `window_too_long` or
+`nothing_to_query` (all but `not_diagnostic` also add a `missingEvidence` entry).
 
 ### `POST /ask/plan`
 
