@@ -49,7 +49,21 @@ RAG_GENERATE_TIMEOUT_MS=60000        # answer generation stage (incl. retries)
 RAG_RETRY_MAX_ATTEMPTS=3             # total attempts per upstream call (1 = no retries)
 RAG_RETRY_BASE_DELAY_MS=200          # first backoff; doubles per retry, with jitter
 RAG_RETRY_MAX_DELAY_MS=10000         # backoff cap; a longer Retry-After fails fast
+
+# Live evidence (optional; API). Uses DD_API_KEY/DD_APP_KEY/DD_SITE above; without
+# them live evidence is disabled and reported per request, and the API still starts.
+RAG_LIVE_EVIDENCE=on                 # on|off: query live Datadog data for diagnostic questions
+RAG_LIVE_EVIDENCE_TIMEOUT_MS=20000   # budget for all live queries of one question (incl. retries)
+RAG_LIVE_MAX_SERVICES=3              # services queried per question (logs + metric scope)
+RAG_LIVE_MAX_METRICS=5               # metric queries per question
+RAG_LIVE_MAX_LOG_EVENTS=1000         # error/warn logs fetched per service
+RAG_LIVE_MAX_WINDOW_HOURS=168        # longer windows are not queried live
 ```
+
+For live evidence the API's Datadog application key needs the `timeseries_query`
+(`GET /api/v1/query`) and `logs_read_data` (`POST /api/v2/logs/events/search`)
+permissions/scopes. The indexer additionally needs read access to monitors,
+dashboards, SLOs, incidents and metrics.
 
 ## Running locally
 
@@ -75,6 +89,10 @@ cargo run -- ask "auth-api latency spikes" --env prod --service auth-api --kind 
 ```
 
 `--tz` defaults to `TZ` (when it is an IANA name) or the system timezone.
+
+For diagnostic questions the CLI prints the live-evidence timeline to stderr in
+three sections (observed facts with links, hypotheses citing them, and missing
+evidence) before the JSON response. `--no-live-evidence` skips the live queries.
 
 Installers and prebuilt binaries are described in the [README](../README.md#installing-the-cli).
 

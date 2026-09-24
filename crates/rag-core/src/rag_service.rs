@@ -21,7 +21,20 @@ pub async fn answer_question(
     top_k: usize,
     question: &str,
 ) -> Result<String, RagError> {
-    if candidates.is_empty() {
+    answer_question_with_live_evidence(oa, candidates, top_k, question, None).await
+}
+
+/// Like [`answer_question`], additionally giving the LLM a rendered live-evidence
+/// timeline (see [`crate::live_evidence::Timeline::prompt_context`]). The LLM is
+/// only skipped when there are neither candidates nor live evidence.
+pub async fn answer_question_with_live_evidence(
+    oa: &OpenAiClient,
+    candidates: Vec<Hit>,
+    top_k: usize,
+    question: &str,
+    live_evidence: Option<&str>,
+) -> Result<String, RagError> {
+    if candidates.is_empty() && live_evidence.is_none() {
         return Ok(NO_EVIDENCE_ANSWER.to_string());
     }
     let hits = rerank_mmr_signals(&candidates, top_k);
@@ -73,13 +86,28 @@ pub async fn answer_question(
         );
     }
 
-    let user = format!(
+    let mut user = format!(
         "Question:
 {}
 
 Context:
 {}
-
+",
+        question, sb
+    );
+    if let Some(timeline) = live_evidence {
+        use std::fmt::Write;
+        let _ = write!(
+            user,
+            "
+Live evidence timeline (measured from Datadog for the question's window):
+{}
+",
+            timeline
+        );
+    }
+    user.push_str(
+        "
 Instructions:
 - Answer concisely.
 - If multiple hypotheses exist, list them ordered by likelihood.
@@ -87,8 +115,16 @@ Instructions:
 - Include markdown links to each Source when you cite evidence.
 - If the context does not support an answer, say so; never invent evidence.
 ",
-        question, sb
     );
+    if live_evidence.is_some() {
+        user.push_str(
+            "- Keep 'Observed' facts (only the timeline's observations, cited by ID such as [obs-1] with their link) \
+separate from 'Hypotheses'. Never present a hypothesis or an indexed document as a measured fact.
+- Do not compute new numbers from the observations; quote the values given.
+- Mention missing evidence that limits confidence.
+",
+        );
+    }
     let system = "You are a helpful SRE assistant. Use only provided context. When unsure, say so. Always cite SourceUri for each claim.";
     let out = oa.chat_complete(system, &user).await?;
     Ok(out)
@@ -115,6 +151,8 @@ pub struct StageTimeouts {
     pub embedding: Duration,
     pub retrieval: Duration,
     pub generation: Duration,
+    /// Budget for all live Datadog queries of one question (run concurrently).
+    pub live_evidence: Duration,
 }
 
 impl Default for StageTimeouts {
@@ -124,13 +162,14 @@ impl Default for StageTimeouts {
             embedding: Duration::from_secs(15),
             retrieval: Duration::from_secs(15),
             generation: Duration::from_secs(60),
+            live_evidence: Duration::from_secs(20),
         }
     }
 }
 
 impl StageTimeouts {
     /// `RAG_PLAN_TIMEOUT_MS`, `RAG_EMBED_TIMEOUT_MS`, `RAG_SEARCH_TIMEOUT_MS`,
-    /// `RAG_GENERATE_TIMEOUT_MS`.
+    /// `RAG_GENERATE_TIMEOUT_MS`, `RAG_LIVE_EVIDENCE_TIMEOUT_MS`.
     pub fn from_env() -> Self {
         let d = Self::default();
         Self {
@@ -138,6 +177,7 @@ impl StageTimeouts {
             embedding: env_duration_ms("RAG_EMBED_TIMEOUT_MS", d.embedding),
             retrieval: env_duration_ms("RAG_SEARCH_TIMEOUT_MS", d.retrieval),
             generation: env_duration_ms("RAG_GENERATE_TIMEOUT_MS", d.generation),
+            live_evidence: env_duration_ms("RAG_LIVE_EVIDENCE_TIMEOUT_MS", d.live_evidence),
         }
     }
 }
@@ -158,14 +198,39 @@ pub async fn retrieve_and_answer(
     top_k: usize,
     timeouts: &StageTimeouts,
 ) -> Result<AskOutcome, RagError> {
+    let candidates = retrieve(oa, qd, query, filter, search_limit, timeouts).await?;
+    answer_candidates(oa, candidates, top_k, question, None, timeouts).await
+}
+
+/// Embed `query` and search Qdrant. Failures are errors, never empty hits.
+pub async fn retrieve(
+    oa: &OpenAiClient,
+    qd: &Qdrant,
+    query: &str,
+    filter: Option<serde_json::Value>,
+    search_limit: usize,
+    timeouts: &StageTimeouts,
+) -> Result<Vec<Hit>, RagError> {
     let vector = run_stage(Stage::Embedding, timeouts.embedding, oa.embed(query)).await?;
-    let candidates = run_stage(
+    run_stage(
         Stage::Retrieval,
         timeouts.retrieval,
         qd.search(vector, search_limit, filter),
     )
-    .await?;
-    if candidates.is_empty() {
+    .await
+}
+
+/// Answer from retrieved candidates plus an optional rendered live-evidence
+/// timeline. With neither, returns [`Evidence::None`] without calling the LLM.
+pub async fn answer_candidates(
+    oa: &OpenAiClient,
+    candidates: Vec<Hit>,
+    top_k: usize,
+    question: &str,
+    live_evidence: Option<&str>,
+    timeouts: &StageTimeouts,
+) -> Result<AskOutcome, RagError> {
+    if candidates.is_empty() && live_evidence.is_none() {
         tracing::info!("retrieval returned no hits; answering without LLM");
         return Ok(AskOutcome {
             answer: NO_EVIDENCE_ANSWER.to_string(),
@@ -175,7 +240,7 @@ pub async fn retrieve_and_answer(
     let answer = run_stage(
         Stage::Generation,
         timeouts.generation,
-        answer_question(oa, candidates, top_k, question),
+        answer_question_with_live_evidence(oa, candidates, top_k, question, live_evidence),
     )
     .await?;
     Ok(AskOutcome {

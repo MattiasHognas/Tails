@@ -16,10 +16,10 @@ flowchart TB
     user(["User"])
 
     subgraph cli ["rag-cli"]
-        cliAsk["ask QUESTION<br/>--service --env --kind --tz"]
+        cliAsk["ask QUESTION<br/>--service --env --kind --tz<br/>--no-live-evidence"]
         cliPlan["plan QUESTION --tz"]
         cliTz["timezone()<br/>--tz, TZ or system zone"]
-        cliOut["print answer JSON<br/>clarifying questions to stderr<br/>format_api_error() + exit 1"]
+        cliOut["print answer JSON<br/>timeline + clarifying questions to stderr<br/>format_api_error() + exit 1"]
     end
 
     subgraph api ["rag-api (Axum, :5191)"]
@@ -29,9 +29,10 @@ flowchart TB
         planner["run_planner()<br/>planner::plan_query()<br/>sanitize_plan(): untrusted LLM output,<br/>'yesterday' resolved in code"]
         scope["RetrievalScope::resolve()<br/>explicit fields win over inferred<br/>to_qdrant_filter()"]
         topk["choose_topk()"]
-        rna["rag_service::retrieve_and_answer()"]
-        answer["answer_question()<br/>rerank_mmr_signals() + prompt"]
-        noev["zero hits: fixed no-evidence answer<br/>(LLM not called)"]
+        rna["rag_service::retrieve()<br/>embed + filtered search"]
+        live["live_timeline()<br/>diagnostic intent + window?<br/>live_evidence::collect_timeline()"]
+        answer["answer_candidates()<br/>rerank_mmr_signals() + prompt<br/>with timeline"]
+        noev["no hits and no observations:<br/>fixed no-evidence answer (LLM not called)"]
         errs["ApiError: typed JSON error<br/>400 / 502 / 503 / 504"]
     end
 
@@ -39,8 +40,9 @@ flowchart TB
         resil["resilience: run_stage() timeouts,<br/>send_with_retry() backoff for 429/5xx"]
         oaClient["OpenAiClient<br/>embed() / chat_json() / chat_complete()"]
         qdClient["Qdrant<br/>search() / upsert()"]
-        ddClient["Datadog adapters<br/>get_monitors() list_dashboards() list_slos()<br/>list_metrics() get_incidents() search_logs()"]
+        ddClient["Datadog adapters<br/>indexing: get_monitors() list_dashboards() list_slos()<br/>list_metrics() get_incidents() search_logs()<br/>live: query_metrics() search_log_events()"]
         chunker["chunk() + stable_id()"]
+        liveCore["live_evidence<br/>discover(): services + metrics from hits<br/>analysis: spikes, drops, gaps, log bursts vs baseline<br/>timeline: observations / hypotheses / missing"]
     end
 
     subgraph indexer ["rag-indexer (one-shot, CronJob)"]
@@ -57,7 +59,7 @@ flowchart TB
     subgraph ext ["External services"]
         openai[["OpenAI<br/>/v1/embeddings<br/>/v1/chat/completions"]]
         qdrant[("Qdrant<br/>/collections/{c}/points/search<br/>PUT /collections/{c}/points")]
-        datadog[["Datadog API<br/>/api/v1/monitor, /dashboard, /slo, /metrics<br/>/api/v2/incidents/search<br/>/api/v2/logs/events/search"]]
+        datadog[["Datadog API<br/>/api/v1/monitor, /dashboard, /slo, /metrics<br/>/api/v1/query (live time series)<br/>/api/v2/incidents/search<br/>/api/v2/logs/events/search"]]
     end
 
     %% Question flow
@@ -71,8 +73,12 @@ flowchart TB
     planner --> scope --> topk --> rna
     rna -- "1. embed query" --> oaClient
     rna -- "2. filtered search" --> qdClient
-    rna -- "hits" --> answer
-    rna -- "no hits" --> noev
+    rna -- "hits + scope" --> live
+    live --> liveCore
+    liveCore -- "live queries, window + baseline" --> ddClient
+    liveCore -- "hypotheses (chat_json)" --> oaClient
+    live -- "hits + timeline" --> answer
+    live -- "nothing found" --> noev
     answer -- "3. generate" --> oaClient
     planner -- "chat_json" --> oaClient
     rna -. "failure / timeout" .-> errs
@@ -86,7 +92,9 @@ flowchart TB
     qdClient --> resil
     resil --> openai
     resil --> qdrant
-    ddClient --> datadog
+    ddClient -- "indexing" --> datadog
+    ddClient -- "live queries" --> resil
+    resil --> datadog
 
     %% Ingestion flow
     ckFile --> ckLoad --> idx --> fetch --> ddClient
@@ -107,14 +115,21 @@ What each part does:
     is treated as untrusted, and relative times like "yesterday" are resolved in code;
   - merges the plan with explicit request fields into a `RetrievalScope`, which becomes
     the Qdrant filter;
-  - runs `retrieve_and_answer`: embed the query, search Qdrant, rerank, and generate
-    an answer.
-  - Zero hits give a fixed no-evidence answer without calling the LLM. Failures and
-    timeouts become typed `502`/`503`/`504` errors, never an answer.
+  - retrieves: embeds the query and searches Qdrant with that filter;
+  - for diagnostic questions with a time window, collects live evidence: queries Datadog
+    for the discovered services' metrics and error logs over the window and a baseline,
+    and returns a `timeline` (see [Live evidence](#live-evidence-timeline));
+  - reranks the hits and generates an answer from them and the timeline.
+  - With no hits and no live observations it returns a fixed no-evidence answer without
+    calling the LLM. Planning, embedding, retrieval and generation failures become typed
+    `502`/`503`/`504` errors, never an answer; live-evidence failures are reported in the
+    timeline instead.
 - **rag-core**: the shared library.
   - The OpenAI client (embeddings and chat), the Qdrant client (search and upsert), and
     the Datadog adapters.
   - The planner, the retrieval scope and the reranker.
+  - `live_evidence`: discovery, deterministic time-series and log analysis, and the
+    timeline.
   - The chunker (stable chunk IDs, so re-indexing overwrites instead of duplicating).
   - `resilience`: per-stage timeouts, the overall request deadline, and bounded retries
     for 429 and 5xx responses.
@@ -124,7 +139,7 @@ What each part does:
   source doesn't block the others.
 - **External services**:
   - **Datadog**: the source of monitors, dashboards, SLOs, metric names, incidents and
-    logs.
+    logs for indexing, and of live time series and logs for diagnostic questions.
   - **OpenAI**: embeddings, planning, and answers.
   - **Qdrant**: the vector store the API searches.
 
@@ -133,7 +148,7 @@ What each part does:
 | Crate | Description |
 |-------|--------------|
 | `rag-core` | Domain models, OpenAI, Qdrant (search + upsert), Datadog client (monitors, incidents, logs, dashboards, metrics, SLOs), chunker, planner, reranker, RAG service. |
-| `rag-api` | Axum REST API — `/ask/plan` (intent + inferred filters) and `/ask` (server-side planning + filtered retrieval + answer). |
+| `rag-api` | Axum REST API — `/ask/plan` (intent + inferred filters) and `/ask` (server-side planning + filtered retrieval + live Datadog evidence for diagnostic questions + answer). |
 | `rag-cli` | CLI that calls the API. The server plans (service/env/time) and decides top-K. |
 | `rag-indexer` | One-shot, resumable indexer for Datadog → Qdrant with per-source checkpoints. Perfect for Kubernetes CronJob. |
 
@@ -176,6 +191,71 @@ is how the server interprets a request:
   Documents with no timestamp, and monitors, dashboards and SLOs (whose timestamp, if any,
   is a creation date), always pass the time condition, so "yesterday" still surfaces the
   relevant monitor or SLO. Incidents are filtered by creation time.
+
+## Live evidence (`timeline`)
+
+Indexed documents say which monitors and metrics exist; they cannot show whether latency
+actually spiked. For diagnostic questions `/ask` also queries Datadog for the question's
+window and returns what it measured:
+
+- **When it runs.** The planner intent is `rootCauseWindow` or `metricQuestion` (a keyword
+  heuristic such as "why", "spike", "latency" applies only when the intent is `unknown`),
+  the resolved `scope` has a window (explicit `from_utc`/`to_utc` or an inferred one such as
+  "yesterday"; an open end is "now"), `RAG_LIVE_EVIDENCE` is on and Datadog credentials are
+  configured. `"live_evidence": false` in the request disables it; `true` runs it for any
+  question with a window.
+- **Discovery.** Services come from the scope's service and the retrieved hits; metrics
+  from the plan's `metric`, metric documents and monitor queries (the name before the
+  `{...}` scope, e.g. `trace.http.request.duration` in
+  `avg(last_5m):avg:trace.http.request.duration{service:auth-api} > 2`, keeping `avg`/`sum`/
+  `min`/`max`). Both are ranked by summed retrieval score, the scope's service and planned
+  metric first, and capped (`RAG_LIVE_MAX_SERVICES`, `RAG_LIVE_MAX_METRICS`).
+- **Queries.** Each metric: `GET /api/v1/query` as
+  `avg:<metric>{service:<svc>,env:<env>}` over the window plus an equal-length baseline just
+  before it. Each service: `POST /api/v2/logs/events/search` for
+  `service:<svc> env:<env> status:(error OR warn)` in the window (up to
+  `RAG_LIVE_MAX_LOG_EVENTS`). Queries run concurrently with bounded retries and share
+  `RAG_LIVE_EVIDENCE_TIMEOUT_MS`, inside the overall `/ask` deadline.
+- **Analysis (in code).** Per series: count/min/max/mean/stddev/p5/p50/p95 for window and
+  baseline. A *spike* is at least two consecutive points above
+  `p95 + max(0.5·|p95|, 3·stddev)` of the baseline (one point if above
+  `p95 + max(2·|p95|, 3·stddev)`); a *drop* mirrors this below
+  `p5 - max(|p5|/3, 3·stddev)` (`p5 - max(2·|p5|/3, 3·stddev)` for one point). Three or more missing intervals are a *gap*. Fewer than 5 baseline points
+  disables spike/drop detection. Logs are counted per ~1/24 of the window (at least one
+  minute); a *burst* is a run of buckets with at least `max(5, 3 × median)` events. Top
+  messages are grouped with digits masked.
+- **Hypotheses** are requested from the LLM only when there are observations, and every one
+  must cite observation IDs; hypotheses citing none or unknown IDs are dropped. The answer
+  prompt receives the timeline and must separate observed facts from hypotheses.
+- **Failures never fail `/ask`.** A failed or timed-out query, an empty series, a missing
+  baseline or a cap is logged and listed in `missingEvidence`. Observations are never
+  fabricated. With no retrieved documents but live observations, the answer is generated
+  from the observations (`"evidence": "found"`).
+
+```json
+"timeline": {
+  "status": "collected",
+  "window": {"fromUtc": "2026-09-22T22:00:00Z", "toUtc": "2026-09-23T22:00:00Z"},
+  "baseline": {"fromUtc": "2026-09-21T22:00:00Z", "toUtc": "2026-09-22T22:00:00Z"},
+  "observations": [{
+    "id": "obs-2", "kind": "spike", "source": "metricQuery", "service": "auth-api",
+    "query": "avg:trace.http.request.duration{env:prod,service:auth-api}",
+    "startUtc": "2026-09-23T10:00:00Z", "endUtc": "2026-09-23T11:00:00Z",
+    "summary": "…: 2 point(s) above the baseline band (0.3); extreme 1.5 at 2026-09-23T10:00:00Z vs baseline p95 0.2",
+    "values": {"points": 2, "peak": 1.5, "threshold": 0.3, "baselineReference": 0.2, "ratioToBaseline": 7.5},
+    "link": "https://app.datadoghq.eu/metric/explorer?exp_metric=trace.http.request.duration&…"
+  }],
+  "hypotheses": [{"statement": "Connection pool exhaustion slowed requests", "observationIds": ["obs-2", "obs-3"]}],
+  "missingEvidence": [{"subject": "metrics for payments", "reason": "no_metrics_discovered", "detail": "…"}]
+}
+```
+
+`kind` is `spike`, `drop`, `gap`, `seriesSummary`, `logBurst` or `logSummary`; `source` is
+`metricQuery` or `logQuery`. `reason` is one of `skipped`, `no_metrics_discovered`,
+`query_failed`, `timed_out`, `series_empty`, `no_baseline`, `capped`, `hypotheses_failed`.
+When nothing ran, `status` is `skipped` with `skipReason` `not_diagnostic`, `disabled`,
+`disabled_by_request`, `not_configured`, `window_not_specified`, `window_too_long` or
+`nothing_to_query` (all but `not_diagnostic` also add a `missingEvidence` entry).
 
 ## API errors and evidence
 
@@ -224,9 +304,10 @@ would end past the stage or request deadline. The CLI prints typed errors as
   - weights scores by source kind (incident 1.10, monitor 1.05, SLO 1.03, logs 0.98);
   - applies a 24-hour recency half-life, never cutting a score below half;
   - selects the top-K with maximal marginal relevance, so near-duplicate text is skipped.
-- **Answering:** `answer_question()` sends the selected documents (title, kind, time,
-  service, environment, source link and key metadata) to the chat model. The model is told
-  to answer only from them and never to invent evidence.
+- **Answering:** `answer_candidates()` sends the selected documents (title, kind, time,
+  service, environment, source link and key metadata) and, when collected, the rendered
+  live-evidence timeline to the chat model. The model is told to answer only from them,
+  never to invent evidence, and to keep observed facts separate from hypotheses.
 
 ## Indexing
 

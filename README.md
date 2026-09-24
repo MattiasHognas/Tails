@@ -79,6 +79,12 @@ actually applied to retrieval:
 }
 ```
 
+For diagnostic questions (for example "why did …", "did latency spike …") with a time
+window, the API also queries Datadog live for that window. The CLI prints the resulting
+timeline to stderr before the JSON, in three sections: observed facts with Datadog links,
+hypotheses that cite them, and evidence that couldn't be checked. Add
+`--no-live-evidence` to skip the live queries.
+
 If the planner is unsure about something, its clarifying questions are printed to
 stderr under `Need more info:`. If a step fails (planning, embedding, search or
 generation), no answer is printed. The CLI prints the typed error, for example
@@ -149,13 +155,17 @@ Binaries are automatically built and available as [GitHub Release](https://githu
   "kinds": null,
   "filters": null,
   "rewritten_query": null,
-  "plan": null
+  "plan": null,
+  "live_evidence": null
 }
 ```
 
 Only `question` is required. The response is
-`{"answer": "...", "evidence": "found" | "none", "plan": {...}, "scope": {"service", "environment", "fromUtc", "toUtc", "kinds"}}`,
-where `plan` is the validated plan and `scope` is what was actually applied to retrieval.
+`{"answer": "...", "evidence": "found" | "none", "plan": {...}, "scope": {"service", "environment", "fromUtc", "toUtc", "kinds"}, "timeline": {...}}`,
+where `plan` is the validated plan, `scope` is what was actually applied to retrieval and
+`timeline` is the live Datadog evidence for diagnostic questions (see
+[Live evidence](docs/ARCHITECTURE.md#live-evidence-timeline)). `"live_evidence": false`
+turns the live queries off for one request.
 
 The full request rules (precedence of explicit and inferred values, timezone handling,
 validation and retrieval filters) are described in
