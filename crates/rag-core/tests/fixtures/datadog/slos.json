@@ -1,0 +1,37 @@
+{
+  "data": [
+    {
+      "id": "c2ce7fb6030c5c0b8035d1ce94dec12c",
+      "name": "Test-Get_all_SLOs_returns_OK_response-1704322487",
+      "tags": [],
+      "monitor_tags": [],
+      "thresholds": [
+        {
+          "timeframe": "7d",
+          "target": 95.0,
+          "target_display": "95.",
+          "warning": 98.0,
+          "warning_display": "98."
+        }
+      ],
+      "type": "metric",
+      "type_id": 1,
+      "description": "",
+      "timeframe": "7d",
+      "warning_threshold": 98.0,
+      "target_threshold": 95.0,
+      "query": {
+        "denominator": "sum:httpservice.hits{!code:3xx}.as_count()",
+        "numerator": "sum:httpservice.hits{code:2xx}.as_count()"
+      },
+      "creator": {
+        "name": null,
+        "handle": "frog@datadoghq.com",
+        "email": "frog@datadoghq.com"
+      },
+      "created_at": 1704322487,
+      "modified_at": 1704322487
+    }
+  ],
+  "error": null
+}
