@@ -2,11 +2,9 @@ use anyhow::Result;
 use rag_core::{
     chunk::chunk,
     datadog::Datadog,
-    domain::RagDocument,
     openai::OpenAiClient,
     qdrant::{QPoint, Qdrant},
 };
-use serde_json::json;
 
 /// Maximum characters per chunk
 const CHUNK_SIZE: usize = 1800;
@@ -50,11 +48,7 @@ async fn main() -> Result<()> {
     let mut batch = Vec::new();
     for c in chunks {
         let emb = oa.embed(&c.text).await?;
-        batch.push(QPoint {
-            id: c.id.clone(),
-            vector: emb,
-            payload: payload_from(&c),
-        });
+        batch.push(QPoint::from_document(&c, emb));
         if batch.len() >= 64 {
             qd.upsert(std::mem::take(&mut batch)).await?;
         }
@@ -91,23 +85,10 @@ async fn save_watermark(path: &str, timestamp: &str) -> Result<()> {
     Ok(())
 }
 
-fn payload_from(doc: &RagDocument) -> serde_json::Value {
-    json!({
-        "title": doc.title,
-        "text": doc.text,
-        "source_uri": doc.source_uri,
-        "kind": doc.kind,
-        "timestamp": doc.timestamp,
-        "Service": doc.service,
-        "Environment": doc.environment,
-        "metadata": doc.metadata,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rag_core::domain::SourceKind;
+    use rag_core::domain::{RagDocument, SourceKind};
 
     fn create_test_doc() -> RagDocument {
         RagDocument {
@@ -126,11 +107,12 @@ mod tests {
     #[test]
     fn test_payload_from_basic() {
         let doc = create_test_doc();
-        let payload = payload_from(&doc);
+        let payload = serde_json::to_value(QPoint::from_document(&doc, vec![1.0]).payload).unwrap();
 
-        assert_eq!(payload["title"], "Test Document");
-        assert_eq!(payload["text"], "This is test content");
-        assert_eq!(payload["source_uri"], "http://example.com/test");
+        assert_eq!(payload["id"], doc.id);
+        assert_eq!(payload["Title"], "Test Document");
+        assert_eq!(payload["Text"], "This is test content");
+        assert_eq!(payload["SourceUri"], "http://example.com/test");
         assert_eq!(payload["Service"], "test-service");
         assert_eq!(payload["Environment"], "production");
     }
@@ -138,27 +120,27 @@ mod tests {
     #[test]
     fn test_payload_from_with_timestamp() {
         let doc = create_test_doc();
-        let payload = payload_from(&doc);
+        let payload = serde_json::to_value(QPoint::from_document(&doc, vec![1.0]).payload).unwrap();
 
-        assert_eq!(payload["timestamp"], "2025-01-01T00:00:00Z");
+        assert_eq!(payload["Timestamp"], "2025-01-01T00:00:00Z");
     }
 
     #[test]
     fn test_payload_from_without_timestamp() {
         let mut doc = create_test_doc();
         doc.timestamp = None;
-        let payload = payload_from(&doc);
+        let payload = serde_json::to_value(QPoint::from_document(&doc, vec![1.0]).payload).unwrap();
 
-        assert!(payload["timestamp"].is_null());
+        assert!(payload["Timestamp"].is_null());
     }
 
     #[test]
     fn test_payload_from_preserves_kind() {
         let mut doc = create_test_doc();
         doc.kind = SourceKind::Incident;
-        let payload = payload_from(&doc);
+        let payload = serde_json::to_value(QPoint::from_document(&doc, vec![1.0]).payload).unwrap();
 
-        assert_eq!(payload["kind"], serde_json::json!(SourceKind::Incident));
+        assert_eq!(payload["Kind"], serde_json::json!(SourceKind::Incident));
     }
 
     #[test]
@@ -169,19 +151,19 @@ mod tests {
         metadata.insert("status".to_string(), serde_json::json!("active"));
         doc.metadata = metadata;
 
-        let payload = payload_from(&doc);
+        let payload = serde_json::to_value(QPoint::from_document(&doc, vec![1.0]).payload).unwrap();
 
-        assert_eq!(payload["metadata"]["severity"], "SEV-1");
-        assert_eq!(payload["metadata"]["status"], "active");
+        assert_eq!(payload["Metadata"]["severity"], "SEV-1");
+        assert_eq!(payload["Metadata"]["status"], "active");
     }
 
     #[test]
     fn test_payload_from_empty_metadata() {
         let doc = create_test_doc();
-        let payload = payload_from(&doc);
+        let payload = serde_json::to_value(QPoint::from_document(&doc, vec![1.0]).payload).unwrap();
 
-        assert!(payload["metadata"].is_object());
-        assert_eq!(payload["metadata"].as_object().unwrap().len(), 0);
+        assert!(payload["Metadata"].is_object());
+        assert_eq!(payload["Metadata"].as_object().unwrap().len(), 0);
     }
 
     #[tokio::test]
@@ -340,9 +322,10 @@ mod tests {
         for kind in kinds {
             let mut doc = create_test_doc();
             doc.kind = kind.clone();
-            let payload = payload_from(&doc);
+            let payload =
+                serde_json::to_value(QPoint::from_document(&doc, vec![1.0]).payload).unwrap();
 
-            assert_eq!(payload["kind"], serde_json::json!(kind));
+            assert_eq!(payload["Kind"], serde_json::json!(kind));
         }
     }
 }

@@ -254,6 +254,25 @@ cargo test -p rag-core
 cargo test -- --nocapture
 ```
 
+### Qdrant storage contract
+
+Ingestion and retrieval share a typed payload in `rag-core::qdrant`. Stored keys
+are `Title`, `Text`, `SourceUri`, `Kind`, `Timestamp`, `Service`, `Environment`,
+`Metadata`, and lowercase `id`. The payload `id` remains the logical chunk ID
+(for example, `monitor_123#c0`); `Metadata.chunk_of` preserves the parent ID.
+Qdrant point IDs are deterministic UUIDv5 values derived from the logical chunk ID
+in a fixed Tails namespace, so retries and content updates replace the same point.
+
+The `Qdrant contract` CI workflow runs an upsert/search test against real Qdrant.
+To run it locally, start an isolated Qdrant instance, then run:
+
+```bash
+QDRANT_TEST_ENDPOINT=http://localhost:6333 cargo test --locked -p rag-core --test qdrant_roundtrip -- --ignored
+```
+
+The test creates and deletes its own uniquely named collection and checks chunk
+identity, full payload recovery, filtering, and idempotent upserts.
+
 ### Mutation Testing
 
 The project uses [cargo-mutants](https://mutants.rs/) for mutation testing to identify missing test coverage:
