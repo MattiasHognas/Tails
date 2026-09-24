@@ -129,7 +129,7 @@ struct PlanResp {
     plan: QueryPlan,
 }
 
-/// Explicit fields always win over values the planner infers. See README "/ask".
+/// Explicit fields always win over values the planner infers. See docs/ARCHITECTURE.md "Question pipeline".
 #[derive(Deserialize)]
 struct AskReq {
     question: String,
