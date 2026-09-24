@@ -11,6 +11,8 @@ jobs:
     name: Build CLI for ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     strategy:
+      # Let every target finish so one failing build doesn't hide the others.
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
