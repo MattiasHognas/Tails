@@ -283,6 +283,8 @@ pub fn embedding_batches(
 mod tests {
     use super::*;
     use crate::test_support::{EnvVarGuard, lock_env};
+    use wiremock::matchers::{body_json, header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn mock_client(base_url: String, retry: RetryPolicy) -> OpenAiClient {
         OpenAiClient {
@@ -506,168 +508,138 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_url_formatting() {
-        let client = OpenAiClient {
+    fn client(server: &MockServer) -> OpenAiClient {
+        OpenAiClient {
             api_key: "test_key".to_string(),
-            base_url: "https://api.openai.com".to_string(),
-            embedding_model: "text-embedding-3-small".to_string(),
-            chat_model: "o4-mini".to_string(),
-            http: reqwest::Client::new(),
-            retry: RetryPolicy::none(),
-        };
-
-        let embed_url = format!("{}/v1/embeddings", client.base_url);
-        assert_eq!(embed_url, "https://api.openai.com/v1/embeddings");
-
-        let chat_url = format!("{}/v1/chat/completions", client.base_url);
-        assert_eq!(chat_url, "https://api.openai.com/v1/chat/completions");
-    }
-
-    #[test]
-    fn test_openai_client_custom_base_url() {
-        let _env_lock = lock_env();
-
-        unsafe {
-            std::env::set_var("OPENAI_API_KEY", "test");
-            std::env::set_var("OPENAI_BASE_URL", "https://custom-llm-gateway.example.com");
-        }
-
-        let client = OpenAiClient::new_from_env().unwrap();
-        assert_eq!(client.base_url, "https://custom-llm-gateway.example.com");
-
-        unsafe {
-            std::env::remove_var("OPENAI_API_KEY");
-            std::env::remove_var("OPENAI_BASE_URL");
-        }
-    }
-
-    #[tokio::test]
-    async fn test_embed_with_mock_server() {
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
-
-        let mock_server = MockServer::start().await;
-
-        Mock::given(method("POST"))
-            .and(path("/v1/embeddings"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "data": [{
-                    "embedding": [0.1, 0.2, 0.3]
-                }]
-            })))
-            .mount(&mock_server)
-            .await;
-
-        let client = OpenAiClient {
-            api_key: "test_key".to_string(),
-            base_url: mock_server.uri(),
+            base_url: server.uri(),
             embedding_model: "test-model".to_string(),
             chat_model: "test-chat".to_string(),
             http: reqwest::Client::new(),
             retry: RetryPolicy::none(),
-        };
+        }
+    }
 
-        let result = client.embed("test text").await;
-        assert!(result.is_ok());
-        let embedding = result.unwrap();
+    fn chat_reply(content: serde_json::Value) -> ResponseTemplate {
+        ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{"message": {"content": content}}]
+        }))
+    }
+
+    #[tokio::test]
+    async fn embed_sends_model_input_and_bearer_key() {
+        let server = MockServer::start().await;
+        // The mock only matches the documented request shape.
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .and(header("authorization", "Bearer test_key"))
+            .and(body_json(
+                serde_json::json!({"input": "Återförsök 🚀", "model": "test-model"}),
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"data": [{"embedding": [0.1, 0.2, 0.3]}]})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let embedding = client(&server).embed("Återförsök 🚀").await.unwrap();
         assert_eq!(embedding, vec![0.1, 0.2, 0.3]);
     }
 
     #[tokio::test]
-    async fn test_embed_error_handling() {
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
-
-        let mock_server = MockServer::start().await;
-
-        Mock::given(method("POST"))
-            .and(path("/v1/embeddings"))
-            .respond_with(ResponseTemplate::new(401))
-            .mount(&mock_server)
-            .await;
-
-        let client = OpenAiClient {
-            api_key: "invalid_key".to_string(),
-            base_url: mock_server.uri(),
-            embedding_model: "test-model".to_string(),
-            chat_model: "test-chat".to_string(),
-            http: reqwest::Client::new(),
-            retry: RetryPolicy::none(),
-        };
-
-        let result = client.embed("test text").await;
-        assert!(result.is_err());
+    async fn embed_failures_are_embedding_errors_never_empty_vectors() {
+        for (status, body) in [
+            (401, serde_json::json!({"error": "bad key"})),
+            (200, serde_json::json!({"data": []})),
+            (200, serde_json::json!({"data": [{"embedding": []}]})),
+            (200, serde_json::json!({"unexpected": true})),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/embeddings"))
+                .respond_with(ResponseTemplate::new(status).set_body_json(body.clone()))
+                .mount(&server)
+                .await;
+            let err = client(&server).embed("text").await.unwrap_err();
+            assert!(
+                matches!(err, RagError::EmbeddingFailed { .. }),
+                "{status} {body}: {err:?}"
+            );
+        }
     }
 
     #[tokio::test]
-    async fn test_chat_complete_with_mock_server() {
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
-
-        let mock_server = MockServer::start().await;
-
+    async fn chat_complete_sends_system_and_user_messages() {
+        let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/chat/completions"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "choices": [{
-                    "message": {
-                        "content": "This is a test response"
-                    }
-                }]
+            .and(header("authorization", "Bearer test_key"))
+            .and(body_json(serde_json::json!({
+                "model": "test-chat",
+                "messages": [
+                    {"role": "system", "content": "You are a helpful assistant"},
+                    {"role": "user", "content": "Hello"}
+                ]
             })))
-            .mount(&mock_server)
+            .respond_with(chat_reply(serde_json::json!("This is a test response")))
+            .expect(1)
+            .mount(&server)
             .await;
 
-        let client = OpenAiClient {
-            api_key: "test_key".to_string(),
-            base_url: mock_server.uri(),
-            embedding_model: "test-model".to_string(),
-            chat_model: "test-chat".to_string(),
-            http: reqwest::Client::new(),
-            retry: RetryPolicy::none(),
-        };
-
-        let result = client
+        let answer = client(&server)
             .chat_complete("You are a helpful assistant", "Hello")
-            .await;
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), "This is a test response");
+            .await
+            .unwrap();
+        assert_eq!(answer, "This is a test response");
     }
 
     #[tokio::test]
-    async fn test_chat_json_with_mock_server() {
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
-
-        let mock_server = MockServer::start().await;
-
+    async fn chat_json_requests_json_mode_and_parses_the_content() {
+        let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/chat/completions"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "choices": [{
-                    "message": {
-                        "content": "{\"result\": \"parsed\"}"
-                    }
-                }]
+            .and(body_json(serde_json::json!({
+                "model": "test-chat",
+                "messages": [
+                    {"role": "system", "content": "plan"},
+                    {"role": "user", "content": "Get JSON"}
+                ],
+                "response_format": {"type": "json_object"}
             })))
-            .mount(&mock_server)
+            .respond_with(chat_reply(serde_json::json!("{\"result\": \"parsed\"}")))
+            .expect(1)
+            .mount(&server)
             .await;
 
-        let client = OpenAiClient {
-            api_key: "test_key".to_string(),
-            base_url: mock_server.uri(),
-            embedding_model: "test-model".to_string(),
-            chat_model: "test-chat".to_string(),
-            http: reqwest::Client::new(),
-            retry: RetryPolicy::none(),
-        };
+        let json = client(&server)
+            .chat_json::<serde_json::Value>("plan", "Get JSON")
+            .await
+            .unwrap();
+        assert_eq!(json, serde_json::json!({"result": "parsed"}));
+    }
 
-        let result = client
-            .chat_json::<serde_json::Value>("You are a helpful assistant", "Get JSON")
-            .await;
-        assert!(result.is_ok());
-        let json = result.unwrap();
-        assert_eq!(json["result"], "parsed");
+    #[tokio::test]
+    async fn chat_json_rejects_non_json_and_empty_content_as_planning_failures() {
+        for content in [
+            serde_json::json!("not json"),
+            serde_json::json!(""),
+            serde_json::Value::Null,
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/chat/completions"))
+                .respond_with(chat_reply(content.clone()))
+                .mount(&server)
+                .await;
+            let err = client(&server)
+                .chat_json::<serde_json::Value>("s", "u")
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, RagError::PlanningFailed { .. }),
+                "{content}: {err:?}"
+            );
+        }
     }
 }

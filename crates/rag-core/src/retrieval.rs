@@ -13,9 +13,15 @@ use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 
 /// Kinds that describe configuration or state rather than events. Their `Timestamp`,
-/// when set at all, is a creation date, so a time window never excludes them.
-pub const TIMELESS_KINDS: [SourceKind; 3] =
-    [SourceKind::Monitor, SourceKind::Dashboard, SourceKind::SLO];
+/// when set at all, is a creation date (monitors, dashboards, SLOs) or the time the
+/// indexer last saw the metric active (metric catalog entries), so a time window never
+/// excludes them.
+pub const TIMELESS_KINDS: [SourceKind; 4] = [
+    SourceKind::Metrics,
+    SourceKind::Monitor,
+    SourceKind::Dashboard,
+    SourceKind::SLO,
+];
 
 /// Values the caller set explicitly on the request. These are already validated.
 #[derive(Debug, Clone, Default)]
@@ -256,7 +262,7 @@ mod tests {
                         "lt": "2026-09-23T22:00:00Z"
                     }},
                     {"is_empty": {"key": "Timestamp"}},
-                    {"key": "Kind", "match": {"any": ["monitor", "dashboard", "sLO"]}}
+                    {"key": "Kind", "match": {"any": ["metrics", "monitor", "dashboard", "sLO"]}}
                 ]}
             ]})
         );

@@ -1,0 +1,220 @@
+{
+  "version": 1,
+  "description": "Crafted Datadog corpus for the incident question set (questions.json). Objects have the shape of Datadog API responses so the real adapters parse them. Services: checkout, checkout-worker (similar name), payments, auth-api, sökmotor; environments prod and staging. The questions are asked at 2026-03-12T09:00:00Z in Europe/Stockholm, so 'yesterday' is 2026-03-10T23:00:00Z..2026-03-11T23:00:00Z. The recorded fixtures' monitors, dashboards, SLOs and metrics are indexed alongside as unrelated distractors.",
+  "monitors": [
+    {
+      "id": 1001,
+      "type": "query alert",
+      "name": "Checkout p95 latency above 1.5s",
+      "query": "avg(last_5m):avg:trace.http.request.duration{service:checkout,env:prod} > 1.5",
+      "message": "Checkout p95 latency is above 1.5s. Check the payments dependency and the database connection pool.",
+      "tags": ["service:checkout", "env:prod", "team:shop"]
+    },
+    {
+      "id": 1002,
+      "type": "query alert",
+      "name": "Checkout p95 latency above 1.5s (staging)",
+      "query": "avg(last_5m):avg:trace.http.request.duration{service:checkout,env:staging} > 1.5",
+      "message": "Staging checkout latency is above 1.5s.",
+      "tags": ["service:checkout", "env:staging", "team:shop"]
+    },
+    {
+      "id": 1003,
+      "type": "query alert",
+      "name": "checkout-worker order queue backlog",
+      "query": "avg(last_10m):avg:rabbitmq.queue.messages{service:checkout-worker,env:prod} > 10000",
+      "message": "Order queue backlog: checkout-worker consumers are lagging.",
+      "tags": ["service:checkout-worker", "env:prod", "team:shop"]
+    },
+    {
+      "id": 1004,
+      "type": "query alert",
+      "name": "Payments API 5xx rate",
+      "query": "sum(last_5m):sum:trace.http.request.errors{service:payments,env:prod}.as_count() > 50",
+      "message": "Payments returns 5xx. Bank gateway timeouts are the usual cause.",
+      "tags": ["service:payments", "env:prod", "team:payments"]
+    },
+    {
+      "id": 1005,
+      "type": "query alert",
+      "name": "Betalningar: timeout mot bankgateway ⚠️",
+      "query": "avg(last_5m):avg:payments.gateway.latency{service:payments,env:prod} > 3",
+      "message": "Svarstiden mot bankgatewayen överstiger 3 s. Kontrollera anslutningspoolen och återförsöken.",
+      "tags": ["service:payments", "env:prod", "team:payments"]
+    },
+    {
+      "id": 1006,
+      "type": "query alert",
+      "name": "Auth API login failures",
+      "query": "sum(last_5m):sum:auth.login.failures{service:auth-api,env:prod}.as_count() > 100",
+      "message": "Login failures above threshold. Check the token signing keys.",
+      "tags": ["service:auth-api", "env:prod", "team:identity"]
+    }
+  ],
+  "slos": [
+    {
+      "id": "slo-checkout-avail",
+      "name": "Checkout availability",
+      "description": "99.9% of checkout requests succeed over 30 days.",
+      "type": "metric",
+      "thresholds": [{"timeframe": "30d", "target": 99.9}],
+      "tags": ["service:checkout", "env:prod"]
+    },
+    {
+      "id": "slo-checkout-avail-stg",
+      "name": "Checkout availability (staging)",
+      "description": "99% of staging checkout requests succeed.",
+      "type": "metric",
+      "thresholds": [{"timeframe": "7d", "target": 99.0}],
+      "tags": ["service:checkout", "env:staging"]
+    },
+    {
+      "id": "slo-payments-latency",
+      "name": "Payments latency – 95 % under 800 ms",
+      "description": "Kortbetalningar ska besvaras inom 800 ms.",
+      "type": "metric",
+      "thresholds": [{"timeframe": "30d", "target": 95.0}],
+      "tags": ["service:payments", "env:prod"]
+    },
+    {
+      "id": "slo-auth-login",
+      "name": "Auth login success",
+      "description": "99.5% of logins succeed.",
+      "type": "metric",
+      "thresholds": [{"timeframe": "30d", "target": 99.5}],
+      "tags": ["service:auth-api", "env:prod"]
+    }
+  ],
+  "dashboards": [
+    {
+      "id": "dash-checkout",
+      "title": "Checkout overview",
+      "description": "Checkout latency, error rate and payment dependency panels.",
+      "created_at": "2025-06-01T10:00:00.000000+00:00",
+      "author_handle": "shop@example.com"
+    },
+    {
+      "id": "dash-payments",
+      "title": "Betalningar – översikt 📊",
+      "description": "Payments: kortbetalningar, bank gateway latency och återförsök.",
+      "created_at": "2025-07-01T10:00:00.000000+00:00",
+      "author_handle": "payments@example.com"
+    }
+  ],
+  "metrics": [
+    "trace.http.request.duration",
+    "trace.http.request.errors",
+    "payments.gateway.latency",
+    "auth.login.failures",
+    "rabbitmq.queue.messages"
+  ],
+  "incidents": [
+    {
+      "id": "inc-checkout-latency",
+      "type": "incidents",
+      "attributes": {
+        "public_id": 42,
+        "title": "Checkout latency degradation",
+        "created": "2026-03-11T10:05:00+00:00",
+        "state": "resolved",
+        "customer_impact_scope": "Checkout p95 above 4s for 35 minutes; some orders timed out.",
+        "fields": {
+          "severity": {"type": "dropdown", "value": "SEV-2"},
+          "services": {"type": "autocomplete", "value": ["checkout"]},
+          "env": {"type": "dropdown", "value": "prod"}
+        }
+      }
+    },
+    {
+      "id": "inc-checkout-latency-stg",
+      "type": "incidents",
+      "attributes": {
+        "public_id": 43,
+        "title": "Checkout latency degradation in staging",
+        "created": "2026-03-11T10:30:00+00:00",
+        "state": "resolved",
+        "customer_impact_scope": "Staging checkout latency above 4s; no customer impact.",
+        "fields": {
+          "severity": {"type": "dropdown", "value": "SEV-4"},
+          "services": {"type": "autocomplete", "value": ["checkout"]},
+          "env": {"type": "dropdown", "value": "staging"}
+        }
+      }
+    },
+    {
+      "id": "inc-checkout-deploy",
+      "type": "incidents",
+      "attributes": {
+        "public_id": 44,
+        "title": "Checkout errors after deploy",
+        "created": "2026-03-02T08:00:00+00:00",
+        "state": "resolved",
+        "customer_impact_scope": "Checkout returned 500 errors for 10 minutes after a deploy; rolled back.",
+        "fields": {
+          "severity": {"type": "dropdown", "value": "SEV-3"},
+          "services": {"type": "autocomplete", "value": ["checkout"]},
+          "env": {"type": "dropdown", "value": "prod"}
+        }
+      }
+    },
+    {
+      "id": "inc-auth-login",
+      "type": "incidents",
+      "attributes": {
+        "public_id": 45,
+        "title": "Auth-API login failures",
+        "created": "2026-03-11T14:00:00+00:00",
+        "state": "resolved",
+        "customer_impact_scope": "Users could not log in; token signature validation failed after a key rotation.",
+        "fields": {
+          "severity": {"type": "dropdown", "value": "SEV-1"},
+          "services": {"type": "autocomplete", "value": ["Auth-API"]},
+          "env": {"type": "dropdown", "value": "PROD"}
+        }
+      }
+    },
+    {
+      "id": "inc-payments-card",
+      "type": "incidents",
+      "attributes": {
+        "public_id": 46,
+        "title": "Kortbetalningar misslyckas 💳 (決済エラー)",
+        "created": "2026-03-12T07:10:00+00:00",
+        "state": "active",
+        "customer_impact_scope": "Card payments failed for Swedish and Japanese customers; bank gateway timeouts.",
+        "fields": {
+          "severity": {"type": "dropdown", "value": "SEV-2"},
+          "services": {"type": "autocomplete", "value": ["payments"]},
+          "env": {"type": "dropdown", "value": "prod"}
+        }
+      }
+    },
+    {
+      "id": "inc-worker-backlog",
+      "type": "incidents",
+      "attributes": {
+        "public_id": 47,
+        "title": "checkout-worker order backlog",
+        "created": "2026-03-11T11:00:00+00:00",
+        "state": "resolved",
+        "customer_impact_scope": "Order confirmation emails were delayed by up to an hour.",
+        "fields": {
+          "severity": {"type": "dropdown", "value": "SEV-3"},
+          "services": {"type": "autocomplete", "value": ["checkout-worker"]},
+          "env": {"type": "dropdown", "value": "prod"}
+        }
+      }
+    }
+  ],
+  "logs": [
+    {"id": "co-1", "type": "log", "attributes": {"service": "checkout", "status": "error", "timestamp": "2026-03-11T10:12:00.000Z", "message": "upstream timeout calling payments after 3000ms (checkout → payments)", "tags": ["env:prod"]}},
+    {"id": "co-2", "type": "log", "attributes": {"service": "checkout", "status": "error", "timestamp": "2026-03-11T10:15:30.000Z", "message": "db connection pool exhausted: 50/50 connections in use", "tags": ["env:prod"]}},
+    {"id": "co-stg", "type": "log", "attributes": {"service": "checkout", "status": "error", "timestamp": "2026-03-11T10:20:00.000Z", "message": "db connection pool exhausted: 10/10 connections in use", "tags": ["env:staging"]}},
+    {"id": "co-old", "type": "log", "attributes": {"service": "checkout", "status": "warn", "timestamp": "2026-03-09T09:00:00.000Z", "message": "slow query on orders table (1200ms)", "tags": ["env:prod"]}},
+    {"id": "auth-1", "type": "log", "attributes": {"service": "Auth-API", "status": "error", "timestamp": "2026-03-11T14:02:00.000Z", "message": "login failed: token signature invalid för användare åsa.öberg@example.se", "tags": ["env:prod"]}},
+    {"id": "pay-1", "type": "log", "attributes": {"service": "payments", "status": "error", "timestamp": "2026-03-12T07:05:00.000Z", "message": "決済ゲートウェイ タイムアウト (payment gateway timeout) 🚨", "tags": ["env:prod"]}},
+    {"id": "pay-long", "type": "log", "attributes": {"service": "payments", "status": "error", "timestamp": "2026-03-12T07:06:00.000Z", "message": "GatewayTimeoutException: bank gateway did not answer within 3000 ms. Återförsök 1 av 3 misslyckades (決済ゲートウェイ) – kortbetalning nekad för kund i Malmö 🚨. at payments.gateway.BankClient.authorize(BankClient.kt:212) at payments.api.CardController.pay(CardController.kt:88). Återförsök 2 av 3 misslyckades (決済ゲートウェイ) – kortbetalning nekad för kund i Tōkyō 🚨. at payments.gateway.BankClient.authorize(BankClient.kt:212) at payments.api.CardController.pay(CardController.kt:88). Återförsök 3 av 3 misslyckades (決済ゲートウェイ) – kortbetalning nekad för kund i Göteborg 🚨. at payments.gateway.BankClient.authorize(BankClient.kt:212) at payments.api.CardController.pay(CardController.kt:88). Connection pool state: 64/64 busy, 118 waiting. Circuit breaker for bank gateway opened after 25 consecutive failures; half-open probe scheduled in 30 s. Gateway response headers: x-request-id=7f3c2a91, server=bank-edge-eu-north-1, retry-after=none. Upstream TLS handshake took 2870 ms; DNS lookup 12 ms; connect 45 ms. Previous successful authorization 00:04:12 ago. Tidigare lyckade betalningar: 1 204 i senaste timmen, misslyckade: 377. ご注意: 決済ゲートウェイの応答が遅延しています。再試行ポリシー: 指数バックオフ (200 ms, 400 ms, 800 ms). Merchant accounts affected: se-retail-01, se-retail-02, jp-retail-07. Customer-facing error shown: \"Betalningen kunde inte genomföras – försök igen om en stund.\" Trace ids: 4bf92f3577b34da6a3ce929d0e0e4736, 00f067aa0ba902b7, 7a085853722dc6d2. Heap usage 71%; GC pauses p99 42 ms; thread pool payments-io 32/32 active. Bank gateway status page reported degraded performance in region eu-north-1 from 07:02. Rollback not applicable: no deploy in the last 24 hours. Next steps suggested by runbook RB-PAY-12: fail over to secondary acquirer, raise gateway timeout to 5000 ms temporarily, notify merchant success team. Återförsök mot sekundär inlösare lyckades för 83 % av de nekade betalningarna. 二次アクワイアラーへのフェイルオーバーは成功しました (83 %). End of incident log excerpt; see incident 46 for the full timeline. Additional context: the payments service depends on the bank gateway for card authorization, 3-D Secure challenges and refunds; refunds were queued and replayed after recovery. Queue depth peaked at 4 812 messages at 07:21; drained by 07:48. Alerting: monitor 1004 (Payments API 5xx rate) and monitor 1005 (Betalningar: timeout mot bankgateway) both triggered at 07:04 and recovered at 07:52. SLO burn: payments latency SLO consumed 38 % of its monthly error budget during the event. Owner: team payments (on-call: Åsa Öberg 👩‍💻). Postmortem scheduled. Åtgärdspunkter: 1) lägg till timeout-larm på TLS-handskakning, 2) automatisera failover till sekundär inlösare, 3) följ upp med banken om kapacitet i eu-north-1.", "tags": ["env:prod"]}},
+    {"id": "worker-1", "type": "log", "attributes": {"service": "checkout-worker", "status": "warn", "timestamp": "2026-03-11T10:40:00.000Z", "message": "order queue depth 12000 exceeds limit 10000", "tags": ["env:prod"]}},
+    {"id": "search-1", "type": "log", "attributes": {"service": "sökmotor", "status": "warn", "timestamp": "2026-03-11T12:00:00.000Z", "message": "indexering långsam för 'smörgåsbord' – 2.3 s per sida", "tags": ["env:prod"]}}
+  ]
+}

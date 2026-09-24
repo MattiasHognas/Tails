@@ -241,16 +241,21 @@ Binaries are automatically built and available as [GitHub Release](https://githu
 ```
 
 Only `question` is required. The response is
-`{"answer": "...", "evidence": "found" | "none", "sources": [...], "plan": {...}, "scope": {"service", "environment", "fromUtc", "toUtc", "kinds"}, "timeline": {...}}`,
+`{"answer": "...", "evidence": "found" | "none", "sources": [...], "citationWarnings": [...], "plan": {...}, "scope": {"service", "environment", "fromUtc", "toUtc", "kinds"}, "timeline": {...}}`,
 where `sources` lists the indexed documents given to the answer model, numbered like
-the answer's `[DOC #n]` citations:
+the answer's `[DOC #n]` citations (`id` is the indexed document's ID):
 
 ```json
-"sources": [{"n": 1, "title": "auth-api 5xx spike", "kind": "incident", "timestamp": "2026-09-23T10:02:00Z",
-             "service": "auth-api", "environment": "prod", "uri": "https://app.datadoghq.eu/incidents/1"}]
+"sources": [{"n": 1, "id": "incident_1f0c…", "title": "auth-api 5xx spike", "kind": "incident",
+             "timestamp": "2026-09-23T10:02:00Z", "service": "auth-api", "environment": "prod",
+             "uri": "https://app.datadoghq.eu/incidents/1"}]
 ```
 
-`sources` is empty when no answer model was called (`"evidence": "none"`). `plan` is the
+`sources` is empty when no answer model was called (`"evidence": "none"`).
+`citationWarnings` lists citations in the answer that resolve to nothing, e.g.
+`[{"citation": "DOC #7", "reason": "unknown_document"}]` or `"unknown_observation"` for
+an `obs-N` not in the timeline; it is empty when every citation resolves (see
+[Citation checks](docs/ARCHITECTURE.md#citation-checks)). `plan` is the
 validated plan, `scope` is what was actually applied to retrieval and
 `timeline` is the live Datadog evidence for diagnostic questions (see
 [Live evidence](docs/ARCHITECTURE.md#live-evidence-timeline)). `"live_evidence": false`

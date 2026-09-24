@@ -1349,13 +1349,16 @@ dependencies = [
  "anyhow",
  "chrono",
  "futures",
+ "rag-api",
  "rag-core",
+ "reqwest",
  "serde",
  "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "wiremock",
 ]
 
 [[package]]

@@ -169,7 +169,8 @@ is how the server interprets a request:
   planner output.
 - **Explicit fields win**, field by field:
   - `service`/`env`: the explicit field, then a `service:`/`env:` entry in `filters`,
-    then the planner's value, then a tag in the planner's `filters`.
+    then the planner's value, then a tag in the planner's `filters`. Explicit values are
+    trimmed and lowercased like everything else that meets the stored payload.
   - Time: if either `from_utc` or `to_utc` is given, the caller's window replaces the
     inferred one entirely (a missing bound is open-ended).
   - Source kinds: `kinds`, then `kind:` entries in `filters`, then planner `kind:` filters.
@@ -193,11 +194,16 @@ is how the server interprets a request:
   [API errors and evidence](#api-errors-and-evidence)) instead of retrieving with a
   default plan. Supply `plan` to skip the planner call. Planning counts toward the
   overall `RAG_ASK_DEADLINE_MS`.
-- **Retrieval filters.** Service, environment and kinds are `match` conditions. The window
-  is a half-open `[from, to)` Qdrant datetime `range` on the RFC 3339 `Timestamp` payload.
-  Documents with no timestamp, and monitors, dashboards and SLOs (whose timestamp, if any,
-  is a creation date), always pass the time condition, so "yesterday" still surfaces the
-  relevant monitor or SLO. Incidents are filtered by creation time.
+- **Retrieval filters.** Service, environment and kinds are `match` conditions. Qdrant
+  keyword matches are case-sensitive, so the Datadog adapters store `Service` and
+  `Environment` trimmed and lowercased, the form planner and explicit values take. The
+  window is a half-open `[from, to)` Qdrant datetime `range` on the RFC 3339 `Timestamp`
+  payload. Documents with no timestamp, and monitors, dashboards, SLOs (whose timestamp,
+  if any, is a creation date) and metric catalog entries (stamped with the indexing run's
+  time), always pass the time condition, so "yesterday" still surfaces the relevant
+  monitor, SLO or metric. Incidents are filtered by creation time. Dashboards and metric
+  entries carry no service or environment, so a service or environment scope excludes
+  them.
 
 ## Live evidence (`timeline`)
 
@@ -291,9 +297,23 @@ A successful search that matches nothing is **not** an error: `/ask` returns
 200 with `"evidence": "none"` and a fixed "No matching evidence was found in the
 indexed data" answer, without calling the LLM (so it cannot invent evidence).
 Answers backed by retrieved documents have `"evidence": "found"`, and `sources` lists the
-documents given to the answer model (`n`, `title`, `kind`, `timestamp`, `service`,
+documents given to the answer model (`n`, `id`, `title`, `kind`, `timestamp`, `service`,
 `environment`, `uri`) in the same order and numbering as the prompt's `[DOC #n]`
-citations. `sources` is empty when the LLM was not called.
+citations; `id` is the indexed document (the chunk's `Metadata.chunk_of`). `sources` is
+empty when the LLM was not called.
+
+### Citation checks
+
+The answer text is returned as generated, but its citations are checked with
+`rag_core::citations::validate_citations`: every `DOC #n` (bracketed, grouped like
+`[DOC #1, DOC #3]`, or bare) must be a number in `sources`, and every `obs-N` must be an
+observation in `timeline`. Those that resolve to nothing are listed in
+`citationWarnings` (always present, usually empty) and logged:
+
+```json
+"citationWarnings": [{"citation": "DOC #7", "reason": "unknown_document"},
+                     {"citation": "obs-9", "reason": "unknown_observation"}]
+```
 
 Retries apply only to transient failures (connect errors, timeouts, HTTP 429
 honoring `Retry-After`/`retry-after-ms`, and 5xx) with exponential backoff and
@@ -311,7 +331,8 @@ with `--json`) on stderr and exits with status 1.
   2 for explicit time ranges and 2 for incident questions, capped at `RAG_TOPK_MAX` (32).
   `RAG_TOPK_FIXED` overrides this (clamped to 1–64).
 - **Reranking:** `rerank_mmr_signals()`:
-  - keeps the best chunk per document;
+  - keeps the best chunk per document (grouped by `Metadata.chunk_of`), also when there
+    are fewer candidates than K, so a document is never numbered twice;
   - weights scores by source kind (incident 1.10, monitor 1.05, SLO 1.03, logs 0.98);
   - applies a 24-hour recency half-life, never cutting a score below half;
   - selects the top-K with maximal marginal relevance, so near-duplicate text is skipped.

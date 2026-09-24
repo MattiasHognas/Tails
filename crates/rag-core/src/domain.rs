@@ -70,6 +70,18 @@ pub struct RagDocument {
     pub metadata: serde_json::Map<String, serde_json::Value>,
 }
 
+impl RagDocument {
+    /// The document a chunk belongs to: `metadata.chunk_of` (set by
+    /// [`crate::chunk::chunk`]), else the document's own ID. The reranker groups
+    /// chunks by it and `/ask` reports it as a source's `id`.
+    pub fn parent_id(&self) -> &str {
+        self.metadata
+            .get("chunk_of")
+            .and_then(|v| v.as_str())
+            .unwrap_or(&self.id)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Hit {

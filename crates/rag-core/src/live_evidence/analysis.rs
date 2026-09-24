@@ -545,4 +545,41 @@ mod tests {
         assert!(a.bursts.is_empty());
         assert_eq!(a.bucket, Duration::minutes(3));
     }
+
+    /// Log messages are grouped by a digit-masked, length-capped form; multibyte
+    /// text (and non-ASCII digits, which are not masked) must survive the cap.
+    #[test]
+    fn message_grouping_is_char_safe_for_multibyte_text() {
+        assert_eq!(
+            normalize_message("Återförsök 3 av 5 misslyckades  för   åsa 🚀 決済 ２"),
+            "Återförsök # av # misslyckades för åsa 🚀 決済 ２"
+        );
+        for pad in 150..=165 {
+            let msg = format!("{}決済エラー 42 e\u{0301} 👩\u{200D}💻", "å".repeat(pad));
+            let out = normalize_message(&msg);
+            assert!(out.chars().count() <= 161, "{pad}: {out}");
+            assert!(!out.chars().any(|c| c.is_ascii_digit()), "{pad}: {out}");
+            if pad >= 160 {
+                assert_eq!(out, format!("{}…", "å".repeat(160)));
+            }
+        }
+        let t = |m: &str| {
+            (
+                ts("2026-03-11T10:00:00Z"),
+                "error".to_string(),
+                m.to_string(),
+            )
+        };
+        let events = [
+            t("決済 timeout 1200ms"),
+            t("決済 timeout 900ms"),
+            t("åäö 1"),
+        ];
+        let a = analyse_logs(
+            &events,
+            ts("2026-03-11T00:00:00Z"),
+            ts("2026-03-12T00:00:00Z"),
+        );
+        assert_eq!(a.top_messages[0], ("決済 timeout #ms".to_string(), 2));
+    }
 }

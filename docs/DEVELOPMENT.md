@@ -249,6 +249,137 @@ upserts, and the incremental-indexing calls: retrieving bookkeeping by point ID,
 Recommended payload indexes for large collections are listed under
 [Qdrant storage](ARCHITECTURE.md#qdrant-storage).
 
+### Pipeline tests (writer against reader)
+
+Unit tests check each side against hand-written JSON, so they keep passing when the
+indexer's writer and the API's reader drift apart. The pipeline tests in
+`crates/rag-indexer/src/pipeline_tests/` run both for real on one store:
+
+1. a fake Datadog API serves the recorded fixtures (`crates/rag-core/tests/fixtures/datadog`)
+   and a crafted corpus, with the pagination the adapters follow;
+2. the indexer's own `index_sources` + `IncrementalSink` (chunking, content hashes,
+   batched embeddings, upserts, cleanup) writes to the store;
+3. the API's router (`rag_api::app`, served with a fixed clock) answers `/ask`: planner
+   reply, `RetrievalScope` filter, search, rerank, prompt, `sources`, `citationWarnings`.
+
+Embeddings and chat come from a deterministic fake OpenAI server: a signed, hashed
+bag-of-words vector per text (1024 dimensions, so texts sharing words are close), a
+canned planner reply per question, and an answer model that cites the documents it is
+told to by reading its prompt. The store is an in-memory fake Qdrant that stores what
+the writer sent and evaluates the filter subset Tails uses (`must`/`should`/`must_not`,
+`match` value/any/except, numeric and datetime `range`, `is_empty`, `is_null`, `has_id`);
+anything else it rejects and the test fails. Each test also has a `*_real_qdrant`
+variant, ignored by default, that uses a fresh collection on `QDRANT_TEST_ENDPOINT`.
+
+| Test | Checks |
+|------|--------|
+| `pipeline_tests::contract` | Every stored point decodes (reader's `QdrantPayload`) to the chunk the adapters produced, under the UUIDv5 of its ID; `Kind` equals the filter's value; `Timestamp` is RFC 3339; `Service`/`Environment` are lowercase; `ContentHash`/`ChunkCount`/`SyncId` never reach `sources`. `/ask` returns the right documents for service (`Auth-API` from Datadog vs `AUTH-API` from the planner), environment, kind and time filters (half-open window, timeless kinds); a three-chunk log is one source; `sources` are stored documents numbered like the prompt; unknown citations appear in `citationWarnings`; a second run rewrites nothing. |
+| `pipeline_tests::unicode` | See [Unicode policy](#unicode-policy). |
+| `pipeline_tests::quality` | The [incident question set](#incident-question-set). |
+
+```bash
+# In-memory store: part of the normal test run.
+cargo test -p rag-indexer pipeline_tests
+
+# Real Qdrant (CI runs these in the Build workflow):
+QDRANT_TEST_ENDPOINT=http://localhost:6333 cargo test -p rag-indexer --bin rag-indexer -- \
+  --ignored --exact pipeline_tests::contract::pipeline_contract_real_qdrant \
+  pipeline_tests::unicode::unicode_round_trip_real_qdrant \
+  pipeline_tests::quality::incident_questions_real_qdrant
+```
+
+The tests live in the indexer's binary crate (a `#[cfg(test)]` module), because that is
+where the writer is; `rag-api` is a dev-dependency there, exposed as a library
+(`AppState`, `app`, `serve`) with `main.rs` only reading the environment and serving.
+
+### Unicode policy
+
+Datadog text routinely contains Swedish `åäö`, `é`, emoji, CJK and combining marks, so
+no code may cut text at a byte offset that is not a char boundary:
+
+- Byte-limited cuts go through `rag_core::text::truncate_bytes` (the last char boundary
+  at or below the limit, never separating a character from a following combining mark,
+  variation selector, skin-tone modifier or zero-width-joiner sequence) or
+  `truncate_with_marker`. Prompt excerpts (`EXCERPT_MAX_BYTES`, 1500 bytes, then
+  ` …[truncated]`) and logged upstream error bodies (512 bytes) use them.
+- Character-limited cuts use `chars()`: the chunker (1800 chars, 200 overlap), log
+  message grouping in live evidence (160 chars) and CLI snippets.
+- Never `String::truncate(n)`, `&s[..n]` or `split_at(n)` with `n` computed from a
+  length, unless `n` comes from `find`/`char_indices` on the same string or only ASCII
+  was skipped.
+
+The tests put multibyte characters exactly at 1500 bytes (±5) and at chunk size ±3,
+sweep every limit on mixed samples (`text.rs`), and check through the whole pipeline
+(`pipeline_tests::unicode`) that nothing panics, excerpts are valid prefixes, chunks
+reassemble to the original text and every payload survives the write/read round trip
+unchanged.
+
+### Incident question set
+
+`crates/rag-indexer/tests/incident_questions/` holds a versioned, human-readable
+evaluation set: `questions.json` (16 incident questions) and `corpus.json` (monitors,
+incidents, SLOs, logs, dashboards and metrics in Datadog response shape, with
+distractors: a similarly named service, another environment, events outside the window).
+The recorded fixtures are indexed alongside. Each question has a fixed `now` and
+timezone, the canned planner reply (`plan`), optional explicit request fields, the
+expected `scope`, `mustRetrieve`/`mayRetrieve`/`mustNotRetrieve` document IDs, expected
+timeline observations with the live data that produces them, and what the answer cites.
+
+Run it and print the report:
+
+```bash
+cargo test -p rag-indexer incident_questions_in_memory -- --nocapture
+```
+
+```
+question                     recall prec@R exclude scope   cites  intent   obs srcs  notes
+q01-checkout-slow-yesterday    1.00   1.00     8/8    ok     5/5     5/5   2/2    5
+...
+aggregate over 15 questions (known gaps excluded):
+  recall@k                   1.000 (threshold 0.95)
+```
+
+- `recall`: share of `mustRetrieve` among `sources` (k = every source given to the
+  answer model). `prec@R`: share of the first R sources that are must/may documents,
+  R = number of `mustRetrieve`. `exclude`: `mustNotRetrieve` kept out of `sources`.
+  `scope`: the response's `scope` equals the expected keys.
+- `cites`: citations in the answer that resolve / all citations (deliberate negative
+  controls excluded). `intent`: intended citations that point at the intended document
+  (`[DOC #n]` is `sources[n-1]`), and intended observations cited. `obs`: expected
+  observations present with their ID, kind and service. `srcs`: number of sources.
+- `notes` lists misses, leaked distractors, scope differences, the top sources when
+  precision drops, and the observations actually collected.
+
+Every question also asserts, regardless of thresholds, that `sources` are stored
+documents numbered like the prompt and that `citationWarnings` equals
+`validate_citations` on the answer. The test fails when an aggregate drops below
+`thresholds` in `questions.json`.
+
+**Adding a question:** add documents to `corpus.json` if needed (IDs become
+`monitor_<id>`, `incident_<id>`, `log_<id>`, `slo_<id>`, `dashboard_<id>`,
+`metric_<name with dots as underscores>`), then an entry to `questions`. Unknown IDs fail
+the run. For live evidence add `live` (hourly series with `spikes`, log `bursts`); the
+observation IDs are assigned chronologically, so run once and read the collected
+observations in `notes` before writing `expect.timeline`. A question documenting a
+known limitation gets `"knownGap": "<why>"`: it is reported but not counted, and the
+report says when it starts passing.
+
+**Changing thresholds:** thresholds are the committed floor, not the current score. Raise
+one when a change improves the aggregate for good. Lower one only together with the
+change that justifies it, and say why in the pull request; bump `version` when questions
+or expectations change meaning.
+
+**Real models (opt-in, never in CI):** `incident_questions_openai` uses
+`OPENAI_API_KEY` (and optionally `OPENAI_BASE_URL`, `OPENAI_EMBEDDING_MODEL`,
+`OPENAI_CHAT_MODEL`) for embeddings and answers, sends the canned plans with the request,
+and uses real Qdrant when `QDRANT_TEST_ENDPOINT` is set. It enforces the retrieval and
+citation-validity thresholds; citation accuracy and negative controls only apply to the
+canned answer model.
+
+```bash
+OPENAI_API_KEY=... cargo test -p rag-indexer incident_questions_openai -- --ignored --nocapture
+```
+
 ### Mutation Testing
 
 The project uses [cargo-mutants](https://mutants.rs/) for mutation testing to identify missing test coverage:

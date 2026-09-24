@@ -529,46 +529,24 @@ mod tests {
         assert!(payload.get("Timestamp").unwrap().is_null());
     }
 
-    #[test]
-    fn test_url_formatting() {
-        let qdrant = Qdrant {
-            endpoint: "http://localhost:6333".to_string(),
-            collection: "test_collection".to_string(),
-            http: reqwest::Client::new(),
-            retry: crate::resilience::RetryPolicy::none(),
-        };
-
-        let upsert_url = format!(
-            "{}/collections/{}/points?wait=true",
-            qdrant.endpoint, qdrant.collection
-        );
-        assert_eq!(
-            upsert_url,
-            "http://localhost:6333/collections/test_collection/points?wait=true"
-        );
-
-        let search_url = format!(
-            "{}/collections/{}/points/search",
-            qdrant.endpoint, qdrant.collection
-        );
-        assert_eq!(
-            search_url,
-            "http://localhost:6333/collections/test_collection/points/search"
-        );
-    }
-
     #[tokio::test]
-    async fn test_search_with_mock_server() {
-        use wiremock::matchers::{method, path};
+    async fn search_sends_vector_limit_and_filter_and_restores_every_field() {
+        use wiremock::matchers::{body_json, method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let mock_server = MockServer::start().await;
-
+        let filter = serde_json::json!({"must": [{"key": "Service", "match": {"value": "api"}}]});
         Mock::given(method("POST"))
             .and(path("/collections/test/points/search"))
+            .and(body_json(serde_json::json!({
+                "vector": [0.5, 0.25],
+                "limit": 10,
+                "with_payload": true,
+                "filter": filter
+            })))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "result": [{
-                    "id": "point1",
+                    "id": "21aca85b-31bc-5c36-bd5f-32403cb008d2",
                     "score": 0.95,
                     "payload": {
                         "Title": "Test Document",
@@ -576,134 +554,116 @@ mod tests {
                         "SourceUri": "http://example.com",
                         "Service": "api",
                         "Environment": "prod",
-                        "id": "doc1",
+                        "id": "doc1#c0",
                         "Timestamp": "2025-01-01T00:00:00Z",
-                        "Kind": "logs"
+                        "Kind": "sLO",
+                        "Metadata": {"chunk_of": "doc1", "chunk_index": 0}
                     }
                 }]
             })))
+            .expect(1)
             .mount(&mock_server)
             .await;
 
-        let qdrant = Qdrant {
-            endpoint: mock_server.uri(),
-            collection: "test".to_string(),
-            http: reqwest::Client::new(),
-            retry: crate::resilience::RetryPolicy::none(),
-        };
-
-        let vector = vec![0.1, 0.2, 0.3];
-        let result = qdrant.search(vector, 10, None).await;
-        assert!(result.is_ok(), "Error: {:?}", result.err());
-        let hits = result.unwrap();
+        let hits = mock_qdrant(mock_server.uri())
+            .search(vec![0.5, 0.25], 10, Some(filter.clone()))
+            .await
+            .unwrap();
         assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].doc.id, "doc1");
+        assert_eq!(hits[0].score, 0.95);
+        let doc = &hits[0].doc;
+        assert_eq!(doc.id, "doc1#c0");
+        assert_eq!(doc.parent_id(), "doc1");
+        assert_eq!(doc.title, "Test Document");
+        assert_eq!(doc.text, "Document content");
+        assert_eq!(doc.source_uri, "http://example.com");
+        assert_eq!(doc.kind, SourceKind::SLO);
+        assert_eq!(doc.timestamp.as_deref(), Some("2025-01-01T00:00:00Z"));
+        assert_eq!(
+            (doc.service.as_str(), doc.environment.as_str()),
+            ("api", "prod")
+        );
     }
 
     #[tokio::test]
-    async fn test_upsert_with_mock_server() {
-        use wiremock::matchers::{method, path};
+    async fn upsert_waits_and_sends_uuid_points_with_the_storage_payload() {
+        use wiremock::matchers::{method, path, query_param};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let mock_server = MockServer::start().await;
-
         Mock::given(method("PUT"))
             .and(path("/collections/test/points"))
+            .and(query_param("wait", "true"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "result": {
-                    "operation_id": 1,
-                    "status": "completed"
-                }
+                "result": {"operation_id": 1, "status": "completed"}
             })))
+            .expect(1)
             .mount(&mock_server)
             .await;
 
-        let qdrant = Qdrant {
-            endpoint: mock_server.uri(),
-            collection: "test".to_string(),
-            http: reqwest::Client::new(),
-            retry: crate::resilience::RetryPolicy::none(),
-        };
-
-        let doc = RagDocument {
-            id: "test123".to_string(),
-            title: "Test".to_string(),
-            text: "Content".to_string(),
-            source_uri: "http://example.com".to_string(),
-            kind: SourceKind::Logs,
-            timestamp: Some("2025-01-01T00:00:00Z".to_string()),
-            service: "api".to_string(),
-            environment: "prod".to_string(),
-            metadata: serde_json::Map::new(),
-        };
-
+        let doc = contract_document();
         let point = QPoint::from_document(&doc, vec![0.1, 0.2, 0.3]);
+        mock_qdrant(mock_server.uri())
+            .upsert(vec![point])
+            .await
+            .unwrap();
 
-        let result = qdrant.upsert(vec![point]).await;
-        assert!(result.is_ok());
+        let reqs = mock_server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&reqs[0].body).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({"points": [{
+                "id": "21aca85b-31bc-5c36-bd5f-32403cb008d2",
+                "vector": [0.1, 0.2, 0.3],
+                "payload": {
+                    "id": "monitor_123#c0",
+                    "Title": "Återkommande fel",
+                    "Text": "Connection failed",
+                    "SourceUri": "https://app.datadoghq.eu/monitors/123",
+                    "Kind": "monitor",
+                    "Timestamp": null,
+                    "Service": "payments",
+                    "Environment": "prod",
+                    "Metadata": {"chunk_of": "monitor_123", "chunk_index": 0}
+                }
+            }]})
+        );
     }
 
     #[tokio::test]
-    async fn test_search_error_handling() {
+    async fn search_and_upsert_failures_are_typed_by_stage() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let mock_server = MockServer::start().await;
-
         Mock::given(method("POST"))
             .and(path("/collections/test/points/search"))
             .respond_with(ResponseTemplate::new(404))
             .mount(&mock_server)
             .await;
-
-        let qdrant = Qdrant {
-            endpoint: mock_server.uri(),
-            collection: "test".to_string(),
-            http: reqwest::Client::new(),
-            retry: crate::resilience::RetryPolicy::none(),
-        };
-
-        let vector = vec![0.1, 0.2, 0.3];
-        let result = qdrant.search(vector, 10, None).await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_upsert_error_handling() {
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
-
-        let mock_server = MockServer::start().await;
-
         Mock::given(method("PUT"))
             .and(path("/collections/test/points"))
             .respond_with(ResponseTemplate::new(500))
             .mount(&mock_server)
             .await;
+        let qdrant = mock_qdrant(mock_server.uri());
 
-        let qdrant = Qdrant {
-            endpoint: mock_server.uri(),
-            collection: "test".to_string(),
-            http: reqwest::Client::new(),
-            retry: crate::resilience::RetryPolicy::none(),
-        };
+        // A missing collection is a retrieval failure, not "no evidence".
+        let err = qdrant.search(vec![0.1], 10, None).await.unwrap_err();
+        assert!(matches!(err, RagError::RetrievalFailed { .. }), "{err:?}");
 
-        let doc = RagDocument {
-            id: "test123".to_string(),
-            title: "Test".to_string(),
-            text: "Content".to_string(),
-            source_uri: "http://example.com".to_string(),
-            kind: SourceKind::Logs,
-            timestamp: Some("2025-01-01T00:00:00Z".to_string()),
-            service: "api".to_string(),
-            environment: "prod".to_string(),
-            metadata: serde_json::Map::new(),
-        };
-
-        let point = QPoint::from_document(&doc, vec![0.1, 0.2, 0.3]);
-
-        let result = qdrant.upsert(vec![point]).await;
-        assert!(result.is_err());
+        let point = QPoint::from_document(&contract_document(), vec![0.1]);
+        let err = qdrant.upsert(vec![point]).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                RagError::UpstreamUnavailable {
+                    stage: Stage::Indexing,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
     }
 
     fn mock_qdrant(uri: String) -> Qdrant {
