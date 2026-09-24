@@ -35,7 +35,7 @@ The server chooses `K` dynamically — no `--k` flag needed.
 | `rag-core` | Domain models, OpenAI, Qdrant (search + upsert), Datadog client (monitors, incidents, logs, dashboards, metrics, SLOs), chunker, planner, reranker, RAG service. |
 | `rag-api` | Axum REST API — `/ask/plan` (intent + inferred filters) and `/ask` (retrieval + answer). |
 | `rag-cli` | CLI that calls the API. Planner infers service/env; server decides top-K. |
-| `rag-indexer` | One-shot indexer with watermark for Datadog → Qdrant. Perfect for Kubernetes CronJob. |
+| `rag-indexer` | One-shot, resumable indexer for Datadog → Qdrant with per-source checkpoints. Perfect for Kubernetes CronJob. |
 
 ---
 
@@ -66,8 +66,9 @@ DD_APP_KEY=...
 DD_SITE=datadoghq.eu    # or datadoghq.com
 
 # Indexer
-INDEXER_WATERMARK=/data/watermark.json
-INDEXER_LOOKBACK_MINUTES=90
+INDEXER_WATERMARK=/data/watermark.json   # per-source checkpoint file
+INDEXER_LOOKBACK_MINUTES=90              # window for a source's first run
+INDEXER_OVERLAP_MINUTES=10               # re-read before each checkpoint for late arrivals
 
 # Retrieval tuning (optional)
 RAG_TOPK_DEFAULT=16
@@ -150,6 +151,33 @@ cd crates/rag-indexer
 INDEXER_WATERMARK=./watermark.json DD_API_KEY=... DD_APP_KEY=... DD_SITE=datadoghq.eu OPENAI_API_KEY=... QDRANT_ENDPOINT=http://localhost:6333 QDRANT_COLLECTION=datadog_rag cargo run
 ```
 
+### How the indexer resumes
+
+Each run indexes every source (monitors, dashboards, SLOs, metrics, incidents, logs)
+independently and records its progress in the checkpoint file at `INDEXER_WATERMARK`:
+
+```json
+{ "sources": { "logs": { "indexed_until": "2025-01-01T12:00:00Z" }, "incidents": { "indexed_until": "2025-01-01T11:45:00Z" } } }
+```
+
+- **Complete fetches:** every Datadog list is paginated to the end (logs via the
+  `meta.page.after` cursor, 1000 per page, oldest first).
+- **Per-source checkpoints:** a source's checkpoint advances to the run's start time only
+  after all of its documents are embedded and upserted, and the file is rewritten
+  atomically (temp file + rename). A failing source is logged and retried from its old
+  checkpoint on the next run while the others advance; the run then exits non-zero.
+- **Windows:** logs, incidents and metrics are fetched from their checkpoint minus
+  `INDEXER_OVERLAP_MINUTES` (default 10) until now, so records that reach Datadog late
+  are picked up by the next run. A source without a checkpoint starts
+  `INDEXER_LOOKBACK_MINUTES` (default 90) back. After an outage, the whole gap since the
+  checkpoint is fetched. Monitors, dashboards and SLOs are re-synced in full each run.
+- **No duplicates:** documents are deduplicated by ID within a run, and Qdrant point IDs
+  are derived from document IDs, so re-indexing overlapping records overwrites them.
+- **Upgrades:** a legacy watermark file holding a single timestamp is used as the
+  checkpoint for every source and rewritten in the new format. An unreadable checkpoint
+  file stops the run instead of silently re-starting from the lookback; delete it to
+  start over.
+
 ---
 
 ## Docker
@@ -204,11 +232,15 @@ metadata:
   name: rag-indexer
 spec:
   schedule: "*/15 * * * *"
+  # Runs share the checkpoint file, so never let two overlap.
+  concurrencyPolicy: Forbid
   jobTemplate:
     spec:
       template:
         spec:
           restartPolicy: OnFailure
+          securityContext:
+            fsGroup: 1000   # the image runs as UID 1000; make the volume writable
           containers:
           - name: indexer
             image: ghcr.io/yourorg/rag-indexer:latest
@@ -229,12 +261,27 @@ spec:
               value: /data/watermark.json
             - name: INDEXER_LOOKBACK_MINUTES
               value: "90"
+            - name: INDEXER_OVERLAP_MINUTES
+              value: "10"
             volumeMounts:
             - name: data
               mountPath: /data
           volumes:
           - name: data
-            emptyDir: {}
+            persistentVolumeClaim:
+              claimName: rag-indexer-data
+---
+# Checkpoints must survive between runs; with emptyDir every run would start over.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: rag-indexer-data
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
 ```
 
 ---
