@@ -29,6 +29,58 @@ The server chooses `K` dynamically — no `--k` flag needed.
 
 ---
 
+## Using the CLI
+
+Once the API is running (see [Quickstart](#quickstart)), install `rag-cli` (see
+[CLI](#cli) for installers and binaries) and point it at the API:
+
+```bash
+export RAG_API_BASE=http://localhost:5191   # default
+export RAG_API_TOKEN=...                    # optional bearer token
+
+# Ask in plain language. The server infers service, environment and time window.
+rag-cli ask "why did auth-api return 5xx errors yesterday?"
+
+# Pin what you already know. Explicit flags always win over inferred values.
+rag-cli ask "latency spikes after the deploy" --service auth-api --env prod
+
+# Only use certain evidence (repeatable): logs, metrics, monitor, incident, dashboard, slo, git
+rag-cli ask "what alerted overnight?" --kind monitor --kind incident
+
+# Resolve "yesterday", "last 2 hours", ... in a specific timezone (default: your system zone)
+rag-cli ask "errors in payments since yesterday" --tz Europe/Stockholm
+
+# See how the server interprets a question, without retrieving or answering
+rag-cli plan "why did checkout fail in staging last night?"
+```
+
+`ask` prints the API response as JSON: the `answer`, whether it is backed by indexed
+documents (`"evidence": "found"` or `"none"`), the validated `plan`, and the `scope`
+actually applied to retrieval:
+
+```json
+{
+  "answer": "auth-api returned 5xx between 14:05 and 14:40 UTC ... [DOC #1] ...",
+  "evidence": "found",
+  "plan": { "intent": "rootCauseWindow", "service": "auth-api", "environment": "prod", "...": "..." },
+  "scope": {
+    "service": "auth-api",
+    "environment": "prod",
+    "fromUtc": "2026-09-22T22:00:00Z",
+    "toUtc": "2026-09-23T22:00:00Z",
+    "kinds": []
+  }
+}
+```
+
+If the planner is unsure about something, its clarifying questions are printed to
+stderr under `Need more info:`. If a step fails (planning, embedding, search or
+generation), no answer is printed. The CLI prints the typed error, for example
+`error [upstream_unavailable] at stage 'retrieval' (HTTP 503): ...`, and exits with
+status 1. See [API errors and evidence](#api-errors-and-evidence).
+
+---
+
 ## Crates Overview
 
 | Crate | Description |
@@ -37,6 +89,132 @@ The server chooses `K` dynamically — no `--k` flag needed.
 | `rag-api` | Axum REST API — `/ask/plan` (intent + inferred filters) and `/ask` (server-side planning + filtered retrieval + answer). |
 | `rag-cli` | CLI that calls the API. The server plans (service/env/time) and decides top-K. |
 | `rag-indexer` | One-shot, resumable indexer for Datadog → Qdrant with per-source checkpoints. Perfect for Kubernetes CronJob. |
+
+---
+
+## How it fits together
+
+There are two flows. **Ingestion** (`rag-indexer`, run on a schedule) copies Datadog
+data into Qdrant as embedded chunks. **Questions** (`rag-cli` → `rag-api`) plan the
+question, search those chunks with the resulting filters, and have the LLM answer only
+from what was found.
+
+```mermaid
+flowchart TB
+    user(["User"])
+
+    subgraph cli ["rag-cli"]
+        cliAsk["ask QUESTION<br/>--service --env --kind --tz"]
+        cliPlan["plan QUESTION --tz"]
+        cliTz["timezone()<br/>--tz, TZ or system zone"]
+        cliOut["print answer JSON<br/>clarifying questions to stderr<br/>format_api_error() + exit 1"]
+    end
+
+    subgraph api ["rag-api (Axum, :5191)"]
+        routeAsk["POST /ask<br/>ask()"]
+        routePlan["POST /ask/plan<br/>plan()"]
+        validate["require_question()<br/>plan_context(): clock + IANA timezone<br/>explicit_scope(): 400 on bad input"]
+        planner["run_planner()<br/>planner::plan_query()<br/>sanitize_plan(): untrusted LLM output,<br/>'yesterday' resolved in code"]
+        scope["RetrievalScope::resolve()<br/>explicit fields win over inferred<br/>to_qdrant_filter()"]
+        topk["choose_topk()"]
+        rna["rag_service::retrieve_and_answer()"]
+        answer["answer_question()<br/>rerank_mmr_signals() + prompt"]
+        noev["zero hits: fixed no-evidence answer<br/>(LLM not called)"]
+        errs["ApiError: typed JSON error<br/>400 / 502 / 503 / 504"]
+    end
+
+    subgraph core ["rag-core (shared library)"]
+        resil["resilience: run_stage() timeouts,<br/>send_with_retry() backoff for 429/5xx"]
+        oaClient["OpenAiClient<br/>embed() / chat_json() / chat_complete()"]
+        qdClient["Qdrant<br/>search() / upsert()"]
+        ddClient["Datadog adapters<br/>get_monitors() list_dashboards() list_slos()<br/>list_metrics() get_incidents() search_logs()"]
+        chunker["chunk() + stable_id()"]
+    end
+
+    subgraph indexer ["rag-indexer (one-shot, CronJob)"]
+        ckLoad["Checkpoints::load()"]
+        idx["index_sources()<br/>per source: window() with overlap"]
+        fetch["SourceFetcher::fetch()"]
+        dedupe["dedupe_by_id()"]
+        sink["QdrantSink::index()<br/>chunk_documents() -> embed -> upsert"]
+        ckSave["Checkpoints::save()<br/>atomic, only after success"]
+    end
+
+    ckFile[("watermark.json<br/>per-source checkpoints (PVC)")]
+
+    subgraph ext ["External services"]
+        openai[["OpenAI<br/>/v1/embeddings<br/>/v1/chat/completions"]]
+        qdrant[("Qdrant<br/>/collections/{c}/points/search<br/>PUT /collections/{c}/points")]
+        datadog[["Datadog API<br/>/api/v1/monitor, /dashboard, /slo, /metrics<br/>/api/v2/incidents/search<br/>/api/v2/logs/events/search"]]
+    end
+
+    %% Question flow
+    user --> cliAsk & cliPlan
+    cliAsk --> cliTz
+    cliPlan --> cliTz
+    cliTz -- "HTTP JSON" --> routeAsk
+    cliTz -- "HTTP JSON" --> routePlan
+    routePlan --> validate --> planner
+    routeAsk --> validate
+    planner --> scope --> topk --> rna
+    rna -- "1. embed query" --> oaClient
+    rna -- "2. filtered search" --> qdClient
+    rna -- "hits" --> answer
+    rna -- "no hits" --> noev
+    answer -- "3. generate" --> oaClient
+    planner -- "chat_json" --> oaClient
+    rna -. "failure / timeout" .-> errs
+    planner -. "failure / timeout" .-> errs
+    answer --> cliOut
+    noev --> cliOut
+    errs --> cliOut
+
+    %% Shared plumbing
+    oaClient --> resil
+    qdClient --> resil
+    resil --> openai
+    resil --> qdrant
+    ddClient --> datadog
+
+    %% Ingestion flow
+    ckFile --> ckLoad --> idx --> fetch --> ddClient
+    fetch --> dedupe --> sink
+    sink --> chunker
+    sink --> oaClient
+    sink --> qdClient
+    sink --> ckSave --> ckFile
+```
+
+What each part does:
+
+- **rag-cli**: turns `ask` and `plan` commands into HTTP calls to the API, adds your
+  timezone, prints the JSON response, and prints typed errors and exits non-zero.
+- **rag-api**:
+  - validates the request (`400` on bad input);
+  - asks the planner for intent, service, environment and time window. Planner output
+    is treated as untrusted, and relative times like "yesterday" are resolved in code;
+  - merges the plan with explicit request fields into a `RetrievalScope`, which becomes
+    the Qdrant filter;
+  - runs `retrieve_and_answer`: embed the query, search Qdrant, rerank, and generate
+    an answer.
+  - Zero hits give a fixed no-evidence answer without calling the LLM. Failures and
+    timeouts become typed `502`/`503`/`504` errors, never an answer.
+- **rag-core**: the shared library.
+  - The OpenAI client (embeddings and chat), the Qdrant client (search and upsert), and
+    the Datadog adapters.
+  - The planner, the retrieval scope and the reranker.
+  - The chunker (stable chunk IDs, so re-indexing overwrites instead of duplicating).
+  - `resilience`: per-stage timeouts, the overall request deadline, and bounded retries
+    for 429 and 5xx responses.
+- **rag-indexer**: for each Datadog source, computes a window from that source's
+  checkpoint (with overlap for late data). It then fetches, deduplicates, chunks, embeds
+  and upserts, and advances that source's checkpoint only after success. One failing
+  source doesn't block the others.
+- **External services**:
+  - **Datadog**: the source of monitors, dashboards, SLOs, metric names, incidents and
+    logs.
+  - **OpenAI**: embeddings, planning, and answers.
+  - **Qdrant**: the vector store the API searches.
 
 ---
 
