@@ -1,5 +1,5 @@
+use crate::error::RagError;
 use crate::openai::OpenAiClient;
-use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,7 +38,7 @@ pub struct QueryPlan {
     pub rewritten_query: Option<String>,
 }
 
-pub async fn plan_query(oa: &OpenAiClient, user_query: &str) -> Result<QueryPlan> {
+pub async fn plan_query(oa: &OpenAiClient, user_query: &str) -> Result<QueryPlan, RagError> {
     let sys = r#"
 You are a planning assistant for an SRE RAG over Datadog.
 Return strictly valid JSON with:

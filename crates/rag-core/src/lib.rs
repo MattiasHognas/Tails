@@ -1,11 +1,13 @@
 pub mod chunk;
 pub mod datadog;
 pub mod domain;
+pub mod error;
 pub mod openai;
 pub mod planner;
 pub mod qdrant;
 pub mod rag_service;
 pub mod reranker;
+pub mod resilience;
 
 #[cfg(test)]
 pub(crate) mod test_support {

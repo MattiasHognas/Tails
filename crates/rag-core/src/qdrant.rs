@@ -1,5 +1,7 @@
 use crate::domain::{Hit, RagDocument, SourceKind};
-use anyhow::{Result, anyhow};
+use crate::error::{RagError, Stage, UpstreamError};
+use crate::resilience::{HttpConfig, RetryPolicy, send_with_retry};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -8,6 +10,7 @@ pub struct Qdrant {
     pub endpoint: String,
     pub collection: String,
     pub http: reqwest::Client,
+    pub retry: RetryPolicy,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -93,18 +96,22 @@ impl Qdrant {
         Self {
             endpoint,
             collection,
-            http: reqwest::Client::new(),
+            http: HttpConfig::default().build_client(),
+            retry: RetryPolicy::default(),
         }
     }
 
     pub fn new_from_env() -> Result<Self> {
-        Ok(Self::new(
+        let mut qdrant = Self::new(
             std::env::var("QDRANT_ENDPOINT").unwrap_or_else(|_| "http://localhost:6333".into()),
             std::env::var("QDRANT_COLLECTION").unwrap_or_else(|_| "datadog_rag".into()),
-        ))
+        );
+        qdrant.http = HttpConfig::from_env().build_client();
+        qdrant.retry = RetryPolicy::from_env();
+        Ok(qdrant)
     }
 
-    pub async fn upsert(&self, points: Vec<QPoint>) -> Result<()> {
+    pub async fn upsert(&self, points: Vec<QPoint>) -> Result<(), RagError> {
         #[derive(Serialize)]
         struct Req {
             points: Vec<QPoint>,
@@ -113,10 +120,12 @@ impl Qdrant {
             "{}/collections/{}/points?wait=true",
             self.endpoint, self.collection
         );
-        let r = self.http.put(url).json(&Req { points }).send().await?;
-        if !r.status().is_success() {
-            return Err(anyhow!("qdrant upsert status {}", r.status()));
-        }
+        let req = Req { points };
+        send_with_retry(&self.retry, "qdrant upsert", || {
+            self.http.put(&url).json(&req)
+        })
+        .await
+        .map_err(|f| RagError::upstream(Stage::Indexing, f))?;
         Ok(())
     }
 
@@ -125,7 +134,7 @@ impl Qdrant {
         vector: Vec<f32>,
         limit: usize,
         filter: Option<serde_json::Value>,
-    ) -> Result<Vec<Hit>> {
+    ) -> Result<Vec<Hit>, RagError> {
         #[derive(Serialize)]
         struct Req<'a> {
             vector: &'a [f32],
@@ -148,21 +157,22 @@ impl Qdrant {
             "{}/collections/{}/points/search",
             self.endpoint, self.collection
         );
-        let r = self
-            .http
-            .post(url)
-            .json(&Req {
-                vector: &vector,
-                limit,
-                with_payload: true,
-                filter,
-            })
-            .send()
-            .await?;
-        if !r.status().is_success() {
-            return Err(anyhow!("qdrant search status {}", r.status()));
-        }
-        let v: Resp = r.json().await?;
+        let req = Req {
+            vector: &vector,
+            limit,
+            with_payload: true,
+            filter,
+        };
+        let r = send_with_retry(&self.retry, "qdrant search", || {
+            self.http.post(&url).json(&req)
+        })
+        .await
+        .map_err(|f| RagError::upstream(Stage::Retrieval, f))?;
+        // A malformed payload is a retrieval failure, never "no evidence".
+        let v: Resp = r
+            .json()
+            .await
+            .map_err(|e| RagError::failed(Stage::Retrieval, UpstreamError::from_reqwest(e)))?;
         Ok(v.result
             .into_iter()
             .map(|it| Hit {
@@ -367,6 +377,7 @@ mod tests {
             endpoint: "http://localhost:6333".to_string(),
             collection: "test_collection".to_string(),
             http: reqwest::Client::new(),
+            retry: crate::resilience::RetryPolicy::none(),
         };
 
         let upsert_url = format!(
@@ -420,6 +431,7 @@ mod tests {
             endpoint: mock_server.uri(),
             collection: "test".to_string(),
             http: reqwest::Client::new(),
+            retry: crate::resilience::RetryPolicy::none(),
         };
 
         let vector = vec![0.1, 0.2, 0.3];
@@ -452,6 +464,7 @@ mod tests {
             endpoint: mock_server.uri(),
             collection: "test".to_string(),
             http: reqwest::Client::new(),
+            retry: crate::resilience::RetryPolicy::none(),
         };
 
         let doc = RagDocument {
@@ -489,6 +502,7 @@ mod tests {
             endpoint: mock_server.uri(),
             collection: "test".to_string(),
             http: reqwest::Client::new(),
+            retry: crate::resilience::RetryPolicy::none(),
         };
 
         let vector = vec![0.1, 0.2, 0.3];
@@ -513,6 +527,7 @@ mod tests {
             endpoint: mock_server.uri(),
             collection: "test".to_string(),
             http: reqwest::Client::new(),
+            retry: crate::resilience::RetryPolicy::none(),
         };
 
         let doc = RagDocument {

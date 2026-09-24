@@ -1,5 +1,7 @@
-use anyhow::{Result, anyhow};
-use serde::{Deserialize, Serialize};
+use crate::error::{RagError, Stage, UpstreamError};
+use crate::resilience::{HttpConfig, RetryPolicy, send_with_retry};
+use anyhow::Result;
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 #[derive(Debug, Clone)]
 pub struct OpenAiClient {
@@ -8,6 +10,26 @@ pub struct OpenAiClient {
     pub embedding_model: String,
     pub chat_model: String,
     pub http: reqwest::Client,
+    pub retry: RetryPolicy,
+}
+
+#[derive(Serialize)]
+struct Msg<'a> {
+    role: &'a str,
+    content: &'a str,
+}
+
+#[derive(Deserialize)]
+struct ChatResp {
+    choices: Vec<Choice>,
+}
+#[derive(Deserialize)]
+struct Choice {
+    message: Message,
+}
+#[derive(Deserialize)]
+struct Message {
+    content: Option<String>,
 }
 
 impl OpenAiClient {
@@ -22,21 +44,58 @@ impl OpenAiClient {
             base_url,
             embedding_model,
             chat_model,
-            http: reqwest::Client::new(),
+            http: HttpConfig::default().build_client(),
+            retry: RetryPolicy::default(),
         }
     }
 
     pub fn new_from_env() -> Result<Self> {
-        Ok(Self::new(
+        let mut client = Self::new(
             std::env::var("OPENAI_API_KEY")?,
             std::env::var("OPENAI_BASE_URL").unwrap_or_else(|_| "https://api.openai.com".into()),
             std::env::var("OPENAI_EMBEDDING_MODEL")
                 .unwrap_or_else(|_| "text-embedding-3-small".into()),
             std::env::var("OPENAI_CHAT_MODEL").unwrap_or_else(|_| "o4-mini".into()),
-        ))
+        );
+        client.http = HttpConfig::from_env().build_client();
+        client.retry = RetryPolicy::from_env();
+        Ok(client)
     }
 
-    pub async fn embed(&self, text: &str) -> Result<Vec<f32>> {
+    /// POST `body` to `path` with retries and decode the JSON response.
+    /// Failures are attributed to `stage`.
+    async fn post_json<B: Serialize, T: DeserializeOwned>(
+        &self,
+        stage: Stage,
+        path: &str,
+        body: &B,
+    ) -> Result<T, RagError> {
+        let url = format!("{}{}", self.base_url, path);
+        let what = format!("openai {path}");
+        let r = send_with_retry(&self.retry, &what, || {
+            self.http.post(&url).bearer_auth(&self.api_key).json(body)
+        })
+        .await
+        .map_err(|f| RagError::upstream(stage, f))?;
+        r.json::<T>()
+            .await
+            .map_err(|e| RagError::failed(stage, UpstreamError::from_reqwest(e)))
+    }
+
+    async fn chat(&self, stage: Stage, body: &impl Serialize) -> Result<String, RagError> {
+        let v: ChatResp = self.post_json(stage, "/v1/chat/completions", body).await?;
+        match v.choices.into_iter().next().and_then(|c| c.message.content) {
+            Some(content) if !content.trim().is_empty() => Ok(content),
+            _ => Err(RagError::failed(
+                stage,
+                UpstreamError::InvalidResponse("empty chat completion".into()),
+            )),
+        }
+    }
+
+    /// Embed `text`. Never returns an empty vector: a response without an
+    /// embedding is an [`RagError::EmbeddingFailed`].
+    pub async fn embed(&self, text: &str) -> Result<Vec<f32>, RagError> {
         #[derive(Serialize)]
         struct Req<'a> {
             input: &'a str,
@@ -50,57 +109,34 @@ impl OpenAiClient {
         struct Item {
             embedding: Vec<f32>,
         }
-        let url = format!("{}/v1/embeddings", self.base_url);
-        let r = self
-            .http
-            .post(url)
-            .bearer_auth(&self.api_key)
-            .json(&Req {
-                input: text,
-                model: &self.embedding_model,
-            })
-            .send()
+        let v: Resp = self
+            .post_json(
+                Stage::Embedding,
+                "/v1/embeddings",
+                &Req {
+                    input: text,
+                    model: &self.embedding_model,
+                },
+            )
             .await?;
-        if !r.status().is_success() {
-            return Err(anyhow!("openai embeddings status {}", r.status()));
+        match v.data.into_iter().next() {
+            Some(d) if !d.embedding.is_empty() => Ok(d.embedding),
+            _ => Err(RagError::failed(
+                Stage::Embedding,
+                UpstreamError::InvalidResponse("empty embedding".into()),
+            )),
         }
-        let v: Resp = r.json().await?;
-        Ok(v.data
-            .into_iter()
-            .next()
-            .map(|d| d.embedding)
-            .unwrap_or_default())
     }
 
-    pub async fn chat_complete(&self, system: &str, user: &str) -> Result<String> {
-        #[derive(Serialize)]
-        struct Msg<'a> {
-            role: &'a str,
-            content: &'a str,
-        }
+    pub async fn chat_complete(&self, system: &str, user: &str) -> Result<String, RagError> {
         #[derive(Serialize)]
         struct Req<'a> {
             model: &'a str,
             messages: Vec<Msg<'a>>,
         }
-        #[derive(Deserialize)]
-        struct Resp {
-            choices: Vec<Choice>,
-        }
-        #[derive(Deserialize)]
-        struct Choice {
-            message: Message,
-        }
-        #[derive(Deserialize)]
-        struct Message {
-            content: String,
-        }
-        let url = format!("{}/v1/chat/completions", self.base_url);
-        let r = self
-            .http
-            .post(url)
-            .bearer_auth(&self.api_key)
-            .json(&Req {
+        self.chat(
+            Stage::Generation,
+            &Req {
                 model: &self.chat_model,
                 messages: vec![
                     Msg {
@@ -112,29 +148,18 @@ impl OpenAiClient {
                         content: user,
                     },
                 ],
-            })
-            .send()
-            .await?;
-        if !r.status().is_success() {
-            return Err(anyhow!("openai chat status {}", r.status()));
-        }
-        let v: Resp = r.json().await?;
-        Ok(v.choices
-            .first()
-            .map(|c| c.message.content.clone())
-            .unwrap_or_default())
+            },
+        )
+        .await
     }
 
+    /// JSON-mode chat completion, used by the planner. Failures (including
+    /// unparseable JSON) are [`RagError::PlanningFailed`].
     pub async fn chat_json<T: for<'de> Deserialize<'de>>(
         &self,
         system: &str,
         user: &str,
-    ) -> Result<T> {
-        #[derive(Serialize)]
-        struct Msg<'a> {
-            role: &'a str,
-            content: &'a str,
-        }
+    ) -> Result<T, RagError> {
         #[derive(Serialize)]
         struct Req<'a> {
             model: &'a str,
@@ -145,51 +170,33 @@ impl OpenAiClient {
         struct RespFmt {
             r#type: &'static str,
         }
-        #[derive(Deserialize)]
-        struct Resp {
-            choices: Vec<Choice>,
-        }
-        #[derive(Deserialize)]
-        struct Choice {
-            message: Message,
-        }
-        #[derive(Deserialize)]
-        struct Message {
-            content: String,
-        }
-        let url = format!("{}/v1/chat/completions", self.base_url);
-        let r = self
-            .http
-            .post(url)
-            .bearer_auth(&self.api_key)
-            .json(&Req {
-                model: &self.chat_model,
-                messages: vec![
-                    Msg {
-                        role: "system",
-                        content: system,
+        let content = self
+            .chat(
+                Stage::Planning,
+                &Req {
+                    model: &self.chat_model,
+                    messages: vec![
+                        Msg {
+                            role: "system",
+                            content: system,
+                        },
+                        Msg {
+                            role: "user",
+                            content: user,
+                        },
+                    ],
+                    response_format: RespFmt {
+                        r#type: "json_object",
                     },
-                    Msg {
-                        role: "user",
-                        content: user,
-                    },
-                ],
-                response_format: RespFmt {
-                    r#type: "json_object",
                 },
-            })
-            .send()
+            )
             .await?;
-        if !r.status().is_success() {
-            return Err(anyhow!("openai chat(json) status {}", r.status()));
-        }
-        let v: Resp = r.json().await?;
-        let content = v
-            .choices
-            .first()
-            .map(|c| c.message.content.clone())
-            .unwrap_or_else(|| "{}".into());
-        Ok(serde_json::from_str::<T>(&content)?)
+        serde_json::from_str::<T>(&content).map_err(|e| {
+            RagError::failed(
+                Stage::Planning,
+                UpstreamError::InvalidResponse(format!("model returned invalid JSON: {e}")),
+            )
+        })
     }
 }
 
@@ -267,6 +274,7 @@ mod tests {
             embedding_model: "text-embedding-3-small".to_string(),
             chat_model: "o4-mini".to_string(),
             http: reqwest::Client::new(),
+            retry: RetryPolicy::none(),
         };
 
         let embed_url = format!("{}/v1/embeddings", client.base_url);
@@ -317,6 +325,7 @@ mod tests {
             embedding_model: "test-model".to_string(),
             chat_model: "test-chat".to_string(),
             http: reqwest::Client::new(),
+            retry: RetryPolicy::none(),
         };
 
         let result = client.embed("test text").await;
@@ -344,6 +353,7 @@ mod tests {
             embedding_model: "test-model".to_string(),
             chat_model: "test-chat".to_string(),
             http: reqwest::Client::new(),
+            retry: RetryPolicy::none(),
         };
 
         let result = client.embed("test text").await;
@@ -375,6 +385,7 @@ mod tests {
             embedding_model: "test-model".to_string(),
             chat_model: "test-chat".to_string(),
             http: reqwest::Client::new(),
+            retry: RetryPolicy::none(),
         };
 
         let result = client
@@ -409,6 +420,7 @@ mod tests {
             embedding_model: "test-model".to_string(),
             chat_model: "test-chat".to_string(),
             http: reqwest::Client::new(),
+            retry: RetryPolicy::none(),
         };
 
         let result = client

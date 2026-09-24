@@ -1,14 +1,29 @@
 use crate::domain::Hit;
+use crate::error::{RagError, Stage};
 use crate::openai::OpenAiClient;
+use crate::qdrant::Qdrant;
 use crate::reranker::rerank_mmr_signals;
-use anyhow::Result;
+use crate::resilience::{env_duration_ms, run_stage};
+use serde::Serialize;
+use std::time::Duration;
 
+/// Returned (with `Evidence::None`) when retrieval succeeded but matched
+/// nothing. The LLM is not called in that case, so it cannot invent evidence.
+pub const NO_EVIDENCE_ANSWER: &str = "No matching evidence was found in the indexed data for this question. \
+The search completed successfully but returned no documents; this does not confirm that nothing happened. \
+Try widening the time window, removing service/environment filters, or checking that the relevant data has been indexed.";
+
+/// Generate an answer from retrieved candidates. With no candidates this
+/// returns [`NO_EVIDENCE_ANSWER`] without calling the LLM.
 pub async fn answer_question(
     oa: &OpenAiClient,
     candidates: Vec<Hit>,
     top_k: usize,
     question: &str,
-) -> Result<String> {
+) -> Result<String, RagError> {
+    if candidates.is_empty() {
+        return Ok(NO_EVIDENCE_ANSWER.to_string());
+    }
     let hits = rerank_mmr_signals(&candidates, top_k);
     let mut sb = String::new();
     for (i, h) in hits.iter().enumerate() {
@@ -70,12 +85,103 @@ Instructions:
 - If multiple hypotheses exist, list them ordered by likelihood.
 - Provide bullet-point 'Top signals' and 'Next steps'.
 - Include markdown links to each Source when you cite evidence.
+- If the context does not support an answer, say so; never invent evidence.
 ",
         question, sb
     );
     let system = "You are a helpful SRE assistant. Use only provided context. When unsure, say so. Always cite SourceUri for each claim.";
     let out = oa.chat_complete(system, &user).await?;
     Ok(out)
+}
+
+/// Whether an answer is backed by retrieved documents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Evidence {
+    Found,
+    None,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AskOutcome {
+    pub answer: String,
+    pub evidence: Evidence,
+}
+
+/// Per-stage timeouts for the ask pipeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StageTimeouts {
+    pub planning: Duration,
+    pub embedding: Duration,
+    pub retrieval: Duration,
+    pub generation: Duration,
+}
+
+impl Default for StageTimeouts {
+    fn default() -> Self {
+        Self {
+            planning: Duration::from_secs(30),
+            embedding: Duration::from_secs(15),
+            retrieval: Duration::from_secs(15),
+            generation: Duration::from_secs(60),
+        }
+    }
+}
+
+impl StageTimeouts {
+    /// `RAG_PLAN_TIMEOUT_MS`, `RAG_EMBED_TIMEOUT_MS`, `RAG_SEARCH_TIMEOUT_MS`,
+    /// `RAG_GENERATE_TIMEOUT_MS`.
+    pub fn from_env() -> Self {
+        let d = Self::default();
+        Self {
+            planning: env_duration_ms("RAG_PLAN_TIMEOUT_MS", d.planning),
+            embedding: env_duration_ms("RAG_EMBED_TIMEOUT_MS", d.embedding),
+            retrieval: env_duration_ms("RAG_SEARCH_TIMEOUT_MS", d.retrieval),
+            generation: env_duration_ms("RAG_GENERATE_TIMEOUT_MS", d.generation),
+        }
+    }
+}
+
+/// Embed `query`, search Qdrant and answer `question`.
+///
+/// Any embedding or retrieval failure is returned as an error and the LLM is
+/// never called. A successful search with zero hits yields
+/// [`Evidence::None`] and [`NO_EVIDENCE_ANSWER`], also without an LLM call.
+#[allow(clippy::too_many_arguments)]
+pub async fn retrieve_and_answer(
+    oa: &OpenAiClient,
+    qd: &Qdrant,
+    query: &str,
+    question: &str,
+    filter: Option<serde_json::Value>,
+    search_limit: usize,
+    top_k: usize,
+    timeouts: &StageTimeouts,
+) -> Result<AskOutcome, RagError> {
+    let vector = run_stage(Stage::Embedding, timeouts.embedding, oa.embed(query)).await?;
+    let candidates = run_stage(
+        Stage::Retrieval,
+        timeouts.retrieval,
+        qd.search(vector, search_limit, filter),
+    )
+    .await?;
+    if candidates.is_empty() {
+        tracing::info!("retrieval returned no hits; answering without LLM");
+        return Ok(AskOutcome {
+            answer: NO_EVIDENCE_ANSWER.to_string(),
+            evidence: Evidence::None,
+        });
+    }
+    let answer = run_stage(
+        Stage::Generation,
+        timeouts.generation,
+        answer_question(oa, candidates, top_k, question),
+    )
+    .await?;
+    Ok(AskOutcome {
+        answer,
+        evidence: Evidence::Found,
+    })
 }
 
 #[cfg(test)]
@@ -371,6 +477,7 @@ Instructions:
             embedding_model: "test-model".to_string(),
             chat_model: "test-chat".to_string(),
             http: reqwest::Client::new(),
+            retry: crate::resilience::RetryPolicy::none(),
         };
 
         let candidates = vec![
@@ -410,6 +517,7 @@ Instructions:
             embedding_model: "test-model".to_string(),
             chat_model: "test-chat".to_string(),
             http: reqwest::Client::new(),
+            retry: crate::resilience::RetryPolicy::none(),
         };
 
         // Create a hit with very long text (>1500 chars) that should be truncated
@@ -443,6 +551,7 @@ Instructions:
             embedding_model: "test-model".to_string(),
             chat_model: "test-chat".to_string(),
             http: reqwest::Client::new(),
+            retry: crate::resilience::RetryPolicy::none(),
         };
 
         let candidates = vec![create_test_hit("1", "Test Hit", "Test content", 0.9)];
@@ -468,6 +577,7 @@ Instructions:
                     }
                 }]
             })))
+            .expect(0)
             .mount(&mock_server)
             .await;
 
@@ -477,12 +587,14 @@ Instructions:
             embedding_model: "test-model".to_string(),
             chat_model: "test-chat".to_string(),
             http: reqwest::Client::new(),
+            retry: crate::resilience::RetryPolicy::none(),
         };
 
         let candidates = vec![];
 
+        // No evidence: the LLM must not be asked to answer from nothing.
         let result = answer_question(&oa, candidates, 10, "Test question").await;
-        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), NO_EVIDENCE_ANSWER);
     }
 
     #[tokio::test]
@@ -511,6 +623,7 @@ Instructions:
             embedding_model: "test-model".to_string(),
             chat_model: "test-chat".to_string(),
             http: reqwest::Client::new(),
+            retry: crate::resilience::RetryPolicy::none(),
         };
 
         let mut metadata = serde_json::Map::new();
@@ -553,6 +666,7 @@ Instructions:
             embedding_model: "test-model".to_string(),
             chat_model: "test-chat".to_string(),
             http: reqwest::Client::new(),
+            retry: crate::resilience::RetryPolicy::none(),
         };
 
         // Text with exactly 1500 characters (boundary condition)
@@ -594,6 +708,7 @@ Instructions:
             embedding_model: "test-model".to_string(),
             chat_model: "test-chat".to_string(),
             http: reqwest::Client::new(),
+            retry: crate::resilience::RetryPolicy::none(),
         };
 
         // Text with 1499 characters (just under boundary)
@@ -634,6 +749,7 @@ Instructions:
             embedding_model: "test-model".to_string(),
             chat_model: "test-chat".to_string(),
             http: reqwest::Client::new(),
+            retry: crate::resilience::RetryPolicy::none(),
         };
 
         // Text with 1501 characters (just over boundary)
