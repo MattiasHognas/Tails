@@ -483,6 +483,7 @@ async fn ask(
     Ok(Json(json!({
         "answer": outcome.answer,
         "evidence": outcome.evidence,
+        "sources": outcome.sources,
         "plan": plan,
         "scope": scope.to_json(),
         "timeline": timeline,
@@ -1087,6 +1088,62 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn sources_list_the_documents_cited_in_the_answer_prompt() {
+            let h = harness_with(
+                "2026-09-24T08:00:00Z",
+                json!({}),
+                vec![monitor_hit()],
+                None,
+                LiveEvidenceConfig::default(),
+            )
+            .await;
+            let (status, resp) = post(
+                &h.base,
+                "/ask",
+                json!({"question": "list auth-api dashboards", "plan": {"intent": "dashboardLookup"}}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{resp}");
+            let sources = resp["sources"].as_array().unwrap();
+
+            let reqs = h.openai.received_requests().await.unwrap();
+            let answer_req = reqs
+                .iter()
+                .find(|r| {
+                    r.url.path() == "/v1/chat/completions"
+                        && body(r).get("response_format").is_none()
+                })
+                .unwrap();
+            let user = body(answer_req)["messages"][1]["content"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            let cited: Vec<&str> = user.lines().filter(|l| l.starts_with("[DOC #")).collect();
+            assert_eq!(cited.len(), 2);
+            assert_eq!(sources.len(), cited.len());
+            for (i, (line, src)) in cited.iter().zip(sources).enumerate() {
+                assert_eq!(src["n"], i + 1);
+                let title = src["title"].as_str().unwrap();
+                assert!(
+                    line.starts_with(&format!("[DOC #{}] {title} (", i + 1)),
+                    "{line} vs {src}"
+                );
+                let uri = src["uri"].as_str().unwrap();
+                assert!(user.contains(&format!("Source: {uri}")));
+            }
+            let incident = sources
+                .iter()
+                .find(|s| s["kind"] == "incident")
+                .expect("incident source");
+            assert_eq!(
+                incident,
+                &json!({"n": incident["n"], "title": "auth-api 5xx spike", "kind": "incident",
+                    "timestamp": "2026-09-23T10:00:00Z", "service": "auth-api",
+                    "environment": "prod", "uri": "https://app.datadoghq.eu/incidents/1"})
+            );
+        }
+
+        #[tokio::test]
         async fn datadog_failure_is_missing_evidence_and_ask_still_succeeds() {
             let dd = MockServer::start().await;
             Mock::given(method("GET"))
@@ -1438,6 +1495,7 @@ mod http_tests {
         assert_eq!(status, 200);
         assert_eq!(body["evidence"], "none");
         assert_eq!(body["answer"], rag_core::rag_service::NO_EVIDENCE_ANSWER);
+        assert_eq!(body["sources"], json!([]));
     }
 
     #[tokio::test]
