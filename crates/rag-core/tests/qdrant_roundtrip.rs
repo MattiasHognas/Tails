@@ -3,6 +3,7 @@ use rag_core::{
     chunk::chunk,
     domain::{RagDocument, SourceKind},
     qdrant::{QPoint, Qdrant},
+    retrieval::RetrievalScope,
 };
 use serde_json::json;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -33,7 +34,11 @@ async fn qdrant_roundtrip() -> Result<()> {
 
     // Clean up even when a request or assertion fails.
     let test_qdrant = qdrant.clone();
-    let outcome = tokio::spawn(async move { check_roundtrip(&test_qdrant).await }).await;
+    let outcome = tokio::spawn(async move {
+        check_roundtrip(&test_qdrant).await?;
+        check_scope_filter(&test_qdrant).await
+    })
+    .await;
     let cleanup = qdrant.http.delete(&collection_url).send().await;
     outcome.context("Qdrant round-trip assertion failed")??;
     cleanup?.error_for_status()?;
@@ -110,5 +115,75 @@ async fn check_roundtrip(qdrant: &Qdrant) -> Result<()> {
         serde_json::to_value(actual)?,
         serde_json::to_value(&chunks[0])?
     );
+    Ok(())
+}
+
+/// The retrieval scope filter must select events inside the window while keeping
+/// timestamp-less documents and configuration kinds (monitor/dashboard/SLO).
+async fn check_scope_filter(qdrant: &Qdrant) -> Result<()> {
+    let doc = |id: &str, kind: SourceKind, ts: Option<&str>| RagDocument {
+        id: id.into(),
+        title: id.into(),
+        text: id.into(),
+        source_uri: format!("https://example.com/{id}"),
+        kind,
+        timestamp: ts.map(str::to_string),
+        service: "scope-svc".into(),
+        environment: "prod".into(),
+        metadata: serde_json::Map::new(),
+    };
+    let docs = [
+        doc(
+            "log_inside",
+            SourceKind::Logs,
+            Some("2026-09-23T10:00:00.123Z"),
+        ),
+        doc("log_before", SourceKind::Logs, Some("2026-09-22T21:59:59Z")),
+        doc("log_at_end", SourceKind::Logs, Some("2026-09-23T22:00:00Z")),
+        doc("log_untimed", SourceKind::Logs, None),
+        doc("monitor", SourceKind::Monitor, None),
+        doc(
+            "dashboard_old",
+            SourceKind::Dashboard,
+            Some("2020-01-01T00:00:00Z"),
+        ),
+        doc("slo", SourceKind::SLO, None),
+    ];
+    let vector = vec![0.0, 1.0, 0.0];
+    let points = docs
+        .iter()
+        .map(|d| QPoint::from_document(d, vector.clone()))
+        .collect();
+    qdrant.upsert(points).await?;
+
+    let mut scope = RetrievalScope {
+        service: Some("scope-svc".into()),
+        environment: Some("prod".into()),
+        from_utc: Some("2026-09-22T22:00:00Z".parse()?),
+        to_utc: Some("2026-09-23T22:00:00Z".parse()?),
+        kinds: vec![],
+    };
+    let ids = |hits: Vec<rag_core::domain::Hit>| {
+        let mut ids: Vec<String> = hits.into_iter().map(|h| h.doc.id).collect();
+        ids.sort();
+        ids
+    };
+    let hits = qdrant
+        .search(vector.clone(), 100, scope.to_qdrant_filter())
+        .await?;
+    assert_eq!(
+        ids(hits),
+        [
+            "dashboard_old",
+            "log_inside",
+            "log_untimed",
+            "monitor",
+            "slo"
+        ]
+    );
+
+    scope.kinds = vec![SourceKind::Logs, SourceKind::SLO];
+    let hits = qdrant.search(vector, 100, scope.to_qdrant_filter()).await?;
+    assert_eq!(ids(hits), ["log_inside", "log_untimed", "slo"]);
     Ok(())
 }

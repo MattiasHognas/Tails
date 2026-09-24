@@ -14,6 +14,7 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 reqwest = { version = "0.13.4", default-features = false, features = ["native-tls", "json"] }
 rag-core = { path = "../rag-core" }
+chrono = "0.4.45"
 
 [dev-dependencies]
 wiremock = "0.6.5"

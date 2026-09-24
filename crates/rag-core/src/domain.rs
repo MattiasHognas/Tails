@@ -12,6 +12,50 @@ pub enum SourceKind {
     Git,
 }
 
+impl SourceKind {
+    pub const ALL: [SourceKind; 7] = [
+        SourceKind::Logs,
+        SourceKind::Metrics,
+        SourceKind::Monitor,
+        SourceKind::Incident,
+        SourceKind::Dashboard,
+        SourceKind::SLO,
+        SourceKind::Git,
+    ];
+
+    /// Human-facing name used in filters and API requests (e.g. `kind:slo`).
+    pub fn name(&self) -> &'static str {
+        match self {
+            SourceKind::Logs => "logs",
+            SourceKind::Metrics => "metrics",
+            SourceKind::Monitor => "monitor",
+            SourceKind::Incident => "incident",
+            SourceKind::Dashboard => "dashboard",
+            SourceKind::SLO => "slo",
+            SourceKind::Git => "git",
+        }
+    }
+
+    /// Case-insensitive parse accepting singular/plural forms. `None` for unknown kinds.
+    pub fn parse_lenient(s: &str) -> Option<SourceKind> {
+        Some(match s.trim().to_lowercase().as_str() {
+            "log" | "logs" => SourceKind::Logs,
+            "metric" | "metrics" => SourceKind::Metrics,
+            "monitor" | "monitors" => SourceKind::Monitor,
+            "incident" | "incidents" => SourceKind::Incident,
+            "dashboard" | "dashboards" => SourceKind::Dashboard,
+            "slo" | "slos" => SourceKind::SLO,
+            "git" => SourceKind::Git,
+            _ => return None,
+        })
+    }
+
+    /// The value stored in the Qdrant `Kind` payload field (serde form, e.g. `sLO`).
+    pub fn payload_value(&self) -> serde_json::Value {
+        serde_json::to_value(self).expect("SourceKind serializes")
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RagDocument {

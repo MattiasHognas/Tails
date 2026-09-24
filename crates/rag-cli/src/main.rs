@@ -11,16 +11,59 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Ask a question (planner may infer service/env; server chooses K)
+    /// Ask a question (server plans: infers service/env/time; explicit flags win)
     Ask {
         question: String,
         #[arg(long)]
         env: Option<String>,
         #[arg(long)]
         service: Option<String>,
+        /// Restrict evidence to a source kind (repeatable): logs, metrics, monitor,
+        /// incident, dashboard, slo, git
+        #[arg(long = "kind")]
+        kinds: Vec<String>,
+        /// IANA timezone for relative times like "yesterday" (default: local zone)
+        #[arg(long)]
+        tz: Option<String>,
     },
     /// Just view the plan (intent + inferred fields)
-    Plan { question: String },
+    Plan {
+        question: String,
+        /// IANA timezone for relative times like "yesterday" (default: local zone)
+        #[arg(long)]
+        tz: Option<String>,
+    },
+}
+
+/// `--tz`, else `TZ` if it is an IANA name, else the system zone. `None` lets the
+/// server default to UTC.
+fn timezone(flag: Option<String>) -> Option<String> {
+    flag.or_else(|| {
+        std::env::var("TZ")
+            .ok()
+            .map(|tz| tz.trim_start_matches(':').to_string())
+            .filter(|tz| tz.contains('/'))
+    })
+    .or_else(|| iana_time_zone::get_timezone().ok())
+}
+
+fn ask_payload(
+    question: String,
+    env: Option<String>,
+    service: Option<String>,
+    kinds: Vec<String>,
+    timezone: Option<String>,
+) -> serde_json::Value {
+    let mut payload = serde_json::json!({
+        "question": question,
+        "env": env,
+        "service": service,
+        "timezone": timezone,
+    });
+    if !kinds.is_empty() {
+        payload["kinds"] = serde_json::json!(kinds);
+    }
+    payload
 }
 
 /// Render a non-2xx API response. Typed errors look like
@@ -70,10 +113,10 @@ async fn main() -> Result<()> {
     let http = reqwest::Client::new();
 
     match cli.cmd {
-        Cmd::Plan { question } => {
+        Cmd::Plan { question, tz } => {
             let mut req = http
                 .post(format!("{}/ask/plan", base))
-                .json(&serde_json::json!({ "question": question }));
+                .json(&serde_json::json!({ "question": question, "timezone": timezone(tz) }));
             if let Some(t) = token.as_ref() {
                 req = req.bearer_auth(t);
             }
@@ -84,54 +127,36 @@ async fn main() -> Result<()> {
             question,
             env,
             service,
+            kinds,
+            tz,
         } => {
-            // 1) Plan
-            let mut req = http
-                .post(format!("{}/ask/plan", base))
-                .json(&serde_json::json!({ "question": &question }));
+            // The server plans (service/env/time inference) and applies the plan to
+            // retrieval; explicit flags take precedence over inferred values.
+            let payload = ask_payload(question, env, service, kinds, timezone(tz));
+            let mut req = http.post(format!("{}/ask", base)).json(&payload);
             if let Some(t) = token.as_ref() {
                 req = req.bearer_auth(t);
             }
-            let plan_resp: serde_json::Value =
-                serde_json::from_str(&body_or_exit(req.send().await?).await?)?;
-            let plan = &plan_resp["plan"];
+            let text = body_or_exit(req.send().await?).await?;
 
-            // 2) If the planner needs more info, print questions (soft guidance)
-            if plan["missingFields"]
-                .as_array()
-                .map(|a| !a.is_empty())
-                .unwrap_or(false)
-                && let Some(qs) = plan["clarifyingQuestions"].as_array()
-            {
-                eprintln!("Need more info:");
-                for qn in qs {
-                    if let Some(qs) = qn.as_str() {
-                        eprintln!("- {}", qs);
+            // If the planner needs more info, print questions (soft guidance)
+            if let Ok(resp) = serde_json::from_str::<serde_json::Value>(&text) {
+                let plan = &resp["plan"];
+                if plan["missingFields"]
+                    .as_array()
+                    .map(|a| !a.is_empty())
+                    .unwrap_or(false)
+                    && let Some(qs) = plan["clarifyingQuestions"].as_array()
+                {
+                    eprintln!("Need more info:");
+                    for qn in qs {
+                        if let Some(qs) = qn.as_str() {
+                            eprintln!("- {}", qs);
+                        }
                     }
                 }
             }
-
-            // 3) Prefer user-specified flags; fall back to plan inference
-            let eff_env = env.or_else(|| plan["environment"].as_str().map(|s| s.to_string()));
-            let eff_service = service.or_else(|| plan["service"].as_str().map(|s| s.to_string()));
-
-            // 4) Ask (server decides K)
-            let payload = serde_json::json!({
-              "question": question,
-              "env": eff_env,
-              "service": eff_service,
-              "from_utc": plan["window"]["fromUtc"],
-              "to_utc": plan["window"]["toUtc"],
-              "filters": plan["filters"],
-              "rewritten_query": plan["rewrittenQuery"],
-            });
-
-            let mut req2 = http.post(format!("{}/ask", base)).json(&payload);
-            if let Some(t) = token.as_ref() {
-                req2 = req2.bearer_auth(t);
-            }
-            let r = req2.send().await?;
-            println!("{}", body_or_exit(r).await?);
+            println!("{}", text);
         }
     }
     Ok(())
@@ -159,6 +184,36 @@ mod tests {
         assert_eq!(
             format_api_error(500, "boom"),
             "error: API returned HTTP 500: boom"
+        );
+    }
+
+    #[test]
+    fn ask_payload_sends_only_explicit_values() {
+        let p = ask_payload(
+            "why?".into(),
+            None,
+            Some("auth-api".into()),
+            vec![],
+            Some("Europe/Stockholm".into()),
+        );
+        assert_eq!(
+            p,
+            serde_json::json!({
+                "question": "why?",
+                "env": null,
+                "service": "auth-api",
+                "timezone": "Europe/Stockholm",
+            })
+        );
+        let p = ask_payload("q".into(), None, None, vec!["logs".into()], None);
+        assert_eq!(p["kinds"], serde_json::json!(["logs"]));
+    }
+
+    #[test]
+    fn explicit_tz_flag_wins() {
+        assert_eq!(
+            timezone(Some("Asia/Tokyo".into())).as_deref(),
+            Some("Asia/Tokyo")
         );
     }
 }
