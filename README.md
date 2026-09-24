@@ -60,36 +60,116 @@ rag-cli ask "errors in payments since yesterday" --tz Europe/Stockholm
 rag-cli plan "why did checkout fail in staging last night?"
 ```
 
-`ask` prints the API response as JSON: the `answer`, whether it is backed by indexed
-documents (`"evidence": "found"` or `"none"`), the validated `plan`, and the `scope`
-actually applied to retrieval:
+`ask` prints a readable report on stdout:
 
-```json
-{
-  "answer": "auth-api returned 5xx between 14:05 and 14:40 UTC ... [DOC #1] ...",
-  "evidence": "found",
-  "plan": { "intent": "rootCauseWindow", "service": "auth-api", "environment": "prod", "...": "..." },
-  "scope": {
-    "service": "auth-api",
-    "environment": "prod",
-    "fromUtc": "2026-09-22T22:00:00Z",
-    "toUtc": "2026-09-23T22:00:00Z",
-    "kinds": []
-  }
-}
+```text
+$ rag-cli ask "why did auth-api fail yesterday?" --tz Europe/Stockholm
+Answer
+  auth-api returned 5xx between 12:05 and 12:40 [1]. Latency spiked at the same
+  time [obs-2], and error logs show the database connection pool was exhausted
+  [obs-3].
+
+  Top signals:
+  - Error rate above 5% on auth-api in prod [1]
+  - Latency monitor fired [2]
+
+  Next steps:
+  1. Check the connection pool size and recent deploys to auth-api.
+
+Scope
+  auth-api · prod · 2026-09-23 00:00–24:00 Europe/Stockholm
+
+Evidence
+  2 indexed documents · 2 live observations
+
+Live evidence
+  Window: 2026-09-23 00:00–24:00 Europe/Stockholm
+  Observed:
+    [obs-2] 2026-09-23 12:00–13:00 trace.http.request.duration: 2 point(s) above
+      the baseline band (0.3); extreme 1.5
+      https://app.datadoghq.eu/metric/explorer?exp_metric=trace.http.request.duration
+    [obs-3] 2026-09-23 12:10–12:20 6 error logs: db connection pool exhausted
+      after #ms
+      https://app.datadoghq.eu/logs?query=service%3Aauth-api
+  Hypotheses (unverified):
+    - Connection pool exhaustion slowed requests [obs-2, obs-3]
+  Not checked:
+    - metrics for payments (no_metrics_discovered): no metric documents or
+      monitor queries mention payments
+
+Sources
+  [1] auth-api 5xx spike (incident, 2026-09-23 12:02) ·
+      https://app.datadoghq.eu/incidents/1
+  [2] auth-api latency (monitor) · https://app.datadoghq.eu/monitors/7
 ```
 
-For diagnostic questions (for example "why did …", "did latency spike …") with a time
-window, the API also queries Datadog live for that window. The CLI prints the resulting
-timeline to stderr before the JSON, in three sections: observed facts with Datadog links,
-hypotheses that cite them, and evidence that couldn't be checked. Add
-`--no-live-evidence` to skip the live queries.
+- **Answer**: the model's answer. Its `[DOC #n]` citations are shown as `[n]` and listed
+  under **Sources**; `[obs-N]` cites a live observation.
+- **Scope**: the service, environment, time window (in your timezone) and source kinds
+  actually used for retrieval.
+- **Evidence**: how many indexed documents and live observations the answer is based on.
+  With no evidence, the answer says so and suggests widening the window, dropping
+  `--service`/`--env` or checking that the data has been indexed.
+- **Live evidence**: for diagnostic questions (for example "why did …", "did latency spike
+  …") with a time window, the API also queries Datadog live for that window: observed
+  facts with Datadog links, hypotheses that cite them, and what couldn't be checked. It is
+  hidden for non-diagnostic questions and when you pass `--no-live-evidence`, which skips
+  the live queries.
+- **Need more info**: the planner's clarifying questions, when it has any.
 
-If the planner is unsure about something, its clarifying questions are printed to
-stderr under `Need more info:`. If a step fails (planning, embedding, search or
-generation), no answer is printed. The CLI prints the typed error, for example
-`error [upstream_unavailable] at stage 'retrieval' (HTTP 503): ...`, and exits with
-status 1. See [API errors and evidence](docs/ARCHITECTURE.md#api-errors-and-evidence).
+`plan` prints the interpreted intent, service, environment, window and other fields as
+key/value lines.
+
+Colors and bold are used only when stdout is a terminal and `NO_COLOR` is not set; text
+is then wrapped to the terminal width. When stdout is piped or redirected, the output is
+plain text with no ANSI codes and is not wrapped.
+
+**`--json`** (on `ask` and `plan`) prints the raw API response instead, for scripts:
+
+```bash
+rag-cli ask --json "why did auth-api fail yesterday?" | jq -r '.sources[] | "\(.n) \(.uri)"'
+```
+
+**Output streams and exit codes** (both modes):
+
+| Outcome | stdout | stderr | Exit code |
+|---------|--------|--------|-----------|
+| Answer (including `"evidence": "none"`) or plan | the result (text, or the API JSON with `--json`) | nothing | 0 |
+| API error, unreachable API, timeout, invalid response | nothing | the error (one readable line plus a hint, or one line of JSON with `--json`) | 1 |
+| Invalid arguments | nothing | clap's usage message | 2 |
+
+Without `--json`, a failed step (planning, embedding, search or generation) prints the
+typed error, for example
+`error [upstream_unavailable] at stage 'retrieval' (HTTP 503): ...`, and client-side
+failures print, for example,
+`error [api_unreachable] (http://localhost:5191): connection refused` with a hint to check
+`RAG_API_BASE`. See [API errors and evidence](docs/ARCHITECTURE.md#api-errors-and-evidence).
+
+With `--json`, stderr gets a single line of JSON with the same shape as the API's typed
+errors, so `jq -r .error.code` works on it:
+
+```json
+{"error":{"code":"api_unreachable","message":"could not connect to http://localhost:5191: connection refused","stage":null,"retryable":true}}
+```
+
+A typed API error body is passed through unchanged. Other failures use these codes:
+`api_unreachable` (connection failed, retryable), `timeout` (retryable),
+`request_failed`, `invalid_response` (a 2xx body that is not JSON), and
+`upstream_http_error` for a non-2xx body that isn't a typed error, such as a proxy's HTML
+page (retryable for 5xx and 429). `stage` is `null` for these.
+
+```bash
+if out=$(rag-cli ask --json "why did auth-api fail yesterday?" 2>err.json); then
+  jq -r .answer <<<"$out"
+else
+  jq -r .error.code err.json
+fi
+```
+
+> **Upgrading:** `rag-cli ask` and `rag-cli plan` used to print the raw API JSON on stdout
+> (with the live-evidence timeline and clarifying questions on stderr). They now print
+> readable text by default. Scripts that parse the output should add `--json`, which
+> prints the API response exactly as before, and should read errors as JSON from stderr.
 
 ---
 
@@ -161,8 +241,17 @@ Binaries are automatically built and available as [GitHub Release](https://githu
 ```
 
 Only `question` is required. The response is
-`{"answer": "...", "evidence": "found" | "none", "plan": {...}, "scope": {"service", "environment", "fromUtc", "toUtc", "kinds"}, "timeline": {...}}`,
-where `plan` is the validated plan, `scope` is what was actually applied to retrieval and
+`{"answer": "...", "evidence": "found" | "none", "sources": [...], "plan": {...}, "scope": {"service", "environment", "fromUtc", "toUtc", "kinds"}, "timeline": {...}}`,
+where `sources` lists the indexed documents given to the answer model, numbered like
+the answer's `[DOC #n]` citations:
+
+```json
+"sources": [{"n": 1, "title": "auth-api 5xx spike", "kind": "incident", "timestamp": "2026-09-23T10:02:00Z",
+             "service": "auth-api", "environment": "prod", "uri": "https://app.datadoghq.eu/incidents/1"}]
+```
+
+`sources` is empty when no answer model was called (`"evidence": "none"`). `plan` is the
+validated plan, `scope` is what was actually applied to retrieval and
 `timeline` is the live Datadog evidence for diagnostic questions (see
 [Live evidence](docs/ARCHITECTURE.md#live-evidence-timeline)). `"live_evidence": false`
 turns the live queries off for one request.

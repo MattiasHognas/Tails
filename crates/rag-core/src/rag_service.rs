@@ -38,6 +38,17 @@ pub async fn answer_question_with_live_evidence(
         return Ok(NO_EVIDENCE_ANSWER.to_string());
     }
     let hits = rerank_mmr_signals(&candidates, top_k);
+    generate(oa, &hits, question, live_evidence).await
+}
+
+/// Ask the LLM to answer from `hits` (already reranked, cited as `[DOC #n]` in
+/// order) and the optional live-evidence timeline.
+async fn generate(
+    oa: &OpenAiClient,
+    hits: &[Hit],
+    question: &str,
+    live_evidence: Option<&str>,
+) -> Result<String, RagError> {
     let mut sb = String::new();
     for (i, h) in hits.iter().enumerate() {
         use std::fmt::Write;
@@ -138,10 +149,46 @@ pub enum Evidence {
     None,
 }
 
+/// An indexed document given to the answer model. `n` is its `[DOC #n]`
+/// citation number in the prompt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AnswerSource {
+    pub n: usize,
+    pub title: String,
+    /// Source kind as used in filters (`logs`, `monitor`, `slo`, ...).
+    pub kind: &'static str,
+    pub timestamp: Option<String>,
+    pub service: Option<String>,
+    pub environment: Option<String>,
+    pub uri: String,
+}
+
+impl AnswerSource {
+    /// Sources for reranked `hits`, numbered exactly like the prompt's `[DOC #n]`.
+    pub fn from_hits(hits: &[Hit]) -> Vec<Self> {
+        let non_empty = |s: &str| Some(s.to_string()).filter(|s| !s.is_empty());
+        hits.iter()
+            .enumerate()
+            .map(|(i, h)| Self {
+                n: i + 1,
+                title: h.doc.title.clone(),
+                kind: h.doc.kind.name(),
+                timestamp: h.doc.timestamp.clone(),
+                service: non_empty(&h.doc.service),
+                environment: non_empty(&h.doc.environment),
+                uri: h.doc.source_uri.clone(),
+            })
+            .collect()
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct AskOutcome {
     pub answer: String,
     pub evidence: Evidence,
+    /// Documents passed to the answer model, in `[DOC #n]` order. Empty when
+    /// the LLM was not called.
+    pub sources: Vec<AnswerSource>,
 }
 
 /// Per-stage timeouts for the ask pipeline.
@@ -235,17 +282,21 @@ pub async fn answer_candidates(
         return Ok(AskOutcome {
             answer: NO_EVIDENCE_ANSWER.to_string(),
             evidence: Evidence::None,
+            sources: vec![],
         });
     }
+    // Rerank once, so `sources` is numbered exactly like the prompt's `[DOC #n]`.
+    let hits = rerank_mmr_signals(&candidates, top_k);
     let answer = run_stage(
         Stage::Generation,
         timeouts.generation,
-        answer_question_with_live_evidence(oa, candidates, top_k, question, live_evidence),
+        generate(oa, &hits, question, live_evidence),
     )
     .await?;
     Ok(AskOutcome {
         answer,
         evidence: Evidence::Found,
+        sources: AnswerSource::from_hits(&hits),
     })
 }
 
@@ -828,5 +879,97 @@ Instructions:
 
         // With 1501 chars, SHOULD be truncated
         // This tests that > comparison works (not >=, not ==)
+    }
+
+    #[tokio::test]
+    async fn answer_candidates_sources_match_prompt_numbering() {
+        use crate::openai::OpenAiClient;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"content": "see [DOC #1]"}}]
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        let oa = OpenAiClient::new("k".into(), mock_server.uri(), "e".into(), "c".into());
+
+        let mut slo = create_test_hit("3", "Checkout SLO", "99.9%", 0.5);
+        slo.doc.kind = SourceKind::SLO;
+        slo.doc.service = String::new();
+        slo.doc.environment = String::new();
+        slo.doc.timestamp = None;
+        let candidates = vec![
+            create_test_hit("1", "First", "alpha", 0.9),
+            slo,
+            create_test_hit("2", "Second", "beta", 0.7),
+        ];
+        let outcome = answer_candidates(&oa, candidates, 2, "q", None, &StageTimeouts::default())
+            .await
+            .unwrap();
+        assert_eq!(outcome.evidence, Evidence::Found);
+
+        let reqs = mock_server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&reqs[0].body).unwrap();
+        let prompt = body["messages"][1]["content"].as_str().unwrap();
+        let cited: Vec<&str> = prompt.lines().filter(|l| l.starts_with("[DOC #")).collect();
+        // Only the top_k documents given to the model are listed, in prompt order.
+        assert_eq!(outcome.sources.len(), 2);
+        assert_eq!(cited.len(), outcome.sources.len());
+        for (line, src) in cited.iter().zip(&outcome.sources) {
+            assert!(
+                line.starts_with(&format!("[DOC #{}] {} (", src.n, src.title)),
+                "{line} vs {src:?}"
+            );
+        }
+        assert_eq!(
+            outcome.sources.iter().map(|s| s.n).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        // Numbering follows the reranked order, not the retrieval order.
+        let first = outcome
+            .sources
+            .iter()
+            .find(|s| s.title == "First")
+            .expect("top hit is given to the model");
+        assert_eq!(first.kind, "monitor");
+        assert_eq!(first.uri, "http://example.com/1");
+        assert_eq!(first.service.as_deref(), Some("test-service"));
+        assert_eq!(first.environment.as_deref(), Some("production"));
+        assert_eq!(first.timestamp.as_deref(), Some("2025-01-01T00:00:00Z"));
+    }
+
+    #[test]
+    fn answer_source_omits_empty_service_and_uses_filter_kind_names() {
+        let mut hit = create_test_hit("1", "SLO", "x", 0.9);
+        hit.doc.kind = SourceKind::SLO;
+        hit.doc.service = String::new();
+        hit.doc.environment = String::new();
+        hit.doc.timestamp = None;
+        let s = &AnswerSource::from_hits(&[hit])[0];
+        assert_eq!(
+            serde_json::to_value(s).unwrap(),
+            serde_json::json!({"n": 1, "title": "SLO", "kind": "slo", "timestamp": null,
+                "service": null, "environment": null, "uri": "http://example.com/1"})
+        );
+    }
+
+    #[tokio::test]
+    async fn no_evidence_outcome_has_no_sources() {
+        let oa = OpenAiClient::new(
+            "k".into(),
+            "http://127.0.0.1:9".into(),
+            "e".into(),
+            "c".into(),
+        );
+        let outcome = answer_candidates(&oa, vec![], 5, "q", None, &StageTimeouts::default())
+            .await
+            .unwrap();
+        assert_eq!(outcome.evidence, Evidence::None);
+        assert!(outcome.sources.is_empty());
     }
 }

@@ -90,9 +90,10 @@ cargo run -- ask "auth-api latency spikes" --env prod --service auth-api --kind 
 
 `--tz` defaults to `TZ` (when it is an IANA name) or the system timezone.
 
-For diagnostic questions the CLI prints the live-evidence timeline to stderr in
-three sections (observed facts with links, hypotheses citing them, and missing
-evidence) before the JSON response. `--no-live-evidence` skips the live queries.
+The CLI prints a readable report on stdout; for diagnostic questions it includes the
+live-evidence timeline (observed facts with links, hypotheses citing them, and what
+couldn't be checked). `--no-live-evidence` skips the live queries and `--json` prints
+the raw API response. See [Using the CLI](../README.md#using-the-cli).
 
 Installers and prebuilt binaries are described in the [README](../README.md#installing-the-cli).
 

@@ -16,10 +16,10 @@ flowchart TB
     user(["User"])
 
     subgraph cli ["rag-cli"]
-        cliAsk["ask QUESTION<br/>--service --env --kind --tz<br/>--no-live-evidence"]
-        cliPlan["plan QUESTION --tz"]
+        cliAsk["ask QUESTION<br/>--service --env --kind --tz<br/>--no-live-evidence --json"]
+        cliPlan["plan QUESTION --tz --json"]
         cliTz["timezone()<br/>--tz, TZ or system zone"]
-        cliOut["print answer JSON<br/>timeline + clarifying questions to stderr<br/>format_api_error() + exit 1"]
+        cliOut["stdout: render_ask() / render_plan()<br/>(raw JSON with --json)<br/>stderr: errors only, exit 1"]
     end
 
     subgraph api ["rag-api (Axum, :5191)"]
@@ -107,8 +107,12 @@ flowchart TB
 
 What each part does:
 
-- **rag-cli**: turns `ask` and `plan` commands into HTTP calls to the API, adds your
-  timezone, prints the JSON response, and prints typed errors and exits non-zero.
+- **rag-cli**: turns `ask` and `plan` commands into HTTP calls to the API and adds your
+  timezone. It renders the response as readable text on stdout (answer with `[n]`
+  citations, scope and times in your timezone, evidence counts, live evidence, sources
+  and clarifying questions), or prints the raw JSON with `--json`. Errors (typed API
+  errors and client failures such as an unreachable API) go to stderr, as one line of
+  text or, with `--json`, one line of JSON, and exit with status 1.
 - **rag-api**:
   - validates the request (`400` on bad input);
   - asks the planner for intent, service, environment and time window. Planner output
@@ -283,13 +287,17 @@ response bodies, URLs or credentials; details are logged server-side.
 A successful search that matches nothing is **not** an error: `/ask` returns
 200 with `"evidence": "none"` and a fixed "No matching evidence was found in the
 indexed data" answer, without calling the LLM (so it cannot invent evidence).
-Answers backed by retrieved documents have `"evidence": "found"`.
+Answers backed by retrieved documents have `"evidence": "found"`, and `sources` lists the
+documents given to the answer model (`n`, `title`, `kind`, `timestamp`, `service`,
+`environment`, `uri`) in the same order and numbering as the prompt's `[DOC #n]`
+citations. `sources` is empty when the LLM was not called.
 
 Retries apply only to transient failures (connect errors, timeouts, HTTP 429
 honoring `Retry-After`/`retry-after-ms`, and 5xx) with exponential backoff and
 jitter; other 4xx responses are never retried. No retry starts if its backoff
 would end past the stage or request deadline. The CLI prints typed errors as
-`error [code] at stage '...' (HTTP status): message` and exits non-zero.
+`error [code] at stage '...' (HTTP status): message` (or passes the JSON body through
+with `--json`) on stderr and exits with status 1.
 
 ## Retrieval and ranking
 
