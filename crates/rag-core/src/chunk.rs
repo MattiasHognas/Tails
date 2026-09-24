@@ -10,6 +10,55 @@ pub fn stable_id(parts: &[&str]) -> String {
     hex::encode(&out[..16])
 }
 
+/// Logical ID of chunk `index` of document `doc_id` (for example `monitor_123#c0`).
+pub fn chunk_id(doc_id: &str, index: usize) -> String {
+    format!("{doc_id}#c{index}")
+}
+
+/// Version of the [`content_hash`] input layout. Changing it invalidates every stored hash
+/// and so re-embeds everything once.
+const CONTENT_HASH_VERSION: &str = "tails-content-v1";
+
+/// Stable hash (64 hex chars) of everything that determines a document's stored points:
+/// every field of `doc` (text, title, URI, kind, timestamp, service, environment and
+/// metadata), the chunking parameters and the embedding model. Object keys are sorted
+/// before hashing, so metadata key order does not matter.
+pub fn content_hash(
+    doc: &RagDocument,
+    max_chars: usize,
+    overlap: usize,
+    embedding_model: &str,
+) -> String {
+    let input = serde_json::json!({
+        "version": CONTENT_HASH_VERSION,
+        "chunk": {"max_chars": max_chars, "overlap": overlap},
+        "embedding_model": embedding_model,
+        "doc": doc,
+    });
+    let bytes = serde_json::to_vec(&canonical(input)).expect("JSON values serialize");
+    hex::encode(Sha256::digest(bytes))
+}
+
+/// `value` with object keys sorted recursively, independent of serde_json's map ordering.
+fn canonical(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut entries: Vec<_> = map.into_iter().collect();
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            serde_json::Value::Object(
+                entries
+                    .into_iter()
+                    .map(|(k, v)| (k, canonical(v)))
+                    .collect(),
+            )
+        }
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.into_iter().map(canonical).collect())
+        }
+        other => other,
+    }
+}
+
 /// Split a document into overlapping character-length chunks.
 /// - `max_chars`: maximum characters per chunk (not bytes)
 /// - `overlap`: characters of overlap between consecutive chunks
@@ -42,7 +91,7 @@ pub fn chunk(max_chars: usize, overlap: usize, doc: &RagDocument) -> Vec<RagDocu
         md.insert("chunk_of".into(), doc.id.clone().into());
 
         out.push(RagDocument {
-            id: format!("{}#c{}", doc.id, i),
+            id: chunk_id(&doc.id, i),
             title: doc.title.clone(),
             text: piece,
             source_uri: doc.source_uri.clone(),
@@ -103,6 +152,60 @@ mod tests {
         let id1 = stable_id(&["part1", "part2"]);
         let id2 = stable_id(&["part2", "part1"]);
         assert_ne!(id1, id2);
+    }
+
+    #[test]
+    fn test_content_hash_is_stable_and_ignores_key_order() {
+        let mut doc = create_test_doc("Some text");
+        doc.metadata.insert("a".into(), serde_json::json!(1));
+        doc.metadata
+            .insert("b".into(), serde_json::json!({"y": 1, "x": 2}));
+        let mut reordered = doc.clone();
+        reordered.metadata = serde_json::Map::new();
+        reordered
+            .metadata
+            .insert("b".into(), serde_json::json!({"x": 2, "y": 1}));
+        reordered.metadata.insert("a".into(), serde_json::json!(1));
+
+        let hash = content_hash(&doc, 100, 20, "model");
+        assert_eq!(hash.len(), 64);
+        assert_eq!(hash, content_hash(&doc, 100, 20, "model"));
+        assert_eq!(hash, content_hash(&reordered, 100, 20, "model"));
+    }
+
+    #[test]
+    fn test_content_hash_covers_every_input() {
+        let doc = create_test_doc("Some text");
+        let base = content_hash(&doc, 100, 20, "model");
+        let edited = |edit: fn(&mut RagDocument)| {
+            let mut d = doc.clone();
+            edit(&mut d);
+            content_hash(&d, 100, 20, "model")
+        };
+        let changed = [
+            ("text", edited(|d| d.text = "Other text".into())),
+            ("title", edited(|d| d.title = "Other".into())),
+            (
+                "uri",
+                edited(|d| d.source_uri = "http://example.com/x".into()),
+            ),
+            ("kind", edited(|d| d.kind = SourceKind::Monitor)),
+            ("timestamp", edited(|d| d.timestamp = None)),
+            ("service", edited(|d| d.service = "other".into())),
+            ("environment", edited(|d| d.environment = "other".into())),
+            (
+                "metadata",
+                edited(|d| {
+                    d.metadata.insert("k".into(), serde_json::json!("v"));
+                }),
+            ),
+            ("chunk size", content_hash(&doc, 101, 20, "model")),
+            ("overlap", content_hash(&doc, 100, 21, "model")),
+            ("model", content_hash(&doc, 100, 20, "other-model")),
+        ];
+        for (what, hash) in changed {
+            assert_ne!(hash, base, "{what} must change the hash");
+        }
     }
 
     #[test]

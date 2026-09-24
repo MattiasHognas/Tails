@@ -38,10 +38,10 @@ flowchart TB
 
     subgraph core ["rag-core (shared library)"]
         resil["resilience: run_stage() timeouts,<br/>send_with_retry() backoff for 429/5xx"]
-        oaClient["OpenAiClient<br/>embed() / chat_json() / chat_complete()"]
-        qdClient["Qdrant<br/>search() / upsert()"]
+        oaClient["OpenAiClient<br/>embed() / embed_batch()<br/>chat_json() / chat_complete()"]
+        qdClient["Qdrant<br/>search() / upsert()<br/>retrieve_states() / set_payload()<br/>count() / delete_by_filter()"]
         ddClient["Datadog adapters<br/>indexing: get_monitors() list_dashboards() list_slos()<br/>list_metrics() get_incidents() search_logs()<br/>live: query_metrics() search_log_events()"]
-        chunker["chunk() + stable_id()"]
+        chunker["chunk() + stable_id()<br/>content_hash()"]
         liveCore["live_evidence<br/>discover(): services + metrics from hits<br/>analysis: spikes, drops, gaps, log bursts vs baseline<br/>timeline: observations / hypotheses / missing"]
     end
 
@@ -50,15 +50,15 @@ flowchart TB
         idx["index_sources()<br/>per source: window() with overlap"]
         fetch["SourceFetcher::fetch()"]
         dedupe["dedupe_by_id()"]
-        sink["QdrantSink::index()<br/>chunk_documents() -> embed -> upsert"]
-        ckSave["Checkpoints::save()<br/>atomic, only after success"]
+        sink["IncrementalSink::index()<br/>chunk + content_hash -> retrieve stored state<br/>skip unchanged; embed_batch -> upsert<br/>(bounded concurrency)<br/>delete surplus chunks; full sync: delete unseen"]
+        ckSave["Checkpoints::save()<br/>atomic, only after all writes succeed"]
     end
 
     ckFile[("watermark.json<br/>per-source checkpoints (PVC)")]
 
     subgraph ext ["External services"]
         openai[["OpenAI<br/>/v1/embeddings<br/>/v1/chat/completions"]]
-        qdrant[("Qdrant<br/>/collections/{c}/points/search<br/>PUT /collections/{c}/points")]
+        qdrant[("Qdrant<br/>POST /collections/{c}/points/search<br/>PUT /collections/{c}/points<br/>POST /collections/{c}/points (retrieve)<br/>POST .../points/payload, /delete, /count")]
         datadog[["Datadog API<br/>/api/v1/monitor, /dashboard, /slo, /metrics<br/>/api/v1/query (live time series)<br/>/api/v2/incidents/search<br/>/api/v2/logs/events/search"]]
     end
 
@@ -129,7 +129,8 @@ What each part does:
     `502`/`503`/`504` errors, never an answer; live-evidence failures are reported in the
     timeline instead.
 - **rag-core**: the shared library.
-  - The OpenAI client (embeddings and chat), the Qdrant client (search and upsert), and
+  - The OpenAI client (single and batched embeddings, chat), the Qdrant client (search,
+    upsert, and the retrieve/set-payload/count/delete calls of incremental indexing), and
     the Datadog adapters.
   - The planner, the retrieval scope and the reranker.
   - `live_evidence`: discovery, deterministic time-series and log analysis, and the
@@ -138,9 +139,11 @@ What each part does:
   - `resilience`: per-stage timeouts, the overall request deadline, and bounded retries
     for 429 and 5xx responses.
 - **rag-indexer**: for each Datadog source, computes a window from that source's
-  checkpoint (with overlap for late data). It then fetches, deduplicates, chunks, embeds
-  and upserts, and advances that source's checkpoint only after success. One failing
-  source doesn't block the others.
+  checkpoint (with overlap for late data). It then fetches, deduplicates and chunks,
+  skips documents whose stored content hash is unchanged, embeds the rest in batches and
+  upserts them, removes obsolete chunks (and, for monitors, dashboards and SLOs, documents
+  deleted in Datadog), and advances that source's checkpoint only after success. One
+  failing source doesn't block the others.
 - **External services**:
   - **Datadog**: the source of monitors, dashboards, SLOs, metric names, incidents and
     logs for indexing, and of live time series and logs for diagnostic questions.
@@ -151,7 +154,7 @@ What each part does:
 
 | Crate | Description |
 |-------|--------------|
-| `rag-core` | Domain models, OpenAI, Qdrant (search + upsert), Datadog client (monitors, incidents, logs, dashboards, metrics, SLOs), chunker, planner, reranker, RAG service. |
+| `rag-core` | Domain models, OpenAI (chat, single and batched embeddings), Qdrant (search, upsert, and the incremental-indexing retrieve/set-payload/count/delete calls), Datadog client (monitors, incidents, logs, dashboards, metrics, SLOs), chunker, planner, reranker, RAG service. |
 | `rag-api` | Axum REST API — `/ask/plan` (intent + inferred filters) and `/ask` (server-side planning + filtered retrieval + live Datadog evidence for diagnostic questions + answer). |
 | `rag-cli` | CLI that calls the API. The server plans (service/env/time) and decides top-K. |
 | `rag-indexer` | One-shot, resumable indexer for Datadog → Qdrant with per-source checkpoints. Perfect for Kubernetes CronJob. |
@@ -331,7 +334,8 @@ independently and records its progress in the checkpoint file at `INDEXER_WATERM
 - **Complete fetches:** every Datadog list is paginated to the end (logs via the
   `meta.page.after` cursor, 1000 per page, oldest first).
 - **Per-source checkpoints:** a source's checkpoint advances to the run's start time only
-  after all of its documents are embedded and upserted, and the file is rewritten
+  after all of its writes succeeded (upserts, obsolete-chunk deletes and, for monitors,
+  dashboards and SLOs, sync markers and stale-document deletes), and the file is rewritten
   atomically (temp file + rename). A failing source is logged and retried from its old
   checkpoint on the next run while the others advance; the run then exits non-zero.
 - **Windows:** logs, incidents and metrics are fetched from their checkpoint minus
@@ -340,11 +344,56 @@ independently and records its progress in the checkpoint file at `INDEXER_WATERM
   `INDEXER_LOOKBACK_MINUTES` (default 90) back. After an outage, the whole gap since the
   checkpoint is fetched. Monitors, dashboards and SLOs are re-synced in full each run.
 - **No duplicates:** documents are deduplicated by ID within a run, and Qdrant point IDs
-  are derived from document IDs, so re-indexing overlapping records overwrites them.
+  are derived from document IDs, so re-indexing overlapping records overwrites them. An
+  overlapping record that hasn't changed is not embedded again (see
+  [Incremental indexing](#incremental-indexing)).
 - **Upgrades:** a legacy watermark file holding a single timestamp is used as the
   checkpoint for every source and rewritten in the new format. An unreadable checkpoint
   file stops the run instead of silently re-starting from the lookback; delete it to
   start over.
+
+### Incremental indexing
+
+Re-fetched documents that haven't changed are not embedded again, and points that no
+longer belong to a document are removed. Per source, after the fetch:
+
+1. **Hash.** Each document is chunked and gets a content hash (SHA-256) over all of its
+   fields (text, title, URI, kind, timestamp, service, environment, metadata), the chunk
+   size and overlap, and the embedding model (`OPENAI_EMBEDDING_MODEL`). Changing the
+   chunking or the model therefore changes every hash.
+2. **Look up.** The stored `ContentHash` and `ChunkCount` of chunk points `#c0` to
+   `#c{n}` of every document (`n` = its new chunk count) are read in batches of 256 by
+   point ID (`POST /collections/{c}/points` with `ids`).
+3. **Skip unchanged.** A document whose chunks `#c0` to `#c{n-1}` all exist with the
+   current hash and count is not embedded or rewritten. Points without a hash (written
+   before incremental indexing) count as changed.
+4. **Embed and upsert changed documents.** Their chunks are embedded with batched
+   requests (array `input`, at most `INDEXER_EMBED_BATCH_SIZE` texts and
+   `INDEXER_EMBED_BATCH_MAX_CHARS` characters per request), and each batch is upserted
+   with the hash, chunk count and (for full-sync sources) the run's sync ID. At most
+   `INDEXER_EMBED_CONCURRENCY` batches (embedding plus its upserts), lookups or deletes
+   are in flight at once.
+5. **Shrink.** If point `#c{n}` exists, the document used to have more chunks, or an
+   earlier cleanup failed: after the upserts, its points with `Metadata.chunk_index >= n`
+   are deleted by filter. A document's chunks always form a prefix `#c0..#c{m-1}`, so
+   probing `#c{n}` is enough.
+6. **Disappeared documents (monitors, dashboards and SLOs only).** These sources are
+   fetched in full, so after a successful fetch every seen document is marked with the
+   run's sync ID (`SyncId`, the run's start time): changed ones through the upsert,
+   unchanged ones with `POST /collections/{c}/points/payload`, without re-embedding.
+   Then every point of that kind without the current sync ID is deleted. A failed fetch
+   deletes nothing, and an empty fetch while points of that kind exist is treated as
+   suspicious: it logs a warning and deletes nothing unless
+   `INDEXER_ALLOW_EMPTY_SYNC_DELETE=true`.
+7. Logs, incidents and metrics are windowed: a record missing from a window is never
+   deleted. Only shrink cleanup applies to them.
+
+Each source logs how many documents were fetched, unchanged and embedded (with their
+chunk count), how many shrank, and how many stale points were deleted.
+
+**Upgrading:** points written before incremental indexing have no content hash, so the
+first run after upgrading re-embeds every fetched document once (and deletes monitors,
+dashboards and SLOs that no longer exist in Datadog). Later runs only embed what changed.
 
 ## Qdrant storage
 
@@ -355,11 +404,25 @@ are `Title`, `Text`, `SourceUri`, `Kind`, `Timestamp`, `Service`, `Environment`,
 Qdrant point IDs are deterministic UUIDv5 values derived from the logical chunk ID
 in a fixed Tails namespace, so retries and content updates replace the same point.
 
+The indexer also writes bookkeeping keys for [incremental indexing](#incremental-indexing).
+They are optional: points without them still load, and count as changed on the next run.
+They are not part of the returned documents, so the answer model never sees them.
+
+| Key | Written for | Meaning |
+|-----|-------------|---------|
+| `ContentHash` | every chunk | Content hash of the parent document (64 hex chars) |
+| `ChunkCount` | every chunk | Number of chunks of the parent document |
+| `SyncId` | monitors, dashboards, SLOs | Start time of the last run whose full fetch included the document |
+
+Shrink cleanup filters on `Kind`, `Metadata.chunk_of` and `Metadata.chunk_index`; stale
+cleanup on `Kind` and `SyncId`.
+
 Time filtering uses Qdrant's datetime `range` on the existing RFC 3339 `Timestamp`
 string, so existing collections need no re-indexing. Filters work without payload
 indexes; for large collections, add them for faster filtering:
 
 ```bash
 curl -X PUT "$QDRANT_ENDPOINT/collections/$QDRANT_COLLECTION/index" -H 'Content-Type: application/json' -d '{"field_name": "Timestamp", "field_schema": "datetime"}'
-# repeat with field_schema "keyword" for Service, Environment and Kind
+# repeat with field_schema "keyword" for Service, Environment, Kind, SyncId and Metadata.chunk_of,
+# and "integer" for Metadata.chunk_index (used by the indexer's cleanup filters)
 ```

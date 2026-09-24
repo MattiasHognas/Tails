@@ -1,8 +1,11 @@
 use anyhow::{Context, Result};
 use rag_core::{
-    chunk::chunk,
+    chunk::{chunk, chunk_id, content_hash},
     domain::{RagDocument, SourceKind},
-    qdrant::{QPoint, Qdrant},
+    qdrant::{
+        QPoint, Qdrant, SYNC_ID_KEY, StoredPointState, point_id, surplus_chunks_filter,
+        unsynced_filter,
+    },
     retrieval::RetrievalScope,
 };
 use serde_json::json;
@@ -36,7 +39,8 @@ async fn qdrant_roundtrip() -> Result<()> {
     let test_qdrant = qdrant.clone();
     let outcome = tokio::spawn(async move {
         check_roundtrip(&test_qdrant).await?;
-        check_scope_filter(&test_qdrant).await
+        check_scope_filter(&test_qdrant).await?;
+        check_incremental_indexing_calls(&test_qdrant).await
     })
     .await;
     let cleanup = qdrant.http.delete(&collection_url).send().await;
@@ -185,5 +189,158 @@ async fn check_scope_filter(qdrant: &Qdrant) -> Result<()> {
     scope.kinds = vec![SourceKind::Logs, SourceKind::SLO];
     let hits = qdrant.search(vector, 100, scope.to_qdrant_filter()).await?;
     assert_eq!(ids(hits), ["log_inside", "log_untimed", "slo"]);
+    Ok(())
+}
+
+/// The calls incremental indexing relies on: retrieve bookkeeping by point ID, mark points
+/// with set_payload, and count/delete by the surplus-chunk and unsynced filters.
+async fn check_incremental_indexing_calls(qdrant: &Qdrant) -> Result<()> {
+    let doc = |id: &str, kind: SourceKind, text: &str| RagDocument {
+        id: id.into(),
+        title: id.into(),
+        text: text.into(),
+        source_uri: format!("https://example.com/{id}"),
+        kind,
+        timestamp: None,
+        service: "incremental-svc".into(),
+        environment: "prod".into(),
+        metadata: serde_json::Map::new(),
+    };
+    let vector = vec![0.0, 0.0, 1.0];
+    let store = |docs: &[RagDocument], sync_id: Option<&str>| {
+        let points: Vec<QPoint> = docs
+            .iter()
+            .flat_map(|d| {
+                let hash = content_hash(d, 10, 0, "contract-model");
+                let chunks = chunk(10, 0, d);
+                let count = chunks.len() as u64;
+                chunks.into_iter().map(move |c| (c, hash.clone(), count))
+            })
+            .map(|(c, hash, count)| {
+                let mut p = QPoint::from_document(&c, vector.clone());
+                p.payload.content_hash = Some(hash);
+                p.payload.chunk_count = Some(count);
+                p.payload.sync_id = sync_id.map(str::to_string);
+                p
+            })
+            .collect();
+        qdrant.upsert(points)
+    };
+
+    // Two 4-chunk monitors, a 1-chunk monitor, a 4-chunk log and a legacy monitor point
+    // without bookkeeping.
+    let long = doc("monitor_inc", SourceKind::Monitor, &"m".repeat(40));
+    let other = doc("monitor_other", SourceKind::Monitor, &"o".repeat(40));
+    let gone = doc("monitor_gone", SourceKind::Monitor, "gone");
+    let log = doc("log_inc", SourceKind::Logs, &"l".repeat(40));
+    store(&[long.clone(), other, gone], Some("run-1")).await?;
+    store(&[log], None).await?;
+    let legacy_doc = doc("monitor_legacy", SourceKind::Monitor, "legacy");
+    let legacy = QPoint::from_document(&chunk(10, 0, &legacy_doc)[0], vector.clone());
+    qdrant.upsert(vec![legacy.clone()]).await?;
+
+    // Retrieve: existing points return their bookkeeping, missing IDs are left out.
+    let c0 = point_id(&chunk_id("monitor_inc", 0));
+    let missing = point_id(&chunk_id("monitor_inc", 99));
+    let mut states = qdrant.retrieve_states(&[c0, legacy.id, missing]).await?;
+    states.sort_by_key(|s| s.id != c0);
+    assert_eq!(
+        states,
+        [
+            StoredPointState {
+                id: c0,
+                content_hash: Some(content_hash(&long, 10, 0, "contract-model")),
+                chunk_count: Some(4),
+            },
+            StoredPointState {
+                id: legacy.id,
+                content_hash: None,
+                chunk_count: None,
+            },
+        ]
+    );
+
+    // Shrink: deleting chunks 2.. of one monitor leaves its chunks 0 and 1 and every
+    // other document's chunks.
+    let surplus = surplus_chunks_filter(&SourceKind::Monitor, "monitor_inc", 2);
+    assert_eq!(qdrant.count(surplus.clone()).await?, 2);
+    qdrant.delete_by_filter(surplus).await?;
+    let ids_of =
+        |doc_id: &str| -> Vec<_> { (0..4).map(|i| point_id(&chunk_id(doc_id, i))).collect() };
+    let monitor_ids = ids_of("monitor_inc");
+    let mut left: Vec<_> = qdrant
+        .retrieve_states(&monitor_ids)
+        .await?
+        .into_iter()
+        .map(|s| s.id)
+        .collect();
+    left.sort();
+    let mut expected = monitor_ids[..2].to_vec();
+    expected.sort();
+    assert_eq!(left, expected);
+    assert_eq!(
+        qdrant
+            .retrieve_states(&ids_of("monitor_other"))
+            .await?
+            .len(),
+        4
+    );
+    assert_eq!(qdrant.retrieve_states(&ids_of("log_inc")).await?.len(), 4);
+
+    // Full sync: mark the monitors seen in run-2, then drop every unmarked monitor.
+    let mut seen = monitor_ids[..2].to_vec();
+    seen.extend(ids_of("monitor_other"));
+    qdrant
+        .set_payload(&seen, json!({ SYNC_ID_KEY: "run-2" }))
+        .await?;
+    let stale = qdrant
+        .count(unsynced_filter(&SourceKind::Monitor, "run-2"))
+        .await?;
+    // Monitors from the earlier checks share the collection and are unmarked too.
+    let earlier_monitors = qdrant
+        .count(json!({
+            "must": [{"key": "Kind", "match": {"value": "monitor"}}],
+            "must_not": [{"key": "Service", "match": {"value": "incremental-svc"}}]
+        }))
+        .await?;
+    assert_eq!(
+        stale,
+        earlier_monitors + 2,
+        "monitor_gone (run-1) and the legacy point"
+    );
+    qdrant
+        .delete_by_filter(unsynced_filter(&SourceKind::Monitor, "run-2"))
+        .await?;
+    assert_eq!(
+        qdrant
+            .count(unsynced_filter(&SourceKind::Monitor, "run-2"))
+            .await?,
+        0
+    );
+    let kept = qdrant
+        .search(
+            vector,
+            100,
+            Some(json!({"must": [{"key": "Service", "match": {"value": "incremental-svc"}}]})),
+        )
+        .await?;
+    let mut kept: Vec<_> = kept.into_iter().map(|h| h.doc.id).collect();
+    kept.sort();
+    assert_eq!(
+        kept,
+        [
+            "log_inc#c0",
+            "log_inc#c1",
+            "log_inc#c2",
+            "log_inc#c3",
+            "monitor_inc#c0",
+            "monitor_inc#c1",
+            "monitor_other#c0",
+            "monitor_other#c1",
+            "monitor_other#c2",
+            "monitor_other#c3"
+        ],
+        "windowed kinds are never swept by a full sync"
+    );
     Ok(())
 }

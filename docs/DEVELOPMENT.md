@@ -31,6 +31,10 @@ DD_SITE=datadoghq.eu    # or datadoghq.com
 INDEXER_WATERMARK=/data/watermark.json   # per-source checkpoint file
 INDEXER_LOOKBACK_MINUTES=90              # window for a source's first run
 INDEXER_OVERLAP_MINUTES=10               # re-read before each checkpoint for late arrivals
+INDEXER_EMBED_BATCH_SIZE=128             # texts per embeddings request (1-2048)
+INDEXER_EMBED_BATCH_MAX_CHARS=200000     # characters per embeddings request (rough token budget)
+INDEXER_EMBED_CONCURRENCY=4              # embedding batches/upserts, lookups or deletes in flight (1-32)
+INDEXER_ALLOW_EMPTY_SYNC_DELETE=false    # true: an empty monitor/dashboard/SLO fetch deletes all indexed ones
 
 # Retrieval tuning (optional)
 RAG_TOPK_DEFAULT=16
@@ -104,7 +108,11 @@ INDEXER_WATERMARK=./watermark.json DD_API_KEY=... DD_APP_KEY=... DD_SITE=datadog
 ```
 
 How the indexer windows, checkpoints and deduplicates is described in
-[ARCHITECTURE.md](ARCHITECTURE.md#how-the-indexer-resumes).
+[ARCHITECTURE.md](ARCHITECTURE.md#how-the-indexer-resumes). Unchanged documents are not
+re-embedded, and obsolete chunks and deleted monitors, dashboards and SLOs are removed
+([Incremental indexing](ARCHITECTURE.md#incremental-indexing)). The first run after
+upgrading to incremental indexing re-embeds everything once, because existing points
+have no content hash yet.
 
 ## Docker
 
@@ -234,8 +242,9 @@ QDRANT_TEST_ENDPOINT=http://localhost:6333 cargo test --locked -p rag-core --tes
 ```
 
 The test creates and deletes its own uniquely named collection and checks chunk
-identity, full payload recovery, filtering (including the time window), and idempotent
-upserts.
+identity, full payload recovery, filtering (including the time window), idempotent
+upserts, and the incremental-indexing calls: retrieving bookkeeping by point ID,
+`set_payload`, and counting and deleting by the shrink and stale-document filters.
 
 Recommended payload indexes for large collections are listed under
 [Qdrant storage](ARCHITECTURE.md#qdrant-storage).

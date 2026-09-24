@@ -1,14 +1,15 @@
 mod checkpoint;
+mod incremental;
 
 use anyhow::Result;
 use checkpoint::{Checkpoints, Window};
 use chrono::{DateTime, Duration, Utc};
+use incremental::{Embedder, IncrementalSink, IndexParams, IndexStats, PointStore, SyncScope};
 use rag_core::{
-    chunk::chunk,
     datadog::Datadog,
-    domain::RagDocument,
+    domain::{RagDocument, SourceKind},
     openai::OpenAiClient,
-    qdrant::{QPoint, Qdrant},
+    qdrant::Qdrant,
 };
 use std::collections::HashSet;
 use std::path::Path;
@@ -17,8 +18,14 @@ use std::path::Path;
 const CHUNK_SIZE: usize = 1800;
 /// Characters of overlap between consecutive chunks
 const CHUNK_OVERLAP: usize = 200;
-/// Points per Qdrant upsert request
-const UPSERT_BATCH_SIZE: usize = 64;
+/// Default texts per embeddings request (OpenAI accepts up to 2048)
+const EMBED_BATCH_SIZE: usize = 128;
+/// Default characters per embeddings request, well under OpenAI's per-request token limit
+const EMBED_BATCH_MAX_CHARS: usize = 200_000;
+/// Default embedding batches, lookups and deletes in flight
+const EMBED_CONCURRENCY: usize = 4;
+/// Upper bound for `INDEXER_EMBED_CONCURRENCY`
+const MAX_EMBED_CONCURRENCY: usize = 32;
 
 /// A Datadog source, indexed and checkpointed independently of the others.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,6 +63,21 @@ impl Source {
     fn names() -> Vec<&'static str> {
         Self::ALL.iter().map(|s| s.name()).collect()
     }
+
+    /// Monitors, dashboards and SLOs are fetched in full, so documents missing from a
+    /// successful fetch were deleted in Datadog. The other sources are windowed.
+    fn sync_scope(self, sync_id: &str) -> SyncScope {
+        let kind = match self {
+            Source::Monitors => SourceKind::Monitor,
+            Source::Dashboards => SourceKind::Dashboard,
+            Source::Slos => SourceKind::SLO,
+            Source::Metrics | Source::Incidents | Source::Logs => return SyncScope::Window,
+        };
+        SyncScope::Full {
+            kind,
+            sync_id: sync_id.to_string(),
+        }
+    }
 }
 
 /// Fetches the documents of one source for a window.
@@ -63,9 +85,10 @@ trait SourceFetcher {
     async fn fetch(&self, source: Source, window: &Window) -> Result<Vec<RagDocument>>;
 }
 
-/// Embeds and stores documents, returning the number of chunks written.
+/// Stores the documents of one fetch and removes what they replace. Returns only after
+/// every write (upserts and deletes) succeeded.
 trait DocumentSink {
-    async fn index(&self, docs: &[RagDocument]) -> Result<usize>;
+    async fn index(&self, docs: &[RagDocument], scope: &SyncScope) -> Result<IndexStats>;
 }
 
 impl SourceFetcher for Datadog {
@@ -84,33 +107,10 @@ impl SourceFetcher for Datadog {
     }
 }
 
-struct QdrantSink {
-    openai: OpenAiClient,
-    qdrant: Qdrant,
-}
-
-impl DocumentSink for QdrantSink {
-    async fn index(&self, docs: &[RagDocument]) -> Result<usize> {
-        let chunks = chunk_documents(docs);
-        let mut batch = Vec::new();
-        for c in &chunks {
-            let emb = self.openai.embed(&c.text).await?;
-            batch.push(QPoint::from_document(c, emb));
-            if batch.len() >= UPSERT_BATCH_SIZE {
-                self.qdrant.upsert(std::mem::take(&mut batch)).await?;
-            }
-        }
-        if !batch.is_empty() {
-            self.qdrant.upsert(batch).await?;
-        }
-        Ok(chunks.len())
+impl<E: Embedder, S: PointStore> DocumentSink for IncrementalSink<E, S> {
+    async fn index(&self, docs: &[RagDocument], scope: &SyncScope) -> Result<IndexStats> {
+        IncrementalSink::index(self, docs, scope).await
     }
-}
-
-fn chunk_documents(docs: &[RagDocument]) -> Vec<RagDocument> {
-    docs.iter()
-        .flat_map(|d| chunk(CHUNK_SIZE, CHUNK_OVERLAP, d))
-        .collect()
 }
 
 /// Drops documents whose id was already seen, keeping the first occurrence. Overlapping
@@ -129,8 +129,8 @@ struct IndexerConfig {
 }
 
 /// Indexes every source, advancing and persisting each source's checkpoint only after
-/// its documents are stored. A failing source is logged and skipped so the others still
-/// advance; the failures are returned.
+/// its documents are stored and obsolete points removed. A failing source is logged and
+/// skipped so the others still advance; the failures are returned.
 async fn index_sources(
     fetcher: &impl SourceFetcher,
     sink: &impl DocumentSink,
@@ -140,6 +140,8 @@ async fn index_sources(
     now: DateTime<Utc>,
 ) -> Vec<(Source, anyhow::Error)> {
     let mut failures = Vec::new();
+    // Marks the points of full-sync documents seen in this run.
+    let sync_id = now.to_rfc3339();
     for source in Source::ALL {
         let window = checkpoint::window(
             checkpoints.get(source.name()),
@@ -154,20 +156,25 @@ async fn index_sources(
             window.to.to_rfc3339()
         );
 
+        // A failed fetch never reaches the sink, so it can't delete anything.
         let result = async {
             let docs = dedupe_by_id(fetcher.fetch(source, &window).await?);
-            let chunks = sink.index(&docs).await?;
-            Ok::<_, anyhow::Error>((docs.len(), chunks))
+            sink.index(&docs, &source.sync_scope(&sync_id)).await
         }
         .await;
 
         match result {
-            Ok((docs, chunks)) => {
+            Ok(stats) => {
                 tracing::info!(
-                    "Indexed {} {} documents ({} chunks)",
-                    docs,
+                    "Indexed {}: {} fetched, {} unchanged, {} embedded ({} chunks), \
+                     {} shrunk, {} stale points deleted",
                     source.name(),
-                    chunks
+                    stats.fetched,
+                    stats.unchanged,
+                    stats.embedded_docs,
+                    stats.embedded_chunks,
+                    stats.shrunk,
+                    stats.deleted_stale
                 );
                 checkpoints.set(source.name(), window.to);
                 if let Err(e) = checkpoints.save(checkpoint_path).await {
@@ -191,6 +198,39 @@ fn env_minutes(name: &str, default: i64) -> i64 {
         .unwrap_or(default)
 }
 
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(default)
+}
+
+fn env_flag(name: &str) -> bool {
+    std::env::var(name)
+        .map(|v| {
+            matches!(
+                v.trim().to_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+/// Incremental indexing settings from the environment, clamped so batches are never
+/// empty and concurrency is never unbounded.
+fn index_params_from_env() -> IndexParams {
+    IndexParams {
+        chunk_size: CHUNK_SIZE,
+        chunk_overlap: CHUNK_OVERLAP,
+        embed_batch_size: env_usize("INDEXER_EMBED_BATCH_SIZE", EMBED_BATCH_SIZE).clamp(1, 2048),
+        embed_batch_max_chars: env_usize("INDEXER_EMBED_BATCH_MAX_CHARS", EMBED_BATCH_MAX_CHARS)
+            .max(1),
+        concurrency: env_usize("INDEXER_EMBED_CONCURRENCY", EMBED_CONCURRENCY)
+            .clamp(1, MAX_EMBED_CONCURRENCY),
+        allow_empty_sync_delete: env_flag("INDEXER_ALLOW_EMPTY_SYNC_DELETE"),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
@@ -203,9 +243,10 @@ async fn main() -> Result<()> {
     };
 
     let dd = Datadog::new_from_env()?;
-    let sink = QdrantSink {
-        openai: OpenAiClient::new_from_env()?,
-        qdrant: Qdrant::new_from_env()?,
+    let sink = IncrementalSink {
+        embedder: OpenAiClient::new_from_env()?,
+        store: Qdrant::new_from_env()?,
+        params: index_params_from_env(),
     };
 
     let checkpoint_path = Path::new(&checkpoint_path);
@@ -232,9 +273,16 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rag_core::domain::SourceKind;
+    use incremental::fakes::{FakeEmbedder, FakeStore};
+    use rag_core::{chunk::chunk, qdrant::QPoint};
     use std::collections::HashMap;
     use std::sync::Mutex;
+
+    fn chunk_documents(docs: &[RagDocument]) -> Vec<RagDocument> {
+        docs.iter()
+            .flat_map(|d| chunk(CHUNK_SIZE, CHUNK_OVERLAP, d))
+            .collect()
+    }
 
     fn create_test_doc() -> RagDocument {
         RagDocument {
@@ -382,7 +430,7 @@ mod tests {
     }
 
     impl DocumentSink for FakeSink {
-        async fn index(&self, docs: &[RagDocument]) -> Result<usize> {
+        async fn index(&self, docs: &[RagDocument], _scope: &SyncScope) -> Result<IndexStats> {
             if docs
                 .iter()
                 .any(|d| Some(&d.kind) == self.failing_kind.as_ref())
@@ -399,7 +447,12 @@ mod tests {
                 let point = QPoint::from_document(c, vec![0.0]);
                 points.insert(point.id.to_string(), c.id.clone());
             }
-            Ok(chunks.len())
+            Ok(IndexStats {
+                fetched: docs.len(),
+                embedded_docs: docs.len(),
+                embedded_chunks: chunks.len(),
+                ..IndexStats::default()
+            })
         }
     }
 
@@ -638,5 +691,175 @@ mod tests {
         );
         assert_eq!(chunk_ids.len(), points.len());
         assert!(chunk_ids.contains("log_b#c0"));
+    }
+
+    #[test]
+    fn test_only_configuration_sources_are_fully_synced() {
+        for source in Source::ALL {
+            let full = matches!(source.sync_scope("run"), SyncScope::Full { .. });
+            assert_eq!(
+                full,
+                matches!(source, Source::Monitors | Source::Dashboards | Source::Slos),
+                "{}",
+                source.name()
+            );
+        }
+    }
+
+    #[test]
+    fn test_index_params_are_bounded() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let vars = [
+            "INDEXER_EMBED_BATCH_SIZE",
+            "INDEXER_EMBED_BATCH_MAX_CHARS",
+            "INDEXER_EMBED_CONCURRENCY",
+            "INDEXER_ALLOW_EMPTY_SYNC_DELETE",
+        ];
+        // SAFETY: tests touching the environment hold ENV_LOCK.
+        unsafe {
+            for v in vars {
+                std::env::remove_var(v);
+            }
+        }
+        let defaults = index_params_from_env();
+        assert_eq!(defaults.embed_batch_size, EMBED_BATCH_SIZE);
+        assert_eq!(defaults.embed_batch_max_chars, EMBED_BATCH_MAX_CHARS);
+        assert_eq!(defaults.concurrency, EMBED_CONCURRENCY);
+        assert!(!defaults.allow_empty_sync_delete);
+
+        unsafe {
+            std::env::set_var("INDEXER_EMBED_BATCH_SIZE", "0");
+            std::env::set_var("INDEXER_EMBED_BATCH_MAX_CHARS", "0");
+            std::env::set_var("INDEXER_EMBED_CONCURRENCY", "100000");
+            std::env::set_var("INDEXER_ALLOW_EMPTY_SYNC_DELETE", "true");
+        }
+        let clamped = index_params_from_env();
+        assert_eq!(clamped.embed_batch_size, 1);
+        assert_eq!(clamped.embed_batch_max_chars, 1);
+        assert_eq!(clamped.concurrency, MAX_EMBED_CONCURRENCY);
+        assert!(clamped.allow_empty_sync_delete);
+
+        unsafe {
+            std::env::set_var("INDEXER_EMBED_CONCURRENCY", "0");
+        }
+        assert_eq!(index_params_from_env().concurrency, 1);
+        unsafe {
+            for v in vars {
+                std::env::remove_var(v);
+            }
+        }
+    }
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn incremental_sink() -> IncrementalSink<FakeEmbedder, FakeStore> {
+        IncrementalSink {
+            embedder: FakeEmbedder::default(),
+            store: FakeStore::default(),
+            params: IndexParams {
+                chunk_size: CHUNK_SIZE,
+                chunk_overlap: CHUNK_OVERLAP,
+                embed_batch_size: EMBED_BATCH_SIZE,
+                embed_batch_max_chars: EMBED_BATCH_MAX_CHARS,
+                concurrency: 2,
+                allow_empty_sync_delete: false,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn test_rerun_embeds_nothing_and_removes_deleted_monitors() {
+        let path = temp_checkpoint("incremental");
+        let mut fetcher = FakeFetcher::new();
+        fetcher.docs.insert(
+            "monitors",
+            vec![
+                doc("monitor_1", SourceKind::Monitor),
+                doc("monitor_2", SourceKind::Monitor),
+            ],
+        );
+        fetcher
+            .docs
+            .insert("logs", vec![doc("log_a", SourceKind::Logs)]);
+        let sink = incremental_sink();
+        let mut checkpoints = Checkpoints::default();
+
+        let first = ts("2025-01-01T12:00:00Z");
+        assert!(
+            index_sources(&fetcher, &sink, &mut checkpoints, &path, &config(), first)
+                .await
+                .is_empty()
+        );
+        let embedded = sink.embedder.embedded_texts().len();
+        assert_eq!(embedded, 3);
+
+        // monitor_2 was deleted in Datadog; the log fell out of the window.
+        fetcher
+            .docs
+            .insert("monitors", vec![doc("monitor_1", SourceKind::Monitor)]);
+        fetcher.docs.remove("logs");
+        let second = ts("2025-01-01T12:15:00Z");
+        assert!(
+            index_sources(&fetcher, &sink, &mut checkpoints, &path, &config(), second)
+                .await
+                .is_empty()
+        );
+
+        assert_eq!(sink.embedder.embedded_texts().len(), embedded);
+        assert_eq!(sink.store.chunk_ids(), ["log_a#c0", "monitor_1#c0"]);
+    }
+
+    #[tokio::test]
+    async fn test_failed_fetch_of_full_sync_source_deletes_nothing() {
+        let path = temp_checkpoint("full-sync-fetch-failure");
+        let mut fetcher = FakeFetcher::new();
+        fetcher
+            .docs
+            .insert("slos", vec![doc("slo_1", SourceKind::SLO)]);
+        let sink = incremental_sink();
+        let mut checkpoints = Checkpoints::default();
+        let first = ts("2025-01-01T12:00:00Z");
+        index_sources(&fetcher, &sink, &mut checkpoints, &path, &config(), first).await;
+
+        fetcher.failing = vec![Source::Slos];
+        let second = ts("2025-01-01T12:15:00Z");
+        let failures =
+            index_sources(&fetcher, &sink, &mut checkpoints, &path, &config(), second).await;
+
+        assert_eq!(failures.len(), 1);
+        assert_eq!(sink.store.chunk_ids(), ["slo_1#c0"]);
+        assert_eq!(checkpoints.get("slos"), Some(first));
+    }
+
+    #[tokio::test]
+    async fn test_checkpoint_does_not_advance_when_a_delete_fails() {
+        let path = temp_checkpoint("delete-failure");
+        let mut fetcher = FakeFetcher::new();
+        fetcher.docs.insert(
+            "dashboards",
+            vec![
+                doc("dashboard_1", SourceKind::Dashboard),
+                doc("dashboard_2", SourceKind::Dashboard),
+            ],
+        );
+        let mut sink = incremental_sink();
+        let mut checkpoints = Checkpoints::default();
+        let first = ts("2025-01-01T12:00:00Z");
+        index_sources(&fetcher, &sink, &mut checkpoints, &path, &config(), first).await;
+
+        fetcher.docs.insert(
+            "dashboards",
+            vec![doc("dashboard_1", SourceKind::Dashboard)],
+        );
+        sink.store.fail_deletes = true;
+        let second = ts("2025-01-01T12:15:00Z");
+        let failures =
+            index_sources(&fetcher, &sink, &mut checkpoints, &path, &config(), second).await;
+
+        let failed: Vec<_> = failures.iter().map(|(s, _)| *s).collect();
+        assert_eq!(failed, [Source::Dashboards]);
+        let saved = Checkpoints::load(&path, &Source::names()).await.unwrap();
+        assert_eq!(saved.get("dashboards"), Some(first));
+        assert_eq!(saved.get("monitors"), Some(second));
     }
 }
