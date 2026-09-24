@@ -6,6 +6,16 @@ use urlencoding;
 const INCIDENT_SEARCH_QUERY: &str = "state:(active OR stable OR resolved)";
 /// Maximum `page[size]` accepted by the incident search endpoint.
 const INCIDENT_PAGE_SIZE: u64 = 100;
+/// Only error and warning logs are indexed.
+const LOG_SEARCH_QUERY: &str = "status:error OR status:warn";
+/// Maximum `page.limit` accepted by the log search endpoint.
+const LOG_PAGE_LIMIT: u64 = 1000;
+/// Maximum `page_size` accepted by the monitor list endpoint.
+const MONITOR_PAGE_SIZE: u64 = 1000;
+/// Page size for the dashboard list (`count`); the API default, as no maximum is documented.
+const DASHBOARD_PAGE_SIZE: u64 = 100;
+/// Page size for the SLO list (`limit`); the API default.
+const SLO_PAGE_SIZE: u64 = 1000;
 
 pub struct Datadog {
     pub api_key: String,
@@ -35,76 +45,90 @@ impl Datadog {
         ))
     }
 
+    /// Fetches all monitors with `GET /api/v1/monitor`, following `page`/`page_size`
+    /// pagination until a short page is returned.
     pub async fn get_monitors(&self) -> Result<Vec<RagDocument>> {
         let url = format!("{}/api/v1/monitor", self.api_base);
-        let response = self
-            .http
-            .get(&url)
-            .header("DD-API-KEY", &self.api_key)
-            .header("DD-APPLICATION-KEY", &self.app_key)
-            .send()
-            .await?;
-
-        if !response.status().is_success() {
-            anyhow::bail!("Failed to fetch monitors: {}", response.status());
-        }
-
-        let monitors: Vec<serde_json::Value> = response.json().await?;
         let mut docs = Vec::new();
+        let mut page: u64 = 0;
+        loop {
+            let response = self
+                .http
+                .get(&url)
+                .header("DD-API-KEY", &self.api_key)
+                .header("DD-APPLICATION-KEY", &self.app_key)
+                .query(&[
+                    ("page", page.to_string()),
+                    ("page_size", MONITOR_PAGE_SIZE.to_string()),
+                ])
+                .send()
+                .await?;
 
-        for monitor in monitors {
-            let id = monitor["id"].as_i64().unwrap_or(0).to_string();
-            let name = monitor["name"].as_str().unwrap_or("").to_string();
-            let message = monitor["message"].as_str().unwrap_or("").to_string();
-            let query = monitor["query"].as_str().unwrap_or("").to_string();
-            let monitor_type = monitor["type"].as_str().unwrap_or("").to_string();
+            if !response.status().is_success() {
+                anyhow::bail!("Failed to fetch monitors: {}", response.status());
+            }
 
-            let tags = monitor["tags"]
-                .as_array()
-                .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
-                .unwrap_or_default();
-
-            let service = tags
-                .iter()
-                .find(|t| t.starts_with("service:"))
-                .and_then(|t| t.strip_prefix("service:"))
-                .unwrap_or("")
-                .to_string();
-
-            let environment = tags
-                .iter()
-                .find(|t| t.starts_with("env:"))
-                .and_then(|t| t.strip_prefix("env:"))
-                .unwrap_or("")
-                .to_string();
-
-            let mut metadata = serde_json::Map::new();
-            metadata.insert(
-                "monitor_type".to_string(),
-                serde_json::Value::String(monitor_type),
-            );
-            metadata.insert(
-                "query".to_string(),
-                serde_json::Value::String(query.clone()),
-            );
-            metadata.insert("tags".to_string(), serde_json::json!(tags));
-
-            let text = format!("{}\n\nQuery: {}\n\nMessage: {}", name, query, message);
-
-            docs.push(RagDocument {
-                id: format!("monitor_{}", id),
-                title: name,
-                text,
-                source_uri: format!("https://app.{}/monitors/{}", self.site, id),
-                kind: crate::domain::SourceKind::Monitor,
-                timestamp: None,
-                service,
-                environment,
-                metadata,
-            });
+            let monitors: Vec<serde_json::Value> = response.json().await?;
+            docs.extend(monitors.iter().map(|m| self.monitor_document(m)));
+            if (monitors.len() as u64) < MONITOR_PAGE_SIZE {
+                break;
+            }
+            page += 1;
         }
 
         Ok(docs)
+    }
+
+    fn monitor_document(&self, monitor: &serde_json::Value) -> RagDocument {
+        let id = monitor["id"].as_i64().unwrap_or(0).to_string();
+        let name = monitor["name"].as_str().unwrap_or("").to_string();
+        let message = monitor["message"].as_str().unwrap_or("").to_string();
+        let query = monitor["query"].as_str().unwrap_or("").to_string();
+        let monitor_type = monitor["type"].as_str().unwrap_or("").to_string();
+
+        let tags = monitor["tags"]
+            .as_array()
+            .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
+            .unwrap_or_default();
+
+        let service = tags
+            .iter()
+            .find(|t| t.starts_with("service:"))
+            .and_then(|t| t.strip_prefix("service:"))
+            .unwrap_or("")
+            .to_string();
+
+        let environment = tags
+            .iter()
+            .find(|t| t.starts_with("env:"))
+            .and_then(|t| t.strip_prefix("env:"))
+            .unwrap_or("")
+            .to_string();
+
+        let mut metadata = serde_json::Map::new();
+        metadata.insert(
+            "monitor_type".to_string(),
+            serde_json::Value::String(monitor_type),
+        );
+        metadata.insert(
+            "query".to_string(),
+            serde_json::Value::String(query.clone()),
+        );
+        metadata.insert("tags".to_string(), serde_json::json!(tags));
+
+        let text = format!("{}\n\nQuery: {}\n\nMessage: {}", name, query, message);
+
+        RagDocument {
+            id: format!("monitor_{}", id),
+            title: name,
+            text,
+            source_uri: format!("https://app.{}/monitors/{}", self.site, id),
+            kind: crate::domain::SourceKind::Monitor,
+            timestamp: None,
+            service,
+            environment,
+            metadata,
+        }
     }
 
     /// Fetches incidents created within `[from_iso, to_iso]` using
@@ -240,150 +264,187 @@ impl Datadog {
         }
     }
 
+    /// Fetches every error/warning log in `[from_iso, to_iso]` with
+    /// `POST /api/v2/logs/events/search`, oldest first, following the
+    /// `meta.page.after` cursor until the last page.
     pub async fn search_logs(&self, from_iso: &str, to_iso: &str) -> Result<Vec<RagDocument>> {
         let url = format!("{}/api/v2/logs/events/search", self.api_base);
 
-        let query = serde_json::json!({
-            "filter": {
-                "from": from_iso,
-                "to": to_iso,
-                "query": "status:error OR status:warn"
-            },
-            "page": {
-                "limit": 100
-            },
-            "sort": "-timestamp"
-        });
-
-        let response = self
-            .http
-            .post(&url)
-            .header("DD-API-KEY", &self.api_key)
-            .header("DD-APPLICATION-KEY", &self.app_key)
-            .json(&query)
-            .send()
-            .await?;
-
-        if !response.status().is_success() {
-            anyhow::bail!("Failed to search logs: {}", response.status());
-        }
-
-        let result: serde_json::Value = response.json().await?;
-        let empty_vec = vec![];
-        let logs = result["data"].as_array().unwrap_or(&empty_vec);
         let mut docs = Vec::new();
-
-        for log in logs {
-            let id = log["id"].as_str().unwrap_or("").to_string();
-            let attrs = &log["attributes"];
-            let message = attrs["message"].as_str().unwrap_or("").to_string();
-            let status = attrs["status"].as_str().unwrap_or("").to_string();
-            let timestamp = attrs["timestamp"].as_str().map(|s| s.to_string());
-
-            let tags = attrs["tags"]
-                .as_array()
-                .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
-                .unwrap_or_default();
-
-            // Logs carry the reserved `service` attribute; tags are only a fallback.
-            let service = attrs["service"]
-                .as_str()
-                .filter(|s| !s.is_empty())
-                .or_else(|| {
-                    tags.iter()
-                        .find(|t| t.starts_with("service:"))
-                        .and_then(|t| t.strip_prefix("service:"))
-                })
-                .unwrap_or("")
-                .to_string();
-
-            let environment = tags
-                .iter()
-                .find(|t| t.starts_with("env:"))
-                .and_then(|t| t.strip_prefix("env:"))
-                .unwrap_or("")
-                .to_string();
-
-            let mut metadata = serde_json::Map::new();
-            metadata.insert(
-                "status".to_string(),
-                serde_json::Value::String(status.clone()),
-            );
-            metadata.insert("tags".to_string(), serde_json::json!(tags));
-
-            let title = format!("Log: {} - {}", service, status);
-
-            docs.push(RagDocument {
-                id: format!("log_{}", id),
-                title,
-                text: message,
-                source_uri: format!("https://app.{}/logs?query=id:{}", self.site, id),
-                kind: crate::domain::SourceKind::Logs,
-                timestamp,
-                service,
-                environment,
-                metadata,
+        let mut cursor: Option<String> = None;
+        loop {
+            let mut page = serde_json::json!({ "limit": LOG_PAGE_LIMIT });
+            if let Some(cursor) = &cursor {
+                page["cursor"] = serde_json::Value::String(cursor.clone());
+            }
+            // Ascending order makes progress through the window monotonic.
+            let query = serde_json::json!({
+                "filter": {
+                    "from": from_iso,
+                    "to": to_iso,
+                    "query": LOG_SEARCH_QUERY
+                },
+                "page": page,
+                "sort": "timestamp"
             });
+
+            let response = self
+                .http
+                .post(&url)
+                .header("DD-API-KEY", &self.api_key)
+                .header("DD-APPLICATION-KEY", &self.app_key)
+                .json(&query)
+                .send()
+                .await?;
+
+            if !response.status().is_success() {
+                anyhow::bail!("Failed to search logs: {}", response.status());
+            }
+
+            let result: serde_json::Value = response.json().await?;
+            let logs = result["data"]
+                .as_array()
+                .ok_or_else(|| anyhow::anyhow!("Unexpected log search response: missing data"))?;
+            docs.extend(logs.iter().map(|log| self.log_document(log)));
+
+            // `meta.page.after` is absent on the last page.
+            match result["meta"]["page"]["after"].as_str() {
+                Some(after) if !logs.is_empty() => {
+                    if cursor.as_deref() == Some(after) {
+                        anyhow::bail!("Log search returned the same cursor twice");
+                    }
+                    cursor = Some(after.to_string());
+                }
+                _ => break,
+            }
         }
 
         Ok(docs)
     }
 
+    fn log_document(&self, log: &serde_json::Value) -> RagDocument {
+        let id = log["id"].as_str().unwrap_or("").to_string();
+        let attrs = &log["attributes"];
+        let message = attrs["message"].as_str().unwrap_or("").to_string();
+        let status = attrs["status"].as_str().unwrap_or("").to_string();
+        let timestamp = attrs["timestamp"].as_str().map(|s| s.to_string());
+
+        let tags = attrs["tags"]
+            .as_array()
+            .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
+            .unwrap_or_default();
+
+        // Logs carry the reserved `service` attribute; tags are only a fallback.
+        let service = attrs["service"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                tags.iter()
+                    .find(|t| t.starts_with("service:"))
+                    .and_then(|t| t.strip_prefix("service:"))
+            })
+            .unwrap_or("")
+            .to_string();
+
+        let environment = tags
+            .iter()
+            .find(|t| t.starts_with("env:"))
+            .and_then(|t| t.strip_prefix("env:"))
+            .unwrap_or("")
+            .to_string();
+
+        let mut metadata = serde_json::Map::new();
+        metadata.insert(
+            "status".to_string(),
+            serde_json::Value::String(status.clone()),
+        );
+        metadata.insert("tags".to_string(), serde_json::json!(tags));
+
+        let title = format!("Log: {} - {}", service, status);
+
+        RagDocument {
+            id: format!("log_{}", id),
+            title,
+            text: message,
+            source_uri: format!("https://app.{}/logs?query=id:{}", self.site, id),
+            kind: crate::domain::SourceKind::Logs,
+            timestamp,
+            service,
+            environment,
+            metadata,
+        }
+    }
+
+    /// Fetches all dashboards with `GET /api/v1/dashboard`, following `start`/`count`
+    /// pagination until a short page is returned.
     pub async fn list_dashboards(&self) -> Result<Vec<RagDocument>> {
         let url = format!("{}/api/v1/dashboard", self.api_base);
-        let response = self
-            .http
-            .get(&url)
-            .header("DD-API-KEY", &self.api_key)
-            .header("DD-APPLICATION-KEY", &self.app_key)
-            .send()
-            .await?;
-
-        if !response.status().is_success() {
-            anyhow::bail!("Failed to fetch dashboards: {}", response.status());
-        }
-
-        let result: serde_json::Value = response.json().await?;
-        let empty_vec = vec![];
-        let dashboards = result["dashboards"].as_array().unwrap_or(&empty_vec);
         let mut docs = Vec::new();
+        let mut start: u64 = 0;
+        loop {
+            let response = self
+                .http
+                .get(&url)
+                .header("DD-API-KEY", &self.api_key)
+                .header("DD-APPLICATION-KEY", &self.app_key)
+                .query(&[
+                    ("start", start.to_string()),
+                    ("count", DASHBOARD_PAGE_SIZE.to_string()),
+                ])
+                .send()
+                .await?;
 
-        for dashboard in dashboards {
-            let id = dashboard["id"].as_str().unwrap_or("").to_string();
-            let title = dashboard["title"].as_str().unwrap_or("").to_string();
-            let description = dashboard["description"].as_str().unwrap_or("").to_string();
-            let author_handle = dashboard["author_handle"]
-                .as_str()
-                .unwrap_or("")
-                .to_string();
-            let created = dashboard["created_at"].as_str().map(|s| s.to_string());
+            if !response.status().is_success() {
+                anyhow::bail!("Failed to fetch dashboards: {}", response.status());
+            }
 
-            let mut metadata = serde_json::Map::new();
-            metadata.insert(
-                "author".to_string(),
-                serde_json::Value::String(author_handle),
-            );
-
-            let text = if description.is_empty() {
-                title.clone()
-            } else {
-                format!("{}\n\n{}", title, description)
-            };
-
-            docs.push(RagDocument {
-                id: format!("dashboard_{}", id),
-                title,
-                text,
-                source_uri: format!("https://app.{}/dashboard/{}", self.site, id),
-                kind: crate::domain::SourceKind::Dashboard,
-                timestamp: created,
-                service: String::new(),
-                environment: String::new(),
-                metadata,
-            });
+            let result: serde_json::Value = response.json().await?;
+            let dashboards = result["dashboards"].as_array().ok_or_else(|| {
+                anyhow::anyhow!("Unexpected dashboard list response: missing dashboards")
+            })?;
+            docs.extend(dashboards.iter().map(|d| self.dashboard_document(d)));
+            if (dashboards.len() as u64) < DASHBOARD_PAGE_SIZE {
+                break;
+            }
+            start += dashboards.len() as u64;
         }
 
         Ok(docs)
+    }
+
+    fn dashboard_document(&self, dashboard: &serde_json::Value) -> RagDocument {
+        let id = dashboard["id"].as_str().unwrap_or("").to_string();
+        let title = dashboard["title"].as_str().unwrap_or("").to_string();
+        let description = dashboard["description"].as_str().unwrap_or("").to_string();
+        let author_handle = dashboard["author_handle"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+        let created = dashboard["created_at"].as_str().map(|s| s.to_string());
+
+        let mut metadata = serde_json::Map::new();
+        metadata.insert(
+            "author".to_string(),
+            serde_json::Value::String(author_handle),
+        );
+
+        let text = if description.is_empty() {
+            title.clone()
+        } else {
+            format!("{}\n\n{}", title, description)
+        };
+
+        RagDocument {
+            id: format!("dashboard_{}", id),
+            title,
+            text,
+            source_uri: format!("https://app.{}/dashboard/{}", self.site, id),
+            kind: crate::domain::SourceKind::Dashboard,
+            timestamp: created,
+            service: String::new(),
+            environment: String::new(),
+            metadata,
+        }
     }
 
     pub async fn list_metrics(&self, from_iso: &str, to_iso: &str) -> Result<Vec<RagDocument>> {
@@ -446,87 +507,102 @@ impl Datadog {
         Ok(docs)
     }
 
+    /// Fetches all SLOs with `GET /api/v1/slo`, following `offset`/`limit`
+    /// pagination until a short page is returned.
     pub async fn list_slos(&self) -> Result<Vec<RagDocument>> {
         let url = format!("{}/api/v1/slo", self.api_base);
-        let response = self
-            .http
-            .get(&url)
-            .header("DD-API-KEY", &self.api_key)
-            .header("DD-APPLICATION-KEY", &self.app_key)
-            .send()
-            .await?;
-
-        if !response.status().is_success() {
-            anyhow::bail!("Failed to fetch SLOs: {}", response.status());
-        }
-
-        let result: serde_json::Value = response.json().await?;
-        let empty_vec = vec![];
-        let slos = result["data"].as_array().unwrap_or(&empty_vec);
         let mut docs = Vec::new();
+        let mut offset: u64 = 0;
+        loop {
+            let response = self
+                .http
+                .get(&url)
+                .header("DD-API-KEY", &self.api_key)
+                .header("DD-APPLICATION-KEY", &self.app_key)
+                .query(&[
+                    ("offset", offset.to_string()),
+                    ("limit", SLO_PAGE_SIZE.to_string()),
+                ])
+                .send()
+                .await?;
 
-        for slo in slos {
-            let id = slo["id"].as_str().unwrap_or("").to_string();
-            let name = slo["name"].as_str().unwrap_or("").to_string();
-            let description = slo["description"].as_str().unwrap_or("").to_string();
-            let slo_type = slo["type"].as_str().unwrap_or("").to_string();
-            let target = slo["thresholds"]
+            if !response.status().is_success() {
+                anyhow::bail!("Failed to fetch SLOs: {}", response.status());
+            }
+
+            let result: serde_json::Value = response.json().await?;
+            let slos = result["data"]
                 .as_array()
-                .and_then(|arr| arr.first())
-                .and_then(|t| t["target"].as_f64())
-                .unwrap_or(0.0);
-
-            let tags = slo["tags"]
-                .as_array()
-                .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
-                .unwrap_or_default();
-
-            let service = tags
-                .iter()
-                .find(|t| t.starts_with("service:"))
-                .and_then(|t| t.strip_prefix("service:"))
-                .unwrap_or("")
-                .to_string();
-
-            let environment = tags
-                .iter()
-                .find(|t| t.starts_with("env:"))
-                .and_then(|t| t.strip_prefix("env:"))
-                .unwrap_or("")
-                .to_string();
-
-            let mut metadata = serde_json::Map::new();
-            metadata.insert(
-                "slo_type".to_string(),
-                serde_json::Value::String(slo_type.clone()),
-            );
-            metadata.insert("target".to_string(), serde_json::json!(target));
-            metadata.insert("tags".to_string(), serde_json::json!(tags));
-
-            // Thresholds are reported as percentages, e.g. 99.9.
-            let text = if description.is_empty() {
-                format!("{}\n\nType: {}\nTarget: {}%", name, slo_type, target)
-            } else {
-                format!(
-                    "{}\n\n{}\n\nType: {}\nTarget: {}%",
-                    name, description, slo_type, target
-                )
-            };
-
-            docs.push(RagDocument {
-                id: format!("slo_{}", id),
-                title: name,
-                text,
-                source_uri: format!("https://app.{}/slo/{}", self.site, id),
-                kind: crate::domain::SourceKind::SLO,
-                timestamp: None,
-                service,
-                environment,
-                metadata,
-            });
+                .ok_or_else(|| anyhow::anyhow!("Unexpected SLO list response: missing data"))?;
+            docs.extend(slos.iter().map(|slo| self.slo_document(slo)));
+            if (slos.len() as u64) < SLO_PAGE_SIZE {
+                break;
+            }
+            offset += slos.len() as u64;
         }
 
         Ok(docs)
+    }
+
+    fn slo_document(&self, slo: &serde_json::Value) -> RagDocument {
+        let id = slo["id"].as_str().unwrap_or("").to_string();
+        let name = slo["name"].as_str().unwrap_or("").to_string();
+        let description = slo["description"].as_str().unwrap_or("").to_string();
+        let slo_type = slo["type"].as_str().unwrap_or("").to_string();
+        let target = slo["thresholds"]
+            .as_array()
+            .and_then(|arr| arr.first())
+            .and_then(|t| t["target"].as_f64())
+            .unwrap_or(0.0);
+
+        let tags = slo["tags"]
+            .as_array()
+            .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
+            .unwrap_or_default();
+
+        let service = tags
+            .iter()
+            .find(|t| t.starts_with("service:"))
+            .and_then(|t| t.strip_prefix("service:"))
+            .unwrap_or("")
+            .to_string();
+
+        let environment = tags
+            .iter()
+            .find(|t| t.starts_with("env:"))
+            .and_then(|t| t.strip_prefix("env:"))
+            .unwrap_or("")
+            .to_string();
+
+        let mut metadata = serde_json::Map::new();
+        metadata.insert(
+            "slo_type".to_string(),
+            serde_json::Value::String(slo_type.clone()),
+        );
+        metadata.insert("target".to_string(), serde_json::json!(target));
+        metadata.insert("tags".to_string(), serde_json::json!(tags));
+
+        // Thresholds are reported as percentages, e.g. 99.9.
+        let text = if description.is_empty() {
+            format!("{}\n\nType: {}\nTarget: {}%", name, slo_type, target)
+        } else {
+            format!(
+                "{}\n\n{}\n\nType: {}\nTarget: {}%",
+                name, description, slo_type, target
+            )
+        };
+
+        RagDocument {
+            id: format!("slo_{}", id),
+            title: name,
+            text,
+            source_uri: format!("https://app.{}/slo/{}", self.site, id),
+            kind: crate::domain::SourceKind::SLO,
+            timestamp: None,
+            service,
+            environment,
+            metadata,
+        }
     }
 }
 
@@ -952,7 +1028,10 @@ mod tests {
             .and(path("/api/v1/monitor"))
             .and(header("DD-API-KEY", "test_api_key"))
             .and(header("DD-APPLICATION-KEY", "test_app_key"))
+            .and(query_param("page", "0"))
+            .and(query_param("page_size", "1000"))
             .respond_with(ResponseTemplate::new(200).set_body_json(fixture("monitors.json")))
+            .expect(1)
             .mount(&server)
             .await;
 
@@ -967,6 +1046,41 @@ mod tests {
         );
     }
 
+    /// A full page of `n` synthetic entries built by `entry(i)`.
+    fn full_page(n: u64, entry: impl Fn(u64) -> serde_json::Value) -> serde_json::Value {
+        serde_json::Value::Array((0..n).map(entry).collect())
+    }
+
+    #[tokio::test]
+    async fn test_get_monitors_follows_pagination() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/monitor"))
+            .and(query_param("page", "0"))
+            .and(query_param("page_size", "1000"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(full_page(
+                MONITOR_PAGE_SIZE,
+                |i| serde_json::json!({"id": i + 1, "name": format!("monitor {}", i + 1)}),
+            )))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/monitor"))
+            .and(query_param("page", "1"))
+            .and(query_param("page_size", "1000"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(fixture("monitors.json")))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let docs = mock_client(&server).get_monitors().await.unwrap();
+
+        assert_eq!(docs.len(), 1002);
+        assert_eq!(docs[0].id, "monitor_1");
+        assert_eq!(docs[1000].id, "monitor_34822915");
+    }
+
     #[tokio::test]
     async fn test_get_monitors_error_handling() {
         let server = MockServer::start().await;
@@ -979,21 +1093,53 @@ mod tests {
         assert!(mock_client(&server).get_monitors().await.is_err());
     }
 
-    #[tokio::test]
-    async fn test_search_logs_from_fixture() {
-        let server = MockServer::start().await;
+    const LOGS_CURSOR_1: &str = "eyJhZnRlciI6IkFRQUFBWUFaZGJvSjdkR3dOZ0FBQUFCQldVRmFaR0p5TVVGQlEwczRPRU4zWW1aMVVESlJRVUUifQ";
+    const LOGS_CURSOR_2: &str = "eyJhZnRlciI6IkFRQUFBWUFaZGJvSzdkR3dPUUFBQUFCQldVRmFaR0p5TVVGQlEwczRPRU4zWW1aMVVESlJRVVEifQ";
+
+    /// Matches a log search for the given window, oldest first, at the maximum page size,
+    /// carrying `cursor` (or no cursor for the first page).
+    fn log_search(cursor: Option<&'static str>) -> wiremock::MockBuilder {
         Mock::given(method("POST"))
             .and(path("/api/v2/logs/events/search"))
+            .and(header("DD-API-KEY", "test_api_key"))
+            .and(header("DD-APPLICATION-KEY", "test_app_key"))
             .and(body_partial_json(serde_json::json!({
                 "filter": {
                     "from": "2022-04-11T16:00:00Z",
                     "to": "2022-04-11T17:00:00Z",
                     "query": "status:error OR status:warn"
                 },
-                "page": {"limit": 100},
-                "sort": "-timestamp"
+                "page": {"limit": 1000},
+                "sort": "timestamp"
             })))
-            .respond_with(ResponseTemplate::new(200).set_body_json(fixture("logs_search.json")))
+            .and(move |req: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+                body["page"]["cursor"].as_str() == cursor
+            })
+    }
+
+    #[tokio::test]
+    async fn test_search_logs_follows_cursor_pagination() {
+        let server = MockServer::start().await;
+        log_search(None)
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(fixture("logs_search_page1.json")),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        log_search(Some(LOGS_CURSOR_1))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(fixture("logs_search_page2.json")),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        log_search(Some(LOGS_CURSOR_2))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(fixture("logs_search_page3.json")),
+            )
+            .expect(1)
             .mount(&server)
             .await;
 
@@ -1002,10 +1148,14 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(docs.len(), 2);
+        let ids: Vec<_> = docs.iter().map(|d| d.id.as_str()).collect();
         assert_eq!(
-            docs[0].id,
-            "log_AQAAAYAZdbh47dGwNwAAAABBWUFaZGJyMUFBQ0s4OEN3YmZ1UDJRQUI"
+            ids,
+            [
+                "log_AQAAAYAZdbh47dGwNwAAAABBWUFaZGJyMUFBQ0s4OEN3YmZ1UDJRQUI",
+                "log_AQAAAYAZdboJ7dGwNgAAAABBWUFaZGJyMUFBQ0s4OEN3YmZ1UDJRQUE",
+                "log_AQAAAYAZdboK7dGwOAAAAABBWUFaZGJyMUFBQ0s4OEN3YmZ1UDJRQUM",
+            ]
         );
         assert_eq!(docs[0].environment, "integrations-lab");
         assert_eq!(docs[0].metadata["status"], "ok");
@@ -1013,12 +1163,74 @@ mod tests {
             docs[0].timestamp.as_deref(),
             Some("2022-04-11T16:29:47.000Z")
         );
+        assert_eq!(
+            docs[2].timestamp.as_deref(),
+            Some("2022-04-11T16:29:47.402Z")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_search_logs_stops_without_next_cursor() {
+        let server = MockServer::start().await;
+        let mut body = fixture("logs_search_page1.json");
+        body.as_object_mut().unwrap().remove("meta");
+        log_search(None)
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let docs = mock_client(&server)
+            .search_logs("2022-04-11T16:00:00Z", "2022-04-11T17:00:00Z")
+            .await
+            .unwrap();
+        assert_eq!(docs.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_search_logs_rejects_repeated_cursor() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v2/logs/events/search"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(fixture("logs_search_page1.json")),
+            )
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let result = mock_client(&server)
+            .search_logs("2022-04-11T16:00:00Z", "2022-04-11T17:00:00Z")
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_search_logs_error_on_later_page() {
+        let server = MockServer::start().await;
+        log_search(None)
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(fixture("logs_search_page1.json")),
+            )
+            .mount(&server)
+            .await;
+        log_search(Some(LOGS_CURSOR_1))
+            .respond_with(ResponseTemplate::new(429))
+            .mount(&server)
+            .await;
+
+        // A partial result must not be reported as success.
+        let result = mock_client(&server)
+            .search_logs("2022-04-11T16:00:00Z", "2022-04-11T17:00:00Z")
+            .await;
+        assert!(result.is_err());
     }
 
     #[tokio::test]
     async fn test_search_logs_prefers_service_attribute() {
         let server = MockServer::start().await;
-        let mut body = fixture("logs_search.json");
+        let mut body = fixture("logs_search_page1.json");
+        body.as_object_mut().unwrap().remove("meta");
         body["data"][0]["attributes"]["service"] = serde_json::json!("sinatra-app");
         Mock::given(method("POST"))
             .and(path("/api/v2/logs/events/search"))
@@ -1040,7 +1252,10 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/v1/dashboard"))
+            .and(query_param("start", "0"))
+            .and(query_param("count", "100"))
             .respond_with(ResponseTemplate::new(200).set_body_json(fixture("dashboards.json")))
+            .expect(1)
             .mount(&server)
             .await;
 
@@ -1085,7 +1300,10 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/v1/slo"))
+            .and(query_param("offset", "0"))
+            .and(query_param("limit", "1000"))
             .respond_with(ResponseTemplate::new(200).set_body_json(fixture("slos.json")))
+            .expect(1)
             .mount(&server)
             .await;
 
@@ -1095,5 +1313,67 @@ mod tests {
         assert_eq!(docs[0].id, "slo_c2ce7fb6030c5c0b8035d1ce94dec12c");
         assert!(docs[0].text.contains("Target: 95%"), "{}", docs[0].text);
         assert_eq!(docs[0].metadata["target"], 95.0);
+    }
+
+    #[tokio::test]
+    async fn test_list_dashboards_follows_pagination() {
+        let server = MockServer::start().await;
+        let mut first = fixture("dashboards.json");
+        first["dashboards"] = full_page(
+            DASHBOARD_PAGE_SIZE,
+            |i| serde_json::json!({"id": format!("dash-{}", i), "title": format!("Dashboard {}", i)}),
+        );
+        Mock::given(method("GET"))
+            .and(path("/api/v1/dashboard"))
+            .and(query_param("start", "0"))
+            .and(query_param("count", "100"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(first))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/dashboard"))
+            .and(query_param("start", "100"))
+            .and(query_param("count", "100"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(fixture("dashboards.json")))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let docs = mock_client(&server).list_dashboards().await.unwrap();
+
+        assert_eq!(docs.len(), 101);
+        assert_eq!(docs[100].id, "dashboard_npw-6di-usv");
+    }
+
+    #[tokio::test]
+    async fn test_list_slos_follows_pagination() {
+        let server = MockServer::start().await;
+        let mut first = fixture("slos.json");
+        first["data"] = full_page(
+            SLO_PAGE_SIZE,
+            |i| serde_json::json!({"id": format!("slo{}", i), "name": format!("SLO {}", i)}),
+        );
+        Mock::given(method("GET"))
+            .and(path("/api/v1/slo"))
+            .and(query_param("offset", "0"))
+            .and(query_param("limit", "1000"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(first))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/slo"))
+            .and(query_param("offset", "1000"))
+            .and(query_param("limit", "1000"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(fixture("slos.json")))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let docs = mock_client(&server).list_slos().await.unwrap();
+
+        assert_eq!(docs.len(), 1001);
+        assert_eq!(docs[1000].id, "slo_c2ce7fb6030c5c0b8035d1ce94dec12c");
     }
 }
