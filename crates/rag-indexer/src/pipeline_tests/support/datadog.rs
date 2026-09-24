@@ -1,0 +1,312 @@
+//! A fake Datadog API serving a corpus in the shape of real responses, so the real
+//! adapters (`rag_core::datadog`) parse it: monitors, dashboards, SLOs, metrics,
+//! incidents and logs, each with the pagination the adapter follows, plus the live
+//! time-series and log queries of `/ask`.
+
+use chrono::{DateTime, Duration, Utc};
+use rag_core::datadog::Datadog;
+use serde_json::{Value, json};
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Arc;
+use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+/// The indexing query the adapter must send for logs.
+const LOG_INDEX_QUERY: &str = "status:error OR status:warn";
+
+/// Datadog objects as the list/search endpoints return them.
+#[derive(Debug, Clone, Default)]
+pub struct Corpus {
+    pub monitors: Vec<Value>,
+    pub dashboards: Vec<Value>,
+    pub slos: Vec<Value>,
+    pub metrics: Vec<String>,
+    /// Incident objects (the `data` of each search result).
+    pub incidents: Vec<Value>,
+    /// Log events (`{"id", "type": "log", "attributes": {...}}`).
+    pub logs: Vec<Value>,
+}
+
+pub fn fixture_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../rag-core/tests/fixtures/datadog")
+}
+
+fn read_json(path: PathBuf) -> Value {
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path:?}: {e}"));
+    serde_json::from_str(&text).unwrap_or_else(|e| panic!("{path:?}: {e}"))
+}
+
+impl Corpus {
+    /// Every recorded response in `rag-core/tests/fixtures/datadog`.
+    pub fn fixtures() -> Self {
+        let f = |name: &str| read_json(fixture_dir().join(name));
+        let array = |v: &Value| v.as_array().cloned().unwrap_or_default();
+        let incidents = ["incidents_search_page1.json", "incidents_search_page2.json"]
+            .iter()
+            .flat_map(|p| array(&f(p)["data"]["attributes"]["incidents"]))
+            .map(|i| i["data"].clone())
+            .collect();
+        let logs = ["logs_search_page1.json", "logs_search_page2.json"]
+            .iter()
+            .flat_map(|p| array(&f(p)["data"]))
+            .collect();
+        Self {
+            monitors: array(&f("monitors.json")),
+            dashboards: array(&f("dashboards.json")["dashboards"]),
+            slos: array(&f("slos.json")["data"]),
+            metrics: array(&f("metrics.json")["metrics"])
+                .iter()
+                .filter_map(|m| m.as_str().map(str::to_string))
+                .collect(),
+            incidents,
+            logs,
+        }
+    }
+
+    /// A corpus file with the same top-level keys (see `tests/eval/corpus.json`).
+    pub fn from_json(v: &Value) -> Self {
+        let array = |k: &str| v[k].as_array().cloned().unwrap_or_default();
+        Self {
+            monitors: array("monitors"),
+            dashboards: array("dashboards"),
+            slos: array("slos"),
+            metrics: array("metrics")
+                .iter()
+                .filter_map(|m| m.as_str().map(str::to_string))
+                .collect(),
+            incidents: array("incidents"),
+            logs: array("logs"),
+        }
+    }
+
+    pub fn extend(&mut self, other: Corpus) {
+        self.monitors.extend(other.monitors);
+        self.dashboards.extend(other.dashboards);
+        self.slos.extend(other.slos);
+        self.metrics.extend(other.metrics);
+        self.incidents.extend(other.incidents);
+        self.logs.extend(other.logs);
+    }
+}
+
+fn param(req: &Request, name: &str) -> Option<usize> {
+    req.url
+        .query_pairs()
+        .find(|(k, _)| k == name)
+        .and_then(|(_, v)| v.parse().ok())
+}
+
+fn page(items: &[Value], offset: usize, size: usize) -> Vec<Value> {
+    items.iter().skip(offset).take(size).cloned().collect()
+}
+
+fn ts(v: &Value) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(v.as_str()?)
+        .ok()
+        .map(|d| d.with_timezone(&Utc))
+}
+
+#[derive(Clone)]
+struct IndexApi(Arc<Corpus>);
+
+impl IndexApi {
+    fn handle(&self, req: &Request) -> Result<ResponseTemplate, String> {
+        if req.headers.get("DD-API-KEY").is_none()
+            || req.headers.get("DD-APPLICATION-KEY").is_none()
+        {
+            return Ok(ResponseTemplate::new(403));
+        }
+        let c = &self.0;
+        let json = |v: Value| Ok(ResponseTemplate::new(200).set_body_json(v));
+        match (req.method.as_str(), req.url.path()) {
+            ("GET", "/api/v1/monitor") => {
+                let size = param(req, "page_size").ok_or("page_size")?;
+                let page_no = param(req, "page").ok_or("page")?;
+                json(Value::Array(page(&c.monitors, page_no * size, size)))
+            }
+            ("GET", "/api/v1/dashboard") => {
+                let (start, count) = (
+                    param(req, "start").ok_or("start")?,
+                    param(req, "count").ok_or("count")?,
+                );
+                json(json!({"dashboards": page(&c.dashboards, start, count)}))
+            }
+            ("GET", "/api/v1/slo") => {
+                let (offset, limit) = (
+                    param(req, "offset").ok_or("offset")?,
+                    param(req, "limit").ok_or("limit")?,
+                );
+                json(json!({"data": page(&c.slos, offset, limit), "error": null}))
+            }
+            ("GET", "/api/v1/metrics") => {
+                param(req, "from").ok_or("from")?;
+                json(json!({"metrics": c.metrics}))
+            }
+            ("GET", "/api/v2/incidents/search") => {
+                let mut sorted = c.incidents.clone();
+                sorted.sort_by_key(|i| std::cmp::Reverse(ts(&i["attributes"]["created"])));
+                let offset = param(req, "page[offset]").ok_or("page[offset]")?;
+                let size = param(req, "page[size]").ok_or("page[size]")?;
+                let items: Vec<Value> = page(&sorted, offset, size)
+                    .into_iter()
+                    .map(|i| json!({"data": i}))
+                    .collect();
+                let next = offset + items.len();
+                json(json!({
+                    "data": {"type": "incidents_search_results",
+                             "attributes": {"facets": {}, "incidents": items, "total": sorted.len()}},
+                    "meta": {"pagination": {"offset": offset, "next_offset": next, "size": items.len()}}
+                }))
+            }
+            ("POST", "/api/v2/logs/events/search") => {
+                let body: Value = serde_json::from_slice(&req.body).map_err(|e| e.to_string())?;
+                let f = &body["filter"];
+                if f["query"] != LOG_INDEX_QUERY {
+                    return Err(format!("unexpected log query {}", f["query"]));
+                }
+                let (from, to) = (ts(&f["from"]).ok_or("from")?, ts(&f["to"]).ok_or("to")?);
+                let mut logs: Vec<Value> = c
+                    .logs
+                    .iter()
+                    .filter(|l| {
+                        ts(&l["attributes"]["timestamp"]).is_some_and(|t| t >= from && t <= to)
+                    })
+                    .cloned()
+                    .collect();
+                logs.sort_by_key(|l| ts(&l["attributes"]["timestamp"]));
+                let offset: usize = body["page"]["cursor"]
+                    .as_str()
+                    .map(|c| c.parse().map_err(|_| "bad cursor"))
+                    .transpose()?
+                    .unwrap_or(0);
+                let limit = body["page"]["limit"].as_u64().ok_or("limit")? as usize;
+                let data = page(&logs, offset, limit);
+                let next = offset + data.len();
+                let mut resp = json!({"data": data, "meta": {"page": {}}});
+                if next < logs.len() {
+                    resp["meta"]["page"]["after"] = json!(next.to_string());
+                }
+                json(resp)
+            }
+            (m, p) => Err(format!("unsupported endpoint {m} {p}")),
+        }
+    }
+}
+
+impl Respond for IndexApi {
+    fn respond(&self, req: &Request) -> ResponseTemplate {
+        self.handle(req).unwrap_or_else(|msg| {
+            ResponseTemplate::new(400)
+                .set_body_json(json!({"errors": [format!("fake Datadog: {msg}")]}))
+        })
+    }
+}
+
+/// Serves `corpus` like the Datadog API and returns a client for it.
+pub async fn serve(corpus: Corpus) -> (MockServer, Datadog) {
+    let server = MockServer::start().await;
+    Mock::given(wiremock::matchers::any())
+        .respond_with(IndexApi(Arc::new(corpus)))
+        .mount(&server)
+        .await;
+    let dd = client(&server);
+    (server, dd)
+}
+
+pub fn client(server: &MockServer) -> Datadog {
+    let mut dd = Datadog::new("api-key".into(), "app-key".into(), "datadoghq.eu".into());
+    dd.api_base = server.uri();
+    dd.retry = rag_core::resilience::RetryPolicy::none();
+    dd
+}
+
+/// Live data for one question: series per metric query and error/warn logs per log
+/// query. Unknown queries return an empty series or no logs.
+#[derive(Debug, Clone, Default)]
+pub struct Live {
+    /// `avg:metric{service:x,env:y}` -> hourly points `(unix ms, value)`.
+    pub series: HashMap<String, Vec<(i64, f64)>>,
+    /// `service:x env:y status:(error OR warn)` -> log events.
+    pub logs: HashMap<String, Vec<Value>>,
+}
+
+impl Live {
+    /// Hourly points from `from` to `to` at `baseline`, with `spikes` (hour start,
+    /// value) replacing the baseline value.
+    pub fn hourly(
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+        baseline: f64,
+        spikes: &[(DateTime<Utc>, f64)],
+    ) -> Vec<(i64, f64)> {
+        let mut out = vec![];
+        let mut t = from;
+        while t < to {
+            let v = spikes
+                .iter()
+                .find(|(at, _)| *at == t)
+                .map_or(baseline, |(_, v)| *v);
+            out.push((t.timestamp_millis(), v));
+            t += Duration::hours(1);
+        }
+        out
+    }
+}
+
+#[derive(Clone)]
+struct LiveApi(Arc<Live>);
+
+impl Respond for LiveApi {
+    fn respond(&self, req: &Request) -> ResponseTemplate {
+        match req.url.path() {
+            "/api/v1/query" => {
+                let arg = |name: &str| {
+                    req.url
+                        .query_pairs()
+                        .find(|(k, _)| k == name)
+                        .map(|(_, v)| v.to_string())
+                        .unwrap_or_default()
+                };
+                let query = arg("query");
+                let secs = |name: &str| arg(name).parse::<i64>().unwrap_or_default() * 1000;
+                let (from, to) = (secs("from"), secs("to"));
+                let series: Vec<Value> = self
+                    .0
+                    .series
+                    .get(&query)
+                    .map(|points| {
+                        let metric = query.split(['{', ':']).nth(1).unwrap_or_default();
+                        vec![json!({
+                            "metric": metric, "expression": query, "scope": "",
+                            "interval": 3600,
+                            "pointlist": points
+                                .iter()
+                                .filter(|(t, _)| (from..=to).contains(t))
+                                .map(|(t, v)| json!([t, v]))
+                                .collect::<Vec<_>>()
+                        })]
+                    })
+                    .unwrap_or_default();
+                ResponseTemplate::new(200).set_body_json(json!({"status": "ok", "series": series}))
+            }
+            "/api/v2/logs/events/search" => {
+                let body: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
+                let query = body["filter"]["query"].as_str().unwrap_or_default();
+                let data = self.0.logs.get(query).cloned().unwrap_or_default();
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"data": data, "meta": {"page": {}}}))
+            }
+            _ => ResponseTemplate::new(404),
+        }
+    }
+}
+
+/// Serves `live` for the API's live-evidence queries.
+pub async fn serve_live(live: Live) -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(wiremock::matchers::any())
+        .respond_with(LiveApi(Arc::new(live)))
+        .mount(&server)
+        .await;
+    server
+}

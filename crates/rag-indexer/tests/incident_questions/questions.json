@@ -1,0 +1,248 @@
+{
+  "version": 1,
+  "description": "Incident questions for the /ask quality harness (crates/rag-indexer/src/pipeline_tests/quality.rs). Each question is answered by the real pipeline over corpus.json plus the recorded fixtures, with deterministic embeddings, a canned planner reply ('plan') and a canned answer model that cites 'answer'. See docs/DEVELOPMENT.md#incident-question-set for the metrics and how to add questions or change thresholds.",
+  "defaults": {"now": "2026-03-12T09:00:00Z", "timezone": "Europe/Stockholm"},
+  "thresholds": {
+    "recallAtK": 0.95,
+    "precisionAtR": 0.9,
+    "distractorExclusion": 1.0,
+    "scopeAccuracy": 1.0,
+    "citationValidity": 1.0,
+    "citationAccuracy": 1.0,
+    "observationRecall": 1.0,
+    "negativeControlsFlagged": 1.0
+  },
+  "questions": [
+    {
+      "id": "q01-checkout-slow-yesterday",
+      "question": "Why was checkout slow yesterday?",
+      "plan": {"intent": "rootCauseWindow", "service": "checkout", "environment": "prod", "rewrittenQuery": "checkout prod latency slow timeout"},
+      "expect": {
+        "scope": {"service": "checkout", "environment": "prod", "fromUtc": "2026-03-10T23:00:00Z", "toUtc": "2026-03-11T23:00:00Z", "kinds": []},
+        "mustRetrieve": ["incident_inc-checkout-latency", "monitor_1001", "log_co-1", "log_co-2"],
+        "mayRetrieve": ["slo_slo-checkout-avail"],
+        "mustNotRetrieve": ["monitor_1002", "incident_inc-checkout-latency-stg", "incident_inc-checkout-deploy", "log_co-stg", "log_co-old", "incident_inc-worker-backlog", "monitor_1003", "log_worker-1"],
+        "timeline": {"status": "collected", "observations": [
+          {"id": "obs-2", "kind": "spike", "service": "checkout"},
+          {"id": "obs-3", "kind": "logBurst", "service": "checkout"}
+        ]}
+      },
+      "live": {
+        "metrics": [{"query": "avg:trace.http.request.duration{service:checkout,env:prod}", "baseline": 0.2,
+                     "spikes": [{"at": "2026-03-11T10:00:00Z", "value": 1.5}, {"at": "2026-03-11T11:00:00Z", "value": 1.6}]}],
+        "logs": [{"query": "service:checkout env:prod status:(error OR warn)",
+                  "bursts": [{"at": "2026-03-11T10:10:00Z", "count": 8, "message": "db connection pool exhausted: 50/50 connections in use"}]}]
+      },
+      "hypotheses": [{"statement": "Database connection pool exhaustion slowed checkout", "observationIds": ["obs-2", "obs-3"]}],
+      "answer": {"citeDocuments": ["incident_inc-checkout-latency", "monitor_1001", "log_co-2"], "citeObservations": ["obs-2", "obs-3"]}
+    },
+    {
+      "id": "q02-checkout-staging",
+      "question": "Were there checkout latency problems in staging yesterday?",
+      "plan": {"intent": "incidentSummary", "service": "checkout", "environment": "staging"},
+      "expect": {
+        "scope": {"service": "checkout", "environment": "staging", "fromUtc": "2026-03-10T23:00:00Z", "toUtc": "2026-03-11T23:00:00Z", "kinds": []},
+        "mustRetrieve": ["incident_inc-checkout-latency-stg", "monitor_1002", "log_co-stg"],
+        "mayRetrieve": ["slo_slo-checkout-avail-stg"],
+        "mustNotRetrieve": ["incident_inc-checkout-latency", "monitor_1001", "log_co-1", "log_co-2", "slo_slo-checkout-avail"],
+        "timeline": {"status": "skipped"}
+      },
+      "answer": {"citeDocuments": ["incident_inc-checkout-latency-stg", "monitor_1002"]}
+    },
+    {
+      "id": "q03-auth-incidents",
+      "question": "Which incidents hit auth-api yesterday?",
+      "note": "Datadog reports the incident's service as 'Auth-API'; it is only found because the writer lowercases like the planner.",
+      "plan": {"intent": "incidentSummary", "service": "auth-api", "environment": "prod", "filters": ["kind:incident"]},
+      "expect": {
+        "scope": {"service": "auth-api", "environment": "prod", "fromUtc": "2026-03-10T23:00:00Z", "toUtc": "2026-03-11T23:00:00Z", "kinds": ["incident"]},
+        "mustRetrieve": ["incident_inc-auth-login"],
+        "mustNotRetrieve": ["log_auth-1", "monitor_1006", "slo_slo-auth-login", "incident_inc-checkout-latency"]
+      },
+      "answer": {"citeDocuments": ["incident_inc-auth-login"]}
+    },
+    {
+      "id": "q04-auth-logs",
+      "question": "Show auth-api error logs from yesterday",
+      "plan": {"intent": "semanticLogSearch", "service": "Auth-API", "environment": "PROD", "filters": ["kind:logs"]},
+      "expect": {
+        "scope": {"service": "auth-api", "environment": "prod", "fromUtc": "2026-03-10T23:00:00Z", "toUtc": "2026-03-11T23:00:00Z", "kinds": ["logs"]},
+        "mustRetrieve": ["log_auth-1"],
+        "mustNotRetrieve": ["incident_inc-auth-login", "monitor_1006", "log_co-1"]
+      },
+      "answer": {"citeDocuments": ["log_auth-1"]}
+    },
+    {
+      "id": "q05-checkout-slo",
+      "question": "What does the checkout availability SLO target?",
+      "plan": {"intent": "unknown", "service": "checkout", "environment": "prod", "filters": ["kind:slo"]},
+      "expect": {
+        "scope": {"service": "checkout", "environment": "prod", "fromUtc": null, "toUtc": null, "kinds": ["slo"]},
+        "mustRetrieve": ["slo_slo-checkout-avail"],
+        "mustNotRetrieve": ["slo_slo-checkout-avail-stg", "monitor_1001", "slo_slo-payments-latency"],
+        "timeline": {"status": "skipped"}
+      },
+      "answer": {"citeDocuments": ["slo_slo-checkout-avail"]}
+    },
+    {
+      "id": "q06-card-payments-today",
+      "question": "Why are card payments failing today?",
+      "note": "pay-long spans several chunks and multibyte text passes the 1500-byte excerpt cut; it must be one source.",
+      "plan": {"intent": "rootCauseWindow", "service": "payments", "environment": "prod"},
+      "expect": {
+        "scope": {"service": "payments", "environment": "prod", "fromUtc": "2026-03-11T23:00:00Z", "toUtc": "2026-03-12T23:00:00Z", "kinds": []},
+        "mustRetrieve": ["incident_inc-payments-card", "log_pay-1", "log_pay-long", "monitor_1004", "monitor_1005"],
+        "mayRetrieve": ["slo_slo-payments-latency"],
+        "mustNotRetrieve": ["incident_inc-checkout-latency", "log_co-1", "incident_inc-auth-login"],
+        "timeline": {"status": "collected", "observations": [
+          {"id": "obs-2", "kind": "logBurst", "service": "payments"},
+          {"id": "obs-3", "kind": "spike", "service": "payments"}
+        ]}
+      },
+      "live": {
+        "metrics": [{"query": "avg:payments.gateway.latency{service:payments,env:prod}", "baseline": 0.4,
+                     "spikes": [{"at": "2026-03-12T07:00:00Z", "value": 4.2}, {"at": "2026-03-12T08:00:00Z", "value": 3.9}]}],
+        "logs": [{"query": "service:payments env:prod status:(error OR warn)",
+                  "bursts": [{"at": "2026-03-12T07:05:00Z", "count": 12, "message": "決済ゲートウェイ タイムアウト (payment gateway timeout) 🚨"}]}]
+      },
+      "hypotheses": [{"statement": "Bank gateway timeouts failed card payments", "observationIds": ["obs-2", "obs-3"]}],
+      "answer": {"citeDocuments": ["incident_inc-payments-card", "monitor_1005", "log_pay-long"], "citeObservations": ["obs-2", "obs-3"]}
+    },
+    {
+      "id": "q07-worker-backlog",
+      "question": "Did the checkout-worker backlog cause problems yesterday?",
+      "note": "checkout-worker must not pull in checkout documents (exact keyword match).",
+      "plan": {"intent": "incidentSummary", "service": "checkout-worker", "environment": "prod"},
+      "expect": {
+        "scope": {"service": "checkout-worker", "environment": "prod", "fromUtc": "2026-03-10T23:00:00Z", "toUtc": "2026-03-11T23:00:00Z", "kinds": []},
+        "mustRetrieve": ["incident_inc-worker-backlog", "monitor_1003", "log_worker-1"],
+        "mustNotRetrieve": ["incident_inc-checkout-latency", "monitor_1001", "log_co-1", "log_co-2"]
+      },
+      "answer": {"citeDocuments": ["incident_inc-worker-backlog", "log_worker-1"]}
+    },
+    {
+      "id": "q08-payments-dashboard",
+      "question": "Which dashboard shows payments and bank gateway latency?",
+      "plan": {"intent": "dashboardLookup", "filters": ["kind:dashboard"]},
+      "expect": {
+        "scope": {"service": null, "environment": null, "fromUtc": null, "toUtc": null, "kinds": ["dashboard"]},
+        "mustRetrieve": ["dashboard_dash-payments"],
+        "mayRetrieve": ["dashboard_dash-checkout", "dashboard_npw-6di-usv"],
+        "mustNotRetrieve": ["monitor_1005"]
+      },
+      "answer": {"citeDocuments": ["dashboard_dash-payments"]}
+    },
+    {
+      "id": "q09-checkout-march-2",
+      "question": "What happened with checkout on 2 March?",
+      "plan": {"intent": "incidentSummary", "service": "checkout", "environment": "prod",
+               "window": {"fromUtc": "2026-03-01T23:00:00Z", "toUtc": "2026-03-02T23:00:00Z"}},
+      "expect": {
+        "scope": {"service": "checkout", "environment": "prod", "fromUtc": "2026-03-01T23:00:00Z", "toUtc": "2026-03-02T23:00:00Z", "kinds": []},
+        "mustRetrieve": ["incident_inc-checkout-deploy"],
+        "mayRetrieve": ["monitor_1001", "slo_slo-checkout-avail"],
+        "mustNotRetrieve": ["incident_inc-checkout-latency", "log_co-1", "log_co-2", "log_co-old"]
+      },
+      "answer": {"citeDocuments": ["incident_inc-checkout-deploy"]}
+    },
+    {
+      "id": "q10-gateway-metrics",
+      "question": "Which metrics do we collect for payments gateway latency?",
+      "plan": {"intent": "metricQuestion", "filters": ["kind:metrics"]},
+      "expect": {
+        "scope": {"service": null, "environment": null, "fromUtc": null, "toUtc": null, "kinds": ["metrics"]},
+        "mustRetrieve": ["metric_payments_gateway_latency"],
+        "mayRetrieve": ["metric_trace_http_request_duration", "metric_trace_http_request_errors", "metric_auth_login_failures",
+                        "metric_rabbitmq_queue_messages", "metric_system_cpu_idle", "metric_system_mem_free", "metric_aws_ec2_cpuutilization"],
+        "timeline": {"status": "skipped"}
+      },
+      "answer": {"citeDocuments": ["metric_payments_gateway_latency"]}
+    },
+    {
+      "id": "q11-explicit-scope",
+      "question": "Show checkout errors from yesterday",
+      "note": "Explicit request fields in the caller's casing win over the (empty) plan.",
+      "plan": {},
+      "request": {"service": "Checkout", "env": "PROD", "kinds": ["logs"]},
+      "expect": {
+        "scope": {"service": "checkout", "environment": "prod", "fromUtc": "2026-03-10T23:00:00Z", "toUtc": "2026-03-11T23:00:00Z", "kinds": ["logs"]},
+        "mustRetrieve": ["log_co-1", "log_co-2"],
+        "mustNotRetrieve": ["log_co-stg", "log_co-old", "incident_inc-checkout-latency", "monitor_1001", "log_worker-1"]
+      },
+      "answer": {"citeDocuments": ["log_co-1", "log_co-2"]}
+    },
+    {
+      "id": "q12-unicode-service",
+      "question": "Varför är sökmotor-indexeringen långsam?",
+      "note": "The planner rejects the non-ASCII service 'sökmotor' (Datadog tag charset), so only the environment scopes the search; the log is still found by content.",
+      "plan": {"intent": "rootCauseWindow", "service": "sökmotor", "environment": "prod"},
+      "expect": {
+        "scope": {"service": null, "environment": "prod", "fromUtc": null, "toUtc": null, "kinds": []},
+        "mustRetrieve": ["log_search-1"],
+        "mustNotRetrieve": ["dashboard_dash-checkout"],
+        "timeline": {"status": "skipped"}
+      },
+      "answer": {"citeDocuments": ["log_search-1"]}
+    },
+    {
+      "id": "q13-monitor-threshold",
+      "question": "What is the p95 latency alert threshold for checkout in prod?",
+      "plan": {"intent": "monitorExplanation", "service": "checkout", "environment": "prod", "filters": ["kind:monitor"]},
+      "expect": {
+        "scope": {"service": "checkout", "environment": "prod", "fromUtc": null, "toUtc": null, "kinds": ["monitor"]},
+        "mustRetrieve": ["monitor_1001"],
+        "mustNotRetrieve": ["monitor_1002", "monitor_1003", "slo_slo-checkout-avail"]
+      },
+      "answer": {"citeDocuments": ["monitor_1001"]}
+    },
+    {
+      "id": "q14-negative-control",
+      "question": "Summarize today's payments incident",
+      "note": "Negative control: the canned answer also cites a document number and an observation that do not exist; both must be reported in citationWarnings.",
+      "plan": {"intent": "incidentSummary", "service": "payments", "environment": "prod"},
+      "expect": {
+        "scope": {"service": "payments", "environment": "prod", "fromUtc": "2026-03-11T23:00:00Z", "toUtc": "2026-03-12T23:00:00Z", "kinds": []},
+        "mustRetrieve": ["incident_inc-payments-card"],
+        "mayRetrieve": ["monitor_1004", "monitor_1005", "slo_slo-payments-latency", "log_pay-1", "log_pay-long"],
+        "mustNotRetrieve": ["incident_inc-checkout-latency"],
+        "timeline": {"status": "skipped"}
+      },
+      "answer": {"citeDocuments": ["incident_inc-payments-card"], "extra": "See also [DOC #42] and [obs-9].",
+                 "expectCitationWarnings": ["DOC #42", "obs-9"]}
+    },
+    {
+      "id": "q15-auth-logins-yesterday",
+      "question": "Why did auth-api logins fail yesterday?",
+      "plan": {"intent": "rootCauseWindow", "service": "AUTH-API", "environment": "Prod"},
+      "expect": {
+        "scope": {"service": "auth-api", "environment": "prod", "fromUtc": "2026-03-10T23:00:00Z", "toUtc": "2026-03-11T23:00:00Z", "kinds": []},
+        "mustRetrieve": ["incident_inc-auth-login", "log_auth-1", "monitor_1006"],
+        "mayRetrieve": ["slo_slo-auth-login"],
+        "mustNotRetrieve": ["incident_inc-checkout-latency", "log_co-2"],
+        "timeline": {"status": "collected", "observations": [
+          {"id": "obs-2", "kind": "spike", "service": "auth-api"},
+          {"id": "obs-3", "kind": "logBurst", "service": "auth-api"}
+        ]}
+      },
+      "live": {
+        "metrics": [{"query": "sum:auth.login.failures{service:auth-api,env:prod}", "baseline": 5,
+                     "spikes": [{"at": "2026-03-11T14:00:00Z", "value": 450}, {"at": "2026-03-11T15:00:00Z", "value": 380}]}],
+        "logs": [{"query": "service:auth-api env:prod status:(error OR warn)",
+                  "bursts": [{"at": "2026-03-11T14:01:00Z", "count": 10, "message": "login failed: token signature invalid för användare åsa.öberg@example.se"}]}]
+      },
+      "hypotheses": [{"statement": "Rotated signing keys invalidated tokens", "observationIds": ["obs-2", "obs-3"]}],
+      "answer": {"citeDocuments": ["incident_inc-auth-login", "log_auth-1"], "citeObservations": ["obs-2", "obs-3"]}
+    },
+    {
+      "id": "q16-dashboards-by-service",
+      "question": "Which dashboards cover payments in prod?",
+      "knownGap": "Dashboards carry no service or environment (the adapter has no tags to read), so any service/environment scope excludes every dashboard. Reported, not counted in the aggregates.",
+      "plan": {"intent": "dashboardLookup", "service": "payments", "environment": "prod", "filters": ["kind:dashboard"]},
+      "expect": {
+        "scope": {"service": "payments", "environment": "prod", "fromUtc": null, "toUtc": null, "kinds": ["dashboard"]},
+        "mustRetrieve": ["dashboard_dash-payments"]
+      },
+      "answer": {"citeDocuments": ["dashboard_dash-payments"]}
+    }
+  ]
+}

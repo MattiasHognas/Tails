@@ -152,6 +152,12 @@ async fn check_scope_filter(qdrant: &Qdrant) -> Result<()> {
             Some("2020-01-01T00:00:00Z"),
         ),
         doc("slo", SourceKind::SLO, None),
+        // Metric catalog entries carry the indexing time, not an event time.
+        doc(
+            "metric_old",
+            SourceKind::Metrics,
+            Some("2020-01-01T00:00:00Z"),
+        ),
     ];
     let vector = vec![0.0, 1.0, 0.0];
     let points = docs
@@ -181,6 +187,7 @@ async fn check_scope_filter(qdrant: &Qdrant) -> Result<()> {
             "dashboard_old",
             "log_inside",
             "log_untimed",
+            "metric_old",
             "monitor",
             "slo"
         ]

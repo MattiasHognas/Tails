@@ -706,4 +706,28 @@ mod tests {
             "[link](https://x/y) [2]"
         );
     }
+
+    /// Answers and titles are routinely non-ASCII; slicing here is by byte offsets
+    /// found by `find`/ASCII digits, so it must stay on char boundaries.
+    #[test]
+    fn multibyte_text_is_rewritten_wrapped_and_listed_safely() {
+        assert_eq!(
+            rewrite_citations("Återförsök 🚀[DOC #1]、決済 DOC #2 é\u{0301}[DOC #3, DOC #4]"),
+            "Återförsök 🚀[1]、決済 [2] é\u{0301}[3, 4]"
+        );
+        assert_eq!(list_marker("1. Åtgärd"), "1. ");
+        assert_eq!(list_marker("• 決済"), "• ");
+        assert_eq!(list_marker("12🚀 x"), "");
+        let lines = wrap(
+            "åäö 決済ゲートウェイ 👩\u{200D}💻 tail",
+            Some(8),
+            "  ",
+            "  ",
+        );
+        assert_eq!(
+            lines.concat().replace("  ", " ").split_whitespace().count(),
+            4
+        );
+        assert!(lines.iter().all(|l| l.starts_with("  ")));
+    }
 }

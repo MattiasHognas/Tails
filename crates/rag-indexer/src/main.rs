@@ -1,5 +1,7 @@
 mod checkpoint;
 mod incremental;
+#[cfg(test)]
+mod pipeline_tests;
 
 use anyhow::Result;
 use checkpoint::{Checkpoints, Window};

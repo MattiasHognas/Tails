@@ -1,4 +1,5 @@
 pub mod chunk;
+pub mod citations;
 pub mod datadog;
 pub mod domain;
 pub mod error;
@@ -10,6 +11,7 @@ pub mod rag_service;
 pub mod reranker;
 pub mod resilience;
 pub mod retrieval;
+pub mod text;
 
 #[cfg(test)]
 pub(crate) mod test_support {

@@ -243,14 +243,8 @@ where
 async fn status_error(what: &str, r: reqwest::Response) -> UpstreamError {
     let status = r.status().as_u16();
     let retry_after = parse_retry_after(r.headers());
-    let mut body = r.text().await.unwrap_or_default();
-    if body.len() > 512 {
-        let mut cut = 512;
-        while !body.is_char_boundary(cut) {
-            cut -= 1;
-        }
-        body.truncate(cut);
-    }
+    let body = r.text().await.unwrap_or_default();
+    let body = crate::text::truncate_bytes(&body, 512);
     tracing::warn!(upstream = what, status, body = %body, "upstream returned error status");
     UpstreamError::Status {
         status,
@@ -342,8 +336,30 @@ mod tests {
             .await;
         let http = reqwest::Client::new();
         let url = format!("{}/x", server.uri());
-        let r = send_with_retry(&fast_policy(3), "test", || http.get(&url)).await;
-        assert!(r.is_ok());
+        let r = send_with_retry(&fast_policy(3), "test", || http.get(&url))
+            .await
+            .unwrap();
+        // The second attempt's response is returned; `expect` checks both were sent.
+        assert_eq!(r.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn multibyte_error_bodies_are_logged_without_panicking() {
+        // 1 + 2·400 bytes: the 512-byte log cut falls inside an "å".
+        let body = format!("x{}", "å".repeat(400));
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(422).set_body_string(body))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let http = reqwest::Client::new();
+        let url = format!("{}/x", server.uri());
+        let f = send_with_retry(&fast_policy(3), "test", || http.get(&url))
+            .await
+            .unwrap_err();
+        assert!(matches!(f.error, UpstreamError::Status { status: 422, .. }));
+        assert!(!f.error.to_string().contains('å'));
     }
 
     #[tokio::test]

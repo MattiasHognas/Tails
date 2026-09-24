@@ -120,19 +120,8 @@ impl Datadog {
             .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
             .unwrap_or_default();
 
-        let service = tags
-            .iter()
-            .find(|t| t.starts_with("service:"))
-            .and_then(|t| t.strip_prefix("service:"))
-            .unwrap_or("")
-            .to_string();
-
-        let environment = tags
-            .iter()
-            .find(|t| t.starts_with("env:"))
-            .and_then(|t| t.strip_prefix("env:"))
-            .unwrap_or("")
-            .to_string();
+        let service = tag_value(&tags, "service");
+        let environment = tag_value(&tags, "env");
 
         let mut metadata = serde_json::Map::new();
         metadata.insert(
@@ -253,10 +242,13 @@ impl Datadog {
             .or_else(|| incident_field(fields, "state"))
             .unwrap_or_default();
         let created = attrs["created"].as_str().map(|s| s.to_string());
-        let service = incident_field(fields, "services").unwrap_or_default();
-        let environment = incident_field(fields, "env")
-            .or_else(|| incident_field(fields, "environment"))
-            .unwrap_or_default();
+        let service =
+            normalize_scope_value(&incident_field(fields, "services").unwrap_or_default());
+        let environment = normalize_scope_value(
+            &incident_field(fields, "env")
+                .or_else(|| incident_field(fields, "environment"))
+                .unwrap_or_default(),
+        );
 
         let mut metadata = serde_json::Map::new();
         metadata.insert(
@@ -359,21 +351,10 @@ impl Datadog {
         // Logs carry the reserved `service` attribute; tags are only a fallback.
         let service = attrs["service"]
             .as_str()
+            .map(normalize_scope_value)
             .filter(|s| !s.is_empty())
-            .or_else(|| {
-                tags.iter()
-                    .find(|t| t.starts_with("service:"))
-                    .and_then(|t| t.strip_prefix("service:"))
-            })
-            .unwrap_or("")
-            .to_string();
-
-        let environment = tags
-            .iter()
-            .find(|t| t.starts_with("env:"))
-            .and_then(|t| t.strip_prefix("env:"))
-            .unwrap_or("")
-            .to_string();
+            .unwrap_or_else(|| tag_value(&tags, "service"));
+        let environment = tag_value(&tags, "env");
 
         let mut metadata = serde_json::Map::new();
         metadata.insert(
@@ -703,19 +684,8 @@ impl Datadog {
             .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
             .unwrap_or_default();
 
-        let service = tags
-            .iter()
-            .find(|t| t.starts_with("service:"))
-            .and_then(|t| t.strip_prefix("service:"))
-            .unwrap_or("")
-            .to_string();
-
-        let environment = tags
-            .iter()
-            .find(|t| t.starts_with("env:"))
-            .and_then(|t| t.strip_prefix("env:"))
-            .unwrap_or("")
-            .to_string();
+        let service = tag_value(&tags, "service");
+        let environment = tag_value(&tags, "env");
 
         let mut metadata = serde_json::Map::new();
         metadata.insert(
@@ -778,6 +748,23 @@ fn log_search_body(
         "page": page,
         "sort": "timestamp"
     })
+}
+
+/// Service and environment values as stored in the `Service`/`Environment` payload.
+/// Qdrant keyword matches are case-sensitive and the retrieval scope lowercases
+/// planner and filter values (see [`crate::planner::sanitize_tag_value`]), so the
+/// writer lowercases too; otherwise `service:Auth-API` would never match `auth-api`.
+pub fn normalize_scope_value(value: &str) -> String {
+    value.trim().to_lowercase()
+}
+
+/// The value of the first `key:value` tag, normalized like [`normalize_scope_value`];
+/// empty when there is none.
+fn tag_value(tags: &[&str], key: &str) -> String {
+    tags.iter()
+        .find_map(|t| t.strip_prefix(key)?.strip_prefix(':'))
+        .map(normalize_scope_value)
+        .unwrap_or_default()
 }
 
 /// Reads an incident field (`{"type": ..., "value": ...}`) as a string, taking the
@@ -894,53 +881,49 @@ mod tests {
     }
 
     #[test]
-    fn test_tag_extraction_service() {
-        let tags = ["env:production", "service:auth-api", "version:1.2.3"];
+    fn test_tag_values_are_lowercased_like_the_retrieval_scope() {
+        let tags = [
+            "environment:test",
+            "env:Production",
+            "service:Auth-API",
+            "version:1.2.3",
+        ];
+        assert_eq!(tag_value(&tags, "service"), "auth-api");
+        // `environment:` is not the `env` tag.
+        assert_eq!(tag_value(&tags, "env"), "production");
+        assert_eq!(tag_value(&["version:1.0.0"], "service"), "");
+        assert_eq!(tag_value(&["service:"], "service"), "");
 
-        let service = tags
-            .iter()
-            .find(|t| t.starts_with("service:"))
-            .and_then(|t| t.strip_prefix("service:"))
-            .unwrap_or("")
-            .to_string();
+        // Every value the writer stores must survive the planner's validation
+        // unchanged, or a filter on it can never match.
+        for raw in ["Auth-API", " checkout ", "PROD", "payments.gateway"] {
+            let stored = normalize_scope_value(raw);
+            assert_eq!(
+                crate::planner::sanitize_tag_value(&serde_json::json!(raw), "service"),
+                Some(stored)
+            );
+        }
 
-        assert_eq!(service, "auth-api");
-    }
-
-    #[test]
-    fn test_tag_extraction_environment() {
-        let tags = ["service:api-service", "env:staging", "region:us-west-2"];
-
-        let environment = tags
-            .iter()
-            .find(|t| t.starts_with("env:"))
-            .and_then(|t| t.strip_prefix("env:"))
-            .unwrap_or("")
-            .to_string();
-
-        assert_eq!(environment, "staging");
-    }
-
-    #[test]
-    fn test_tag_extraction_missing_tags() {
-        let tags = ["version:1.0.0", "region:eu-west-1"];
-
-        let service = tags
-            .iter()
-            .find(|t| t.starts_with("service:"))
-            .and_then(|t| t.strip_prefix("service:"))
-            .unwrap_or("")
-            .to_string();
-
-        let environment = tags
-            .iter()
-            .find(|t| t.starts_with("env:"))
-            .and_then(|t| t.strip_prefix("env:"))
-            .unwrap_or("")
-            .to_string();
-
-        assert_eq!(service, "");
-        assert_eq!(environment, "");
+        let dd = Datadog::new("a".into(), "b".into(), "datadoghq.eu".into());
+        let log = dd.log_document(&serde_json::json!({
+            "id": "1",
+            "attributes": {"service": "Auth-API", "tags": ["env:PROD"], "message": "åäö"}
+        }));
+        assert_eq!(
+            (log.service.as_str(), log.environment.as_str()),
+            ("auth-api", "prod")
+        );
+        let incident = dd.incident_document(&serde_json::json!({
+            "id": "x",
+            "attributes": {"title": "t", "fields": {
+                "services": {"value": ["Payments"]},
+                "environment": {"value": "Staging"}
+            }}
+        }));
+        assert_eq!(
+            (incident.service.as_str(), incident.environment.as_str()),
+            ("payments", "staging")
+        );
     }
 
     #[test]
