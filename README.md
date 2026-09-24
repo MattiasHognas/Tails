@@ -23,7 +23,8 @@ cd ../rag-cli
 RAG_API_BASE=http://localhost:5191 cargo run -- ask "why did auth-api spike yesterday?"
 ```
 
-The planner infers `service`/`environment` automatically.  
+The server plans each question: it infers `service`/`environment`, resolves time
+phrases like "yesterday" in your timezone, and applies them as Qdrant filters.  
 The server chooses `K` dynamically — no `--k` flag needed.
 
 ---
@@ -33,8 +34,8 @@ The server chooses `K` dynamically — no `--k` flag needed.
 | Crate | Description |
 |-------|--------------|
 | `rag-core` | Domain models, OpenAI, Qdrant (search + upsert), Datadog client (monitors, incidents, logs, dashboards, metrics, SLOs), chunker, planner, reranker, RAG service. |
-| `rag-api` | Axum REST API — `/ask/plan` (intent + inferred filters) and `/ask` (retrieval + answer). |
-| `rag-cli` | CLI that calls the API. Planner infers service/env; server decides top-K. |
+| `rag-api` | Axum REST API — `/ask/plan` (intent + inferred filters) and `/ask` (server-side planning + filtered retrieval + answer). |
+| `rag-cli` | CLI that calls the API. The server plans (service/env/time) and decides top-K. |
 | `rag-indexer` | One-shot, resumable indexer for Datadog → Qdrant with per-source checkpoints. Perfect for Kubernetes CronJob. |
 
 ---
@@ -188,10 +189,12 @@ RAG_API_BASE=http://localhost:5191 cargo run -- ask "why did auth-api spike yest
 > No `--k` flag — server dynamically chooses K.  
 > No `--env` or `--service` needed — planner infers them automatically (e.g., “auth-api prod”).
 
-Manual override if desired:
+Manual override if desired (explicit flags always win over inferred values):
 ```
-cargo run -- ask "auth-api latency spikes" --env prod --service auth-api
+cargo run -- ask "auth-api latency spikes" --env prod --service auth-api --kind logs --tz Europe/Stockholm
 ```
+
+`--tz` defaults to `TZ` (when it is an IANA name) or the system timezone.
 
 ### Indexer (manual run)
 ```
@@ -225,6 +228,71 @@ independently and records its progress in the checkpoint file at `INDEXER_WATERM
   checkpoint for every source and rewritten in the new format. An unreadable checkpoint
   file stops the run instead of silently re-starting from the lookback; delete it to
   start over.
+
+---
+
+## API
+
+### `POST /ask`
+
+```json
+{
+  "question": "why did auth-api fail yesterday?",
+  "timezone": "Europe/Stockholm",
+  "service": null,
+  "env": null,
+  "from_utc": null,
+  "to_utc": null,
+  "kinds": null,
+  "filters": null,
+  "rewritten_query": null,
+  "plan": null
+}
+```
+
+Only `question` is required. The response is
+`{"answer": "...", "evidence": "found" | "none", "plan": {...}, "scope": {"service", "environment", "fromUtc", "toUtc", "kinds"}}`,
+where `plan` is the validated plan and `scope` is what was actually applied to retrieval.
+
+- **Planning is server-side.** Unless `plan` is supplied (for example, one returned by
+  `/ask/plan`), the server calls the planner. A supplied `plan` is validated exactly like
+  planner output.
+- **Explicit fields win**, field by field:
+  - `service`/`env`: the explicit field, then a `service:`/`env:` entry in `filters`,
+    then the planner's value, then a tag in the planner's `filters`.
+  - Time: if either `from_utc` or `to_utc` is given, the caller's window replaces the
+    inferred one entirely (a missing bound is open-ended).
+  - Source kinds: `kinds`, then `kind:` entries in `filters`, then planner `kind:` filters.
+    Valid kinds: `logs`, `metrics`, `monitor`, `incident`, `dashboard`, `slo`, `git`.
+  - `rewritten_query`, then the planner's rewrite, then `question` is embedded.
+- **`timezone`** is an IANA name (default `UTC`). The planner is given "now" in that zone.
+  `today`, `yesterday`, `the day before yesterday`, `since yesterday`, and
+  `last|past N minutes|hours|days|weeks` (also `last 24h`, `last week`) are resolved in
+  code: `yesterday` is local midnight to local midnight, converted to UTC (23 or 25 hours
+  across DST changes). An LLM window is kept only if it falls inside that range (for
+  example "yesterday 14:00–15:00"); otherwise the computed range is used.
+- **Validation.** Invalid explicit input (unknown timezone, non-RFC 3339 timestamps,
+  `from_utc >= to_utc`, unknown `kinds`) returns `400`. Planner output is untrusted: each
+  invalid field is dropped and logged instead of failing the request. A window is dropped
+  when a bound fails to parse, `from >= to`, it spans more than 366 days, or a bound is
+  more than 5 years in the past or more than 1 day in the future. Services and
+  environments must look like Datadog tag values and are lowercased; placeholders such as
+  `unknown` or `*` are rejected. Only `kind:`, `service:`, and `env:` filters are kept. If
+  the planner call itself fails or times out (`RAG_PLAN_TIMEOUT_MS`), the request fails
+  with a typed `planning_failed`, `upstream_unavailable` or `timeout` error (see
+  [API errors and evidence](#api-errors-and-evidence)) instead of retrieving with a
+  default plan. Supply `plan` to skip the planner call. Planning counts toward the
+  overall `RAG_ASK_DEADLINE_MS`.
+- **Retrieval filters.** Service, environment and kinds are `match` conditions. The window
+  is a half-open `[from, to)` Qdrant datetime `range` on the RFC 3339 `Timestamp` payload.
+  Documents with no timestamp, and monitors, dashboards and SLOs (whose timestamp, if any,
+  is a creation date), always pass the time condition, so "yesterday" still surfaces the
+  relevant monitor or SLO. Incidents are filtered by creation time.
+
+### `POST /ask/plan`
+
+`{"question": "...", "timezone": "Europe/Stockholm"}` → `{"plan": {...}}`: the
+validated plan, without retrieval.
 
 ---
 
@@ -366,7 +434,17 @@ QDRANT_TEST_ENDPOINT=http://localhost:6333 cargo test --locked -p rag-core --tes
 ```
 
 The test creates and deletes its own uniquely named collection and checks chunk
-identity, full payload recovery, filtering, and idempotent upserts.
+identity, full payload recovery, filtering (including the time window), and idempotent
+upserts.
+
+Time filtering uses Qdrant's datetime `range` on the existing RFC 3339 `Timestamp`
+string, so existing collections need no re-indexing. Filters work without payload
+indexes; for large collections, add them for faster filtering:
+
+```bash
+curl -X PUT "$QDRANT_ENDPOINT/collections/$QDRANT_COLLECTION/index" -H 'Content-Type: application/json' -d '{"field_name": "Timestamp", "field_schema": "datetime"}'
+# repeat with field_schema "keyword" for Service, Environment and Kind
+```
 
 ### Mutation Testing
 
@@ -395,7 +473,7 @@ For detailed mutation testing results and recommendations, see [MUTATION_TESTING
 
 ## Notes
 
-- The planner (`/ask/plan`) extracts **intent**, **time window**, **service/env**, and **clarifying questions**.
-- The API embeds the rewritten query, searches Qdrant, and reranks results using hybrid heuristics.
+- The planner (`/ask/plan`, and `/ask` server-side) extracts **intent**, **time window**, **service/env**, and **clarifying questions**.
+- The API applies the validated plan as Qdrant filters, embeds the rewritten query, searches Qdrant, and reranks results using hybrid heuristics.
 - The CLI automatically displays clarifying questions if planner uncertainty is high.
 - Default values can be tuned via environment variables on the API service.

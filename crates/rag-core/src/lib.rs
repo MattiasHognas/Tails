@@ -8,6 +8,7 @@ pub mod qdrant;
 pub mod rag_service;
 pub mod reranker;
 pub mod resilience;
+pub mod retrieval;
 
 #[cfg(test)]
 pub(crate) mod test_support {
