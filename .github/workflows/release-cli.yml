@@ -90,6 +90,27 @@ jobs:
         with:
           path: artifacts
 
+      # download-artifact puts each artifact in its own folder
+      # (artifacts/<asset_name>/rag-cli), and the release is flattened to
+      # file names, so the Linux and macOS binaries, all named rag-cli, would
+      # overwrite each other. Rename each binary to its asset name, which is
+      # what install.sh and install.ps1 download.
+      - name: Name binaries by platform
+        run: |
+          cd artifacts
+          for dir in rag-cli-*/; do
+            asset="${dir%/}"
+            files=("$dir"*)
+            if [ "${#files[@]}" -ne 1 ] || [ ! -f "${files[0]}" ]; then
+              echo "Expected exactly one binary in $dir, found: ${files[*]}" >&2
+              exit 1
+            fi
+            mv "${files[0]}" "$asset.tmp"
+            rmdir "$dir"
+            mv "$asset.tmp" "$asset"
+          done
+          ls -l
+
       - name: Copy installer scripts to artifacts
         run: |
           cp install.sh artifacts/
