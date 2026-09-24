@@ -75,7 +75,11 @@ jobs:
     needs: build-cli
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
-    
+    # The built-in token needs these to publish the release and read PR details.
+    permissions:
+      contents: write
+      pull-requests: read
+
     steps:
       - uses: actions/checkout@v5
         with:
@@ -94,7 +98,7 @@ jobs:
       - name: Generate Release Documentation
         id: generate_docs
         env:
-          GH_TOKEN: ${{ secrets.CUSTOM_GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.CUSTOM_GITHUB_TOKEN || github.token }}
         run: |
           # Get the current tag
           CURRENT_TAG="${GITHUB_REF#refs/tags/}"
@@ -124,7 +128,7 @@ jobs:
           echo "Fetching PRs between $PREVIOUS_TAG and $CURRENT_TAG..."
           
           # Get commit range
-          COMMITS=$(git log --no-decorate "$PREVIOUS_TAG".."$CURRENT_TAG" --grep="Merge pull request" --format="%H %s")
+          COMMITS=$(git log --no-decorate "$PREVIOUS_TAG".."$CURRENT_TAG" --grep="Merge pull request" --format="%s")
           
           if [ -z "$COMMITS" ]; then
             echo "No merged PRs found in this release." >> artifacts/RELEASE_NOTES.md
@@ -150,8 +154,8 @@ jobs:
                 
                 # If gh pr view failed, extract title from commit message as fallback
                 if [ -z "$PR_TITLE" ]; then
-                  COMMIT_MSG=$(echo "$commit_line" | sed 's/^[^ ]* //')
-                  PR_TITLE=$(echo "$COMMIT_MSG" | sed -E 's/Merge pull request #[0-9]+ from [^ ]+\/[^ ]+ //')
+                  PR_TITLE=$(echo "$commit_line" | sed -E 's/Merge pull request #[0-9]+ from [^ ]+\/[^ ]+ ?//')
+                  PR_TITLE="${PR_TITLE:-PR #$PR_NUMBER}"
                 fi
                 
                 # Add to release notes with improved formatting
@@ -190,5 +194,6 @@ jobs:
             artifacts/**/*
           draft: false
           prerelease: false
-          generate_release_notes: true
-          token: ${{ secrets.CUSTOM_GITHUB_TOKEN }}
+          body_path: artifacts/RELEASE_NOTES.md
+          generate_release_notes: false
+          token: ${{ secrets.CUSTOM_GITHUB_TOKEN || github.token }}
