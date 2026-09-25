@@ -145,9 +145,10 @@ fn prior(kind: &SourceKind) -> f32 {
 /// broken by ID), also when there are fewer candidates than `take`, so a document or
 /// pattern is never listed (and numbered as a `[DOC #n]`) twice.
 ///
-/// Scores come from [`crate::qdrant::Qdrant::hybrid_search`]: normalized fused ranks in
-/// (0, 1], on the same scale for every question, like the cosine similarities the
-/// priors and MMR weights were chosen for.
+/// Scores come from [`crate::qdrant::Qdrant::hybrid_search`]: normalized fused scores in
+/// [0, 1] (ranks with the default RRF, [`crate::qdrant::Fusion`]), on the same scale for
+/// every question, like the cosine similarities the priors and MMR weights were chosen
+/// for.
 pub fn rerank_mmr_signals(candidates: &[Hit], take: usize, focus: &TimeFocus) -> Vec<Hit> {
     let adjusted = candidates.iter().cloned().map(|mut h| {
         h.score *= prior(&h.doc.kind) * recency_weight(&h.doc, focus);

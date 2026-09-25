@@ -20,6 +20,11 @@ text-embeddings-inference, while chat stays on `OPENAI_BASE_URL`. Models trained
 instruction, such as bge or e5, get it through `OPENAI_EMBEDDING_QUERY_PREFIX` and
 `OPENAI_EMBEDDING_DOCUMENT_PREFIX` (see [DEVELOPMENT.md](docs/DEVELOPMENT.md)).
 
+**Hybrid search tuning:** `RAG_FUSION` (`rrf`, default, or `dbsf`) sets how `rag-api` fuses
+dense and keyword results, and `RAG_KEYWORD_STOPWORDS=on` drops English function words
+from keyword queries. Neither needs a re-index; see
+[Retrieval and ranking](docs/ARCHITECTURE.md#retrieval-and-ranking).
+
 ---
 
 ## Quickstart
