@@ -17,6 +17,11 @@
 //!    `citationWarnings` equals `validate_citations`, negative controls are flagged and
 //!    the scope matches. Quality: the aggregates against the committed e2e thresholds.
 //!
+//! 5. Explains every question whose must-retrieve documents aren't all ranked first:
+//!    the top documents of dense search and of keyword search alone (per query text,
+//!    with the question's scope), and the reranked sources with their scores from the
+//!    answer prompt, so a ranking difference can be traced to its search.
+//!
 //! Exits 1 when a hard check fails or an aggregate is below its threshold.
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -210,6 +215,121 @@ async fn ask(args: &Args, q: &Question, tz: &str) -> Result<Value> {
     Ok(v)
 }
 
+/// The Qdrant filter for a question's expected scope (as `questions.json` writes it).
+fn scope_filter(scope: &Value) -> Option<Value> {
+    let text = |k: &str| scope[k].as_str().map(str::to_string);
+    let time = |k: &str| scope[k].as_str().and_then(rag_core::planner::parse_utc);
+    rag_core::retrieval::RetrievalScope {
+        service: text("service"),
+        environment: text("environment"),
+        from_utc: time("fromUtc"),
+        to_utc: time("toUtc"),
+        kinds: scope["kinds"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|k| {
+                k.as_str()
+                    .and_then(rag_core::domain::SourceKind::parse_lenient)
+            })
+            .collect(),
+    }
+    .to_qdrant_filter()
+}
+
+/// The top `limit` points of one named vector search, as `(score, parent id, title)`.
+async fn top_points(
+    http: &reqwest::Client,
+    qdrant: &str,
+    collection: &str,
+    query: Value,
+    using: &str,
+    filter: &Option<Value>,
+    limit: usize,
+) -> Result<Vec<(f64, String, String)>> {
+    let mut body = json!({"query": query, "using": using, "limit": limit, "with_payload": true});
+    if let Some(f) = filter {
+        body["filter"] = f.clone();
+    }
+    let v: Value = http
+        .post(format!("{qdrant}/collections/{collection}/points/query"))
+        .json(&body)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    Ok(v["result"]["points"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|p| {
+            let doc: Option<RagDocument> =
+                serde_json::from_value::<QdrantPayload>(p["payload"].clone())
+                    .ok()
+                    .map(Into::into);
+            let (id, title) = doc
+                .map(|d| (d.parent_id().to_string(), d.title))
+                .unwrap_or_default();
+            (p["score"].as_f64().unwrap_or(0.0), id, title)
+        })
+        .collect())
+}
+
+/// Prints why `q` ranked as it did: dense and keyword search alone for each query text
+/// the API searches with (the question, and the plan's rewrite when it differs), and
+/// the reranked sources with their scores from the answer prompt.
+async fn explain(
+    http: &reqwest::Client,
+    oa: &OpenAiClient,
+    qdrant: &str,
+    collection: &str,
+    q: &Question,
+    prompt: Option<&str>,
+) -> Result<()> {
+    println!(
+        "\nexplain {} (must retrieve {:?}): {:?}",
+        q.id, q.expect.must_retrieve, q.question
+    );
+    let filter = scope_filter(&q.expect.scope);
+    let mut texts = vec![q.question.clone()];
+    if let Some(rw) = q.plan["rewrittenQuery"].as_str()
+        && !rw.trim().eq_ignore_ascii_case(q.question.trim())
+    {
+        texts.push(rw.to_string());
+    }
+    let dense = oa.embed_queries(&texts).await?;
+    for (text, vector) in texts.iter().zip(dense) {
+        let lists = [
+            ("dense", json!(vector)),
+            ("keyword", json!(rag_core::sparse::query_vector(text))),
+        ];
+        for (name, query) in lists {
+            let using = if name == "dense" { "dense" } else { "sparse" };
+            println!("  {name} search for {text:?}:");
+            for (rank, (score, id, title)) in
+                top_points(http, qdrant, collection, query, using, &filter, 5)
+                    .await?
+                    .iter()
+                    .enumerate()
+            {
+                println!("    {}. {score:.4}  {id}  {title}", rank + 1);
+            }
+        }
+    }
+    println!("  reranked sources (score after kind prior and recency weight):");
+    let mut title = None;
+    for line in prompt.unwrap_or_default().lines() {
+        if line.starts_with("[DOC #") {
+            title = Some(line.to_string());
+        } else if let (Some(t), Some(score)) = (&title, line.strip_prefix("Score: ")) {
+            println!("    {t}  score {score}");
+            title = None;
+        }
+    }
+    Ok(())
+}
+
 async fn prompt(http: &reqwest::Client, fakes: &str, question: &str) -> Option<String> {
     let r = http
         .get(format!("{fakes}/_fakes/prompt"))
@@ -290,6 +410,8 @@ async fn main() -> Result<()> {
         }
     }
     let mut rows: Vec<Option<Row>> = dataset.questions.iter().map(|_| None).collect();
+    // Questions that didn't rank their must-retrieve documents first, with their prompt.
+    let mut to_explain: Vec<(usize, Option<String>)> = vec![];
     let started = Instant::now();
     for (now, idx) in &by_now {
         let mut api = start_api(&args, now).await?;
@@ -307,6 +429,9 @@ async fn main() -> Result<()> {
                         &groups,
                         Answers::Canned,
                     );
+                    if row.recall < 1.0 || row.precision < 1.0 {
+                        to_explain.push((i, prompt.clone()));
+                    }
                     if row.negatives_flagged < row.negatives_total {
                         row.hard.push(format!(
                             "{} of {} deliberately unknown citations flagged",
@@ -345,6 +470,20 @@ async fn main() -> Result<()> {
         questions::print_row(row);
     }
     questions::print_aggregate(&rows, &e2e.thresholds);
+    for (i, prompt) in &to_explain {
+        if let Err(e) = explain(
+            &http,
+            &oa,
+            &qdrant,
+            &collection_name,
+            &dataset.questions[*i],
+            prompt.as_deref(),
+        )
+        .await
+        {
+            println!("  (could not explain: {e:#})");
+        }
+    }
 
     for row in &rows {
         hard.extend(row.hard.iter().map(|h| format!("{}: {h}", row.id)));
