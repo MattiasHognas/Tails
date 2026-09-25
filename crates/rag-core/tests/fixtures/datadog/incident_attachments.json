@@ -1,0 +1,43 @@
+{
+  "data": [
+    {
+      "id": "70c374d6-069a-46cf-8031-d2be47b432cb",
+      "type": "incident_attachments",
+      "attributes": {
+        "attachment": {
+          "title": "Test-List_incident_attachments_returns_OK_response-1771855607",
+          "documentUrl": "https://app.datadoghq.com/notebook/TestListincidentattachmentsreturnsOKresponse1771855607/Test-List_incident_attachments_returns_OK_response-1771855607"
+        },
+        "attachment_type": "postmortem",
+        "modified": "2026-02-23T14:06:48.072714Z"
+      },
+      "relationships": {
+        "incident": {
+          "data": {
+            "id": "548c9855-15a4-5015-8a20-4d237f24d784",
+            "type": "incidents"
+          }
+        },
+        "last_modified_by_user": {
+          "data": {
+            "id": "3ad549bf-eba0-11e9-a77a-0705486660d0",
+            "type": "users"
+          }
+        }
+      }
+    }
+  ],
+  "included": [
+    {
+      "id": "3ad549bf-eba0-11e9-a77a-0705486660d0",
+      "type": "users",
+      "attributes": {
+        "email": "frog@datadoghq.com",
+        "handle": "frog@datadoghq.com",
+        "icon": "https://secure.gravatar.com/avatar/28a16dfe36e73b60c1d55872cb0f1172?d=retro&s=48",
+        "name": "frog",
+        "uuid": "3ad549bf-eba0-11e9-a77a-0705486660d0"
+      }
+    }
+  ]
+}

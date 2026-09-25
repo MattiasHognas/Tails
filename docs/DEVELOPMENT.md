@@ -264,7 +264,8 @@ indexer's writer and the API's reader drift apart. The pipeline tests in
 `crates/rag-indexer/src/pipeline_tests/` run both for real on one store:
 
 1. a fake Datadog API serves the recorded fixtures (`crates/rag-core/tests/fixtures/datadog`)
-   and a crafted corpus, with the pagination the adapters follow;
+   and a crafted corpus, with the pagination the adapters follow, plus the per-object
+   endpoints (dashboard definitions, incident timelines and attachments, notebooks);
 2. the indexer's own `index_sources` + `IncrementalSink` (chunking, content hashes,
    batched embeddings, upserts, cleanup) writes to the store;
 3. the API's router (`rag_api::app`, served with a fixed clock) answers `/ask`: planner
@@ -335,8 +336,9 @@ and every payload survives the write/read round trip unchanged.
 ### Incident question set
 
 `crates/rag-indexer/tests/incident_questions/` holds a versioned, human-readable
-evaluation set: `questions.json` (26 incident questions) and `corpus.json` (monitors,
-incidents, SLOs, logs, dashboards and metrics in Datadog response shape, with
+evaluation set: `questions.json` (30 incident questions) and `corpus.json` (monitors,
+incidents with their timelines and postmortem notebooks, SLOs, logs, dashboards with
+their definitions, and metrics in Datadog response shape, with
 distractors: a similarly named service, another environment, events outside the window,
 a burst of 300 near-identical logs, patterns logged on other days of the week, error
 codes and metric names that differ from the asked one in a single word). `logBursts` in the corpus are expanded by the
@@ -357,7 +359,7 @@ cargo test -p rag-indexer incident_questions_in_memory -- --nocapture
 question                     recall prec@R exclude scope   cites  intent   obs  evid srcs  notes
 q01-checkout-slow-yesterday    1.00   1.00     8/8    ok     5/5     5/5   2/2   0/0    5
 ...
-aggregate over 25 questions (known gaps excluded):
+aggregate over 30 questions (known gaps excluded):
   recall@k                   1.000 (threshold 0.95)
 ```
 

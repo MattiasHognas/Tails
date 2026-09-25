@@ -1,6 +1,8 @@
 pub mod chunk;
 pub mod citations;
 pub mod datadog;
+pub mod datadog_dashboards;
+pub mod datadog_incidents;
 pub mod domain;
 pub mod error;
 pub mod live_evidence;

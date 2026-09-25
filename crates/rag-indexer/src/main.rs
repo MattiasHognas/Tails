@@ -11,6 +11,7 @@ use incremental::{
 };
 use rag_core::{
     datadog::Datadog,
+    datadog_dashboards::dashboard_doc_id,
     domain::{RagDocument, SourceKind},
     log_patterns,
     openai::OpenAiClient,
@@ -88,6 +89,18 @@ impl Source {
 /// Fetches the documents of one source for a window.
 trait SourceFetcher {
     async fn fetch(&self, source: Source, window: &Window) -> Result<Vec<RagDocument>>;
+
+    /// [`Self::fetch`], reusing what `sink` already stores where that saves Datadog
+    /// calls: definitions of dashboards whose `modified_at` is unchanged are not
+    /// fetched again. Returns the same documents as `fetch` would.
+    async fn fetch_reusing(
+        &self,
+        source: Source,
+        window: &Window,
+        _sink: &impl DocumentSink,
+    ) -> Result<Vec<RagDocument>> {
+        self.fetch(source, window).await
+    }
 }
 
 /// Stores the documents of one fetch and removes what they replace. Returns only after
@@ -115,6 +128,21 @@ impl SourceFetcher for Datadog {
                 self.search_logs(&from, &to_iso).await
             }
         }
+    }
+
+    async fn fetch_reusing(
+        &self,
+        source: Source,
+        window: &Window,
+        sink: &impl DocumentSink,
+    ) -> Result<Vec<RagDocument>> {
+        if source != Source::Dashboards {
+            return self.fetch(source, window).await;
+        }
+        let summaries = self.list_dashboard_summaries().await?;
+        let ids: Vec<String> = summaries.iter().map(dashboard_doc_id).collect();
+        let stored = sink.stored_metadata(&ids).await?;
+        Ok(self.dashboard_documents(&summaries, &stored).await)
     }
 }
 
@@ -194,7 +222,7 @@ async fn index_sources(
 
         // A failed fetch never reaches the sink, so it can't delete anything.
         let result = async {
-            let mut docs = dedupe_by_id(fetcher.fetch(source, &window).await?);
+            let mut docs = dedupe_by_id(fetcher.fetch_reusing(source, &window, sink).await?);
             if source == Source::Logs {
                 docs = merge_log_patterns(sink, docs, &window).await?;
             }

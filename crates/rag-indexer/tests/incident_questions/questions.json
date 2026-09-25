@@ -1,5 +1,5 @@
 {
-  "version": 3,
+  "version": 4,
   "description": "Incident questions for the /ask quality harness (crates/rag-indexer/src/pipeline_tests/quality.rs). Each question is answered by the real pipeline over corpus.json plus the recorded fixtures, with deterministic embeddings, a canned planner reply ('plan') and a canned answer model that cites 'answer'. Logs are indexed grouped by message pattern and UTC day; 'log_<id>' names the log pattern that holds Datadog log <id>, which is one source whichever of its days are retrieved. 'evidence' lists facts the answer prompt must state about a source, such as a pattern's count in the question's window. See docs/DEVELOPMENT.md#incident-question-set for the metrics and how to add questions or change thresholds.",
   "defaults": {"now": "2026-03-12T09:00:00Z", "timezone": "Europe/Stockholm"},
   "thresholds": {
@@ -21,7 +21,7 @@
       "expect": {
         "scope": {"service": "checkout", "environment": "prod", "fromUtc": "2026-03-10T23:00:00Z", "toUtc": "2026-03-11T23:00:00Z", "kinds": []},
         "mustRetrieve": ["incident_inc-checkout-latency", "monitor_1001", "log_co-1", "log_co-2"],
-        "mayRetrieve": ["slo_slo-checkout-avail"],
+        "mayRetrieve": ["slo_slo-checkout-avail", "dashboard_dash-checkout"],
         "mustNotRetrieve": ["monitor_1002", "incident_inc-checkout-latency-stg", "incident_inc-checkout-deploy", "log_co-stg", "log_co-old", "incident_inc-worker-backlog", "monitor_1003", "log_worker-1"],
         "timeline": {"status": "collected", "observations": [
           {"id": "obs-2", "kind": "spike", "service": "checkout"},
@@ -93,7 +93,7 @@
       "expect": {
         "scope": {"service": "payments", "environment": "prod", "fromUtc": "2026-03-11T23:00:00Z", "toUtc": "2026-03-12T23:00:00Z", "kinds": []},
         "mustRetrieve": ["incident_inc-payments-card", "log_pay-1", "log_pay-long", "monitor_1004", "monitor_1005"],
-        "mayRetrieve": ["slo_slo-payments-latency"],
+        "mayRetrieve": ["slo_slo-payments-latency", "dashboard_dash-payments"],
         "mustNotRetrieve": ["incident_inc-checkout-latency", "log_co-1", "incident_inc-auth-login"],
         "timeline": {"status": "collected", "observations": [
           {"id": "obs-2", "kind": "logBurst", "service": "payments"},
@@ -237,11 +237,12 @@
     {
       "id": "q16-dashboards-by-service",
       "question": "Which dashboards cover payments in prod?",
-      "knownGap": "Dashboards carry no service or environment (the adapter has no tags to read), so any service/environment scope excludes every dashboard. Reported, not counted in the aggregates.",
+      "note": "Dashboards get their service and environment from template variable defaults and service:/env: filters in widget queries (dashboard definition). dash-checkout (checkout) and the unscoped multi-service dash-golden-signals must stay out.",
       "plan": {"intent": "dashboardLookup", "service": "payments", "environment": "prod", "filters": ["kind:dashboard"]},
       "expect": {
         "scope": {"service": "payments", "environment": "prod", "fromUtc": null, "toUtc": null, "kinds": ["dashboard"]},
-        "mustRetrieve": ["dashboard_dash-payments"]
+        "mustRetrieve": ["dashboard_dash-payments"],
+        "mustNotRetrieve": ["dashboard_dash-checkout", "dashboard_dash-golden-signals"]
       },
       "answer": {"citeDocuments": ["dashboard_dash-payments"]}
     },
@@ -369,6 +370,55 @@
         "mustRetrieve": ["log_ca-declined"]
       },
       "answer": {"citeDocuments": ["log_ca-declined"]}
+    },
+    {
+      "id": "q40-checkout-outage-root-cause",
+      "question": "What was the root cause of the last checkout outage?",
+      "note": "Only the incident's root cause field says 'checkout outage'; its title does not. Before incident fields were indexed the other checkout incidents ranked first.",
+      "plan": {"intent": "incidentSummary", "service": "checkout", "environment": "prod", "filters": ["kind:incident"]},
+      "expect": {
+        "scope": {"service": "checkout", "environment": "prod", "fromUtc": null, "toUtc": null, "kinds": ["incident"]},
+        "mustRetrieve": ["incident_inc-checkout-outage"],
+        "mustNotRetrieve": ["incident_inc-checkout-latency-stg", "incident_inc-worker-backlog"]
+      },
+      "answer": {"citeDocuments": ["incident_inc-checkout-outage"]}
+    },
+    {
+      "id": "q41-gateway-postmortem-actions",
+      "question": "Which action items came out of the postmortem on failed card payments at the bank gateway?",
+      "note": "Answered only by the postmortem notebook attached to inc-gateway-cert (incident attachments -> notebook markdown).",
+      "plan": {"intent": "incidentSummary", "service": "payments", "environment": "prod", "filters": ["kind:incident"]},
+      "expect": {
+        "scope": {"service": "payments", "environment": "prod", "fromUtc": null, "toUtc": null, "kinds": ["incident"]},
+        "mustRetrieve": ["incident_inc-gateway-cert"],
+        "mustNotRetrieve": ["incident_inc-checkout-outage"]
+      },
+      "answer": {"citeDocuments": ["incident_inc-gateway-cert"]}
+    },
+    {
+      "id": "q42-orders-db-export-paused",
+      "question": "Why was the nightly export job paused?",
+      "note": "Answered only by a note on the incident timeline of inc-orders-db-failover.",
+      "plan": {"intent": "rootCause", "service": "orders-db", "environment": "prod"},
+      "expect": {
+        "scope": {"service": "orders-db", "environment": "prod", "fromUtc": null, "toUtc": null, "kinds": []},
+        "mustRetrieve": ["incident_inc-orders-db-failover"],
+        "mustNotRetrieve": ["monitor_1001", "incident_inc-checkout-outage"]
+      },
+      "answer": {"citeDocuments": ["incident_inc-orders-db-failover"]}
+    },
+    {
+      "id": "q43-orders-db-replica-dashboard",
+      "question": "Where can I see replica lag graphs for orders-db?",
+      "note": "The dashboard's service comes from service:orders-db in its widget queries; without it every service-scoped question excluded all dashboards.",
+      "plan": {"intent": "dashboardLookup", "service": "orders-db", "environment": "prod"},
+      "expect": {
+        "scope": {"service": "orders-db", "environment": "prod", "fromUtc": null, "toUtc": null, "kinds": []},
+        "mustRetrieve": ["dashboard_dash-orders-db"],
+        "mayRetrieve": ["monitor_3002", "incident_inc-orders-db-failover"],
+        "mustNotRetrieve": ["dashboard_dash-golden-signals", "dashboard_dash-checkout"]
+      },
+      "answer": {"citeDocuments": ["dashboard_dash-orders-db"]}
     }
   ]
 }

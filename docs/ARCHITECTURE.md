@@ -59,7 +59,7 @@ flowchart TB
     subgraph ext ["External services"]
         openai[["OpenAI<br/>/v1/embeddings<br/>/v1/chat/completions"]]
         qdrant[("Qdrant<br/>POST /collections/{c}/points/query<br/>GET, PUT /collections/{c}<br/>PUT /collections/{c}/points<br/>POST /collections/{c}/points (retrieve)<br/>POST .../points/payload, /delete, /count")]
-        datadog[["Datadog API<br/>/api/v1/monitor, /dashboard, /slo, /metrics<br/>/api/v1/query (live time series)<br/>/api/v2/incidents/search<br/>/api/v2/logs/events/search"]]
+        datadog[["Datadog API<br/>/api/v1/monitor, /dashboard, /dashboard/{id}, /slo, /metrics<br/>/api/v1/notebooks/{id} (postmortems)<br/>/api/v1/query (live time series)<br/>/api/v2/incidents/search, /incidents/{id}/timeline, /incidents/{id}/attachments<br/>/api/v2/logs/events/search"]]
     end
 
     %% Question flow
@@ -217,9 +217,10 @@ is how the server interprets a request:
   timestamp, and monitors, dashboards, SLOs (whose timestamp,
   if any, is a creation date) and metric catalog entries (stamped with the indexing run's
   time), always pass the time condition, so "yesterday" still surfaces the relevant
-  monitor, SLO or metric. Incidents are filtered by creation time. Dashboards and metric
-  entries carry no service or environment, so a service or environment scope excludes
-  them.
+  monitor, SLO or metric. Incidents are filtered by creation time. Dashboards take their
+  service and environment from their definition (see
+  [Incidents and dashboards](#incidents-and-dashboards)); a dashboard without one, and
+  metric catalog entries, are excluded by a service or environment scope.
 
 ## Live evidence (`timeline`)
 
@@ -417,7 +418,9 @@ independently and records its progress in the checkpoint file at `INDEXER_WATERM
   `INDEXER_OVERLAP_MINUTES` (default 10) until now, so records that reach Datadog late
   are picked up by the next run. A source without a checkpoint starts
   `INDEXER_LOOKBACK_MINUTES` (default 90) back. After an outage, the whole gap since the
-  checkpoint is fetched. Monitors, dashboards and SLOs are re-synced in full each run.
+  checkpoint is fetched. Monitors, dashboards and SLOs are re-synced in full each run
+  (a dashboard's definition only when its `modified_at` changed; see
+  [Incidents and dashboards](#incidents-and-dashboards)).
 - **No duplicates:** documents are deduplicated by ID within a run, and Qdrant point IDs
   are derived from document IDs, so re-indexing overlapping records overwrites them. An
   overlapping record that hasn't changed is not embedded again (see
@@ -517,6 +520,70 @@ Each chunk is also stored with a sparse keyword vector of the same embedding inp
 
 The tokenizer and weights are versioned (`SPARSE_ENCODER_VERSION`, part of the content
 hash), so changing them re-indexes every document once.
+
+### Incidents and dashboards
+
+Incidents and dashboards need one extra request per object for what they actually say
+(`rag_core::datadog_incidents`, `rag_core::datadog_dashboards`).
+
+**Incidents.** The search result already holds most of an incident: title, severity,
+state, commander, services, teams, detection method, created/detected/resolved times,
+customer impact and the free-text fields (`summary`, `root_cause`, `resolution`, and any
+other `textbox` field an organization defined). Datadog puts most of them in
+`attributes.fields.<name>.value` and a few directly in `attributes`; both places are read
+for every field. For each incident in the window (at most 100 per run, 4 at a time) the
+indexer also fetches:
+
+- the **timeline** (`GET /api/v2/incidents/{id}/timeline`): notes and status changes,
+  oldest first, at most 50 entries of 1000 bytes and 8000 bytes in all. This read
+  endpoint is **not in Datadog's API reference**; the shape read is the documented
+  timeline cell create shape (`attributes.cell_type`, `attributes.content.content`). A
+  client error (4xx other than 429) stops timeline requests for the rest of the run;
+- the **postmortem**: the incident's attachments (`GET /api/v2/incidents/{id}/attachments`,
+  skipped when the search result lists none), the first `postmortem` attachment, and the
+  markdown cells of the notebook it links to (`GET /api/v1/notebooks/{id}`, at most
+  12,000 bytes). A notebook that cannot be read leaves the attachment title.
+
+The document text puts the facts first, then summary, root cause and resolution, customer
+impact, other text fields, the postmortem and the timeline, so the first chunk and the
+prompt excerpt carry what answers "what was the root cause". Long documents are chunked
+like any other, and every chunk carries the incident's [header](#embedding-input). Each
+per-incident request is retried on 429, 5xx and transport errors (`Datadog.retry`, the default
+bounded policy in the indexer); if it still fails the
+incident is indexed without that part and a warning is logged. The run does not fail.
+
+Incidents are fetched by creation time, so an incident is indexed from the runs whose
+window contains its creation; a postmortem written days later is not picked up by later
+runs (a known limitation).
+
+**Dashboards.** Each dashboard's definition (`GET /api/v1/dashboard/{id}`) adds its
+template variables and one line per widget (title, or a note's text, and up to five
+queries: `q`, `queries[].query`, `search.query`, group widgets included), at most 100
+widgets and 8000 bytes. The definition also gives the dashboard a `Service` and
+`Environment`, from the `service`/`env` template variables and the `service:`/`env:`
+filters in widget queries (`$variables`, wildcards and negations ignored), normalized
+like every stored value:
+
+1. a template variable with exactly one concrete default wins;
+2. otherwise the only value in widget queries;
+3. otherwise the value found in strictly the most widget queries;
+4. otherwise (a tie) none: the dashboard stays unscoped.
+
+Every candidate is listed in the text and in `Metadata.services`/`Metadata.environments`;
+the payload keeps one `Service` string, so the retrieval filter is unchanged.
+
+The definition is stored in the document's metadata (`Metadata.definition`) with the
+list's `Metadata.modified_at`. The next run reads the stored metadata of every listed
+dashboard and reuses the stored definition when `modified_at` is unchanged, so an
+unchanged dashboard costs no request and produces the identical document (nothing is
+re-embedded). At most 200 definitions are fetched per run, 4 at a time; dashboards over
+that budget, and dashboards whose fetch failed, keep their stored definition with its old
+`modified_at` (so a later run fetches them) or, with nothing stored, are indexed from their
+list entry.
+
+**API calls per run:** incidents cost up to 3 extra requests each (timeline, attachments,
+notebook; attachments only when listed), at most 100 incidents; dashboards one request per
+new or changed dashboard, at most 200.
 
 ### Log patterns
 
