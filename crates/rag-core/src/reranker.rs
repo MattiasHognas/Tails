@@ -1,25 +1,15 @@
 use crate::domain::{Hit, SourceKind};
 use itertools::Itertools;
 
-/// Rerank retrieved chunks and keep at most `take` documents.
+/// Rerank retrieved chunks and keep at most `take` sources.
 ///
-/// Chunks of the same document (`metadata.chunk_of`, see
-/// [`crate::domain::RagDocument::parent_id`]) are always collapsed to the
-/// best-scoring one, also when there are fewer candidates than `take`, so a
-/// document is never listed (and numbered as a `[DOC #n]`) twice.
+/// Hits are grouped by the source they are listed as
+/// ([`crate::domain::RagDocument::group_id`]): the chunks of one document
+/// (`metadata.chunk_of`), and the days of one log pattern (`metadata.pattern_id`).
+/// Each group is collapsed to its best hit after the kind prior and recency decay
+/// (ties broken by ID), also when there are fewer candidates than `take`, so a
+/// document or pattern is never listed (and numbered as a `[DOC #n]`) twice.
 pub fn rerank_mmr_signals(candidates: &[Hit], take: usize) -> Vec<Hit> {
-    // Collapse duplicates by parent (chunk_of) using highest score
-    let mut by_parent: Vec<Hit> = candidates
-        .iter()
-        .cloned()
-        .into_group_map_by(|h| h.doc.parent_id().to_string())
-        .into_values()
-        .map(|mut v| {
-            v.sort_by(|a, b| b.score.total_cmp(&a.score));
-            v[0].clone()
-        })
-        .collect();
-
     // Adjust score by priors + simple recency decay (if timestamp present)
     fn prior(kind: &SourceKind) -> f32 {
         match kind {
@@ -33,7 +23,7 @@ pub fn rerank_mmr_signals(candidates: &[Hit], take: usize) -> Vec<Hit> {
         }
     }
     let now = time::OffsetDateTime::now_utc();
-    for h in &mut by_parent {
+    let adjusted = candidates.iter().cloned().map(|mut h| {
         let mut adj = h.score * prior(&h.doc.kind);
         if let Some(ts) = &h.doc.timestamp
             && let Ok(t) =
@@ -45,10 +35,20 @@ pub fn rerank_mmr_signals(candidates: &[Hit], take: usize) -> Vec<Hit> {
             adj *= decay.max(0.5);
         }
         h.score = adj;
-    }
+        h
+    });
     // Ties (and group order, which comes from a hash map) are broken by ID so the
     // result is deterministic.
-    by_parent.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.doc.id.cmp(&b.doc.id)));
+    let best_first = |a: &Hit, b: &Hit| b.score.total_cmp(&a.score).then(a.doc.id.cmp(&b.doc.id));
+    let mut by_parent: Vec<Hit> = adjusted
+        .into_group_map_by(|h| h.doc.group_id().to_string())
+        .into_values()
+        .map(|mut v| {
+            v.sort_by(best_first);
+            v.swap_remove(0)
+        })
+        .collect();
+    by_parent.sort_by(best_first);
 
     // Greedy MMR with token Jaccard-ish on text
     let mut selected: Vec<Hit> = Vec::new();
@@ -141,6 +141,34 @@ mod tests {
         let out = rerank_mmr_signals(&candidates, 16);
         assert_eq!(ids(&out), ["doc1#c1", "doc2#c0"]);
         assert!((out[0].score - 0.9 * 0.98).abs() < 1e-6);
+    }
+
+    /// The days of one log pattern are one source, represented by the day with the best
+    /// score after recency decay (ties broken by ID); another pattern stays separate.
+    #[test]
+    fn days_of_one_log_pattern_are_one_source() {
+        let day = |id: &str, pattern: &str, score: f32, ts: &str| {
+            let mut h = chunk_of(hit(&format!("{id}#c0"), id, score, SourceKind::Logs), id);
+            h.doc.timestamp = Some(ts.into());
+            h.doc
+                .metadata
+                .insert("pattern_id".into(), serde_json::json!(pattern));
+            h
+        };
+        let now = chrono::Utc::now();
+        let recent = (now - chrono::Duration::hours(1)).to_rfc3339();
+        let candidates = vec![
+            day("p_2020-01-01", "p", 0.9, "2020-01-01T10:00:00Z"),
+            day("p_today", "p", 0.8, &recent),
+            day("p_2020-01-02", "p", 0.9, "2020-01-02T10:00:00Z"),
+            day("q_2020-01-01", "q", 0.5, "2020-01-01T10:00:00Z"),
+            day("q_2020-01-02", "q", 0.5, "2020-01-02T10:00:00Z"),
+        ];
+        let out = rerank_mmr_signals(&candidates, 16);
+        // 0.8 barely decayed beats 0.9 at the 0.5 floor; equal days pick the lower ID.
+        assert_eq!(ids(&out), ["p_today#c0", "q_2020-01-01#c0"]);
+        let reversed: Vec<Hit> = candidates.into_iter().rev().collect();
+        assert_eq!(ids(&rerank_mmr_signals(&reversed, 16)), ids(&out));
     }
 
     #[test]

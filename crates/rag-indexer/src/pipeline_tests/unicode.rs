@@ -8,7 +8,7 @@
 //! which holds the original message, and prompt excerpts must be valid prefixes of the
 //! stored text.
 //!
-//! Logs are stored as pattern documents whose text starts with a summary before the
+//! Logs are stored as pattern day documents whose text starts with a summary before the
 //! sample message; every log here renders a summary of the same length, so the message
 //! is placed relative to its measured offset ([`message_offset`]).
 

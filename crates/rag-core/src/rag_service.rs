@@ -1,11 +1,15 @@
 use crate::domain::Hit;
 use crate::error::{RagError, Stage};
+use crate::log_patterns::{self, LogPattern};
 use crate::openai::OpenAiClient;
 use crate::qdrant::Qdrant;
 use crate::reranker::rerank_mmr_signals;
 use crate::resilience::{env_duration_ms, run_stage};
 use crate::text::{TRUNCATION_MARKER, truncate_with_marker};
+use chrono::{DateTime, Utc};
+use chrono_tz::Tz;
 use serde::Serialize;
+use std::collections::HashSet;
 use std::time::Duration;
 
 /// Returned (with `Evidence::None`) when retrieval succeeded but matched
@@ -17,6 +21,85 @@ Try widening the time window, removing service/environment filters, or checking 
 /// Longest document excerpt given to the answer model, in bytes. Longer texts are
 /// cut at a char boundary and marked with [`TRUNCATION_MARKER`].
 pub const EXCERPT_MAX_BYTES: usize = 1500;
+
+/// The question's time window (either bound may be open) and the asker's timezone, for
+/// counting log patterns ([`log_patterns::occurrences`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AskWindow {
+    pub from: Option<DateTime<Utc>>,
+    pub to: Option<DateTime<Utc>>,
+    pub tz: Tz,
+}
+
+impl Default for AskWindow {
+    /// No window, days in UTC.
+    fn default() -> Self {
+        Self {
+            from: None,
+            to: None,
+            tz: Tz::UTC,
+        }
+    }
+}
+
+/// `candidates` without the log pattern days that logged nothing in `window`. The
+/// retrieval filter keeps a day whose first..last log overlaps the window; counted by
+/// hour ([`LogPattern::hours_in`]), a day with no logs in the window is not evidence
+/// for it.
+pub fn logged_in_window(candidates: Vec<Hit>, window: &AskWindow) -> Vec<Hit> {
+    if window.from.is_none() && window.to.is_none() {
+        return candidates;
+    }
+    candidates
+        .into_iter()
+        .filter(|h| {
+            log_patterns::from_document(&h.doc)
+                .is_none_or(|p| p.hours_in(window.from, window.to).next().is_some())
+        })
+        .collect()
+}
+
+/// For each reranked hit that is a log pattern day, how often its pattern occurred on
+/// the pattern's days among `candidates` (the hit represents them all), in `window`.
+fn pattern_occurrences(
+    hits: &[Hit],
+    candidates: &[Hit],
+    window: &AskWindow,
+) -> Vec<Option<String>> {
+    hits.iter()
+        .map(|h| {
+            log_patterns::from_document(&h.doc)?;
+            let mut seen = HashSet::new();
+            let days: Vec<LogPattern> = candidates
+                .iter()
+                .filter(|c| c.doc.group_id() == h.doc.group_id() && seen.insert(c.doc.parent_id()))
+                .filter_map(|c| log_patterns::from_document(&c.doc))
+                .collect();
+            Some(log_patterns::occurrences(
+                &days,
+                window.from,
+                window.to,
+                window.tz,
+            ))
+        })
+        .collect()
+}
+
+/// Reranks `candidates` to at most `top_k` sources and asks the LLM, returning the
+/// answer and the sources in `[DOC #n]` order.
+async fn rerank_and_generate(
+    oa: &OpenAiClient,
+    candidates: &[Hit],
+    top_k: usize,
+    question: &str,
+    live_evidence: Option<&str>,
+    window: &AskWindow,
+) -> Result<(String, Vec<Hit>), RagError> {
+    let hits = rerank_mmr_signals(candidates, top_k);
+    let occurrences = pattern_occurrences(&hits, candidates, window);
+    let answer = generate(oa, &hits, &occurrences, question, live_evidence).await?;
+    Ok((answer, hits))
+}
 
 /// Generate an answer from retrieved candidates. With no candidates this
 /// returns [`NO_EVIDENCE_ANSWER`] without calling the LLM.
@@ -42,15 +125,19 @@ pub async fn answer_question_with_live_evidence(
     if candidates.is_empty() && live_evidence.is_none() {
         return Ok(NO_EVIDENCE_ANSWER.to_string());
     }
-    let hits = rerank_mmr_signals(&candidates, top_k);
-    generate(oa, &hits, question, live_evidence).await
+    let window = AskWindow::default();
+    let (answer, _) =
+        rerank_and_generate(oa, &candidates, top_k, question, live_evidence, &window).await?;
+    Ok(answer)
 }
 
 /// Ask the LLM to answer from `hits` (already reranked, cited as `[DOC #n]` in
-/// order) and the optional live-evidence timeline.
+/// order, with the occurrences line of each log pattern) and the optional
+/// live-evidence timeline.
 async fn generate(
     oa: &OpenAiClient,
     hits: &[Hit],
+    occurrences: &[Option<String>],
     question: &str,
     live_evidence: Option<&str>,
 ) -> Result<String, RagError> {
@@ -87,6 +174,9 @@ async fn generate(
             {
                 let _ = writeln!(sb, "{}: {}", k, v);
             }
+        }
+        if let Some(Some(line)) = occurrences.get(i) {
+            let _ = writeln!(sb, "{line}");
         }
         let body = truncate_with_marker(&h.doc.text, EXCERPT_MAX_BYTES, TRUNCATION_MARKER);
         let _ = writeln!(
@@ -128,6 +218,13 @@ Instructions:
 - If the context does not support an answer, say so; never invent evidence.
 ",
     );
+    if occurrences.iter().any(Option::is_some) {
+        user.push_str(
+            "- A log pattern lists its 'Occurrences' per day; use that line for how often and when \
+it occurred (the excerpt only counts one UTC day).
+",
+        );
+    }
     if live_evidence.is_some() {
         user.push_str(
             "- Keep 'Observed' facts (only the timeline's observations, cited by ID such as [obs-1] with their link) \
@@ -251,7 +348,16 @@ pub async fn retrieve_and_answer(
     timeouts: &StageTimeouts,
 ) -> Result<AskOutcome, RagError> {
     let candidates = retrieve(oa, qd, query, filter, search_limit, timeouts).await?;
-    answer_candidates(oa, candidates, top_k, question, None, timeouts).await
+    answer_candidates(
+        oa,
+        candidates,
+        top_k,
+        question,
+        None,
+        &AskWindow::default(),
+        timeouts,
+    )
+    .await
 }
 
 /// Embed `query` and search Qdrant. Failures are errors, never empty hits.
@@ -274,14 +380,20 @@ pub async fn retrieve(
 
 /// Answer from retrieved candidates plus an optional rendered live-evidence
 /// timeline. With neither, returns [`Evidence::None`] without calling the LLM.
+///
+/// With a bounded `window`, log pattern days that logged nothing in it (by hour) are
+/// dropped first. The days of one pattern are one source, and the prompt gives its
+/// count per day in `window` and in `window.tz`, from the retrieved days.
 pub async fn answer_candidates(
     oa: &OpenAiClient,
     candidates: Vec<Hit>,
     top_k: usize,
     question: &str,
     live_evidence: Option<&str>,
+    window: &AskWindow,
     timeouts: &StageTimeouts,
 ) -> Result<AskOutcome, RagError> {
+    let candidates = logged_in_window(candidates, window);
     if candidates.is_empty() && live_evidence.is_none() {
         tracing::info!("retrieval returned no hits; answering without LLM");
         return Ok(AskOutcome {
@@ -291,11 +403,10 @@ pub async fn answer_candidates(
         });
     }
     // Rerank once, so `sources` is numbered exactly like the prompt's `[DOC #n]`.
-    let hits = rerank_mmr_signals(&candidates, top_k);
-    let answer = run_stage(
+    let (answer, hits) = run_stage(
         Stage::Generation,
         timeouts.generation,
-        generate(oa, &hits, question, live_evidence),
+        rerank_and_generate(oa, &candidates, top_k, question, live_evidence, window),
     )
     .await?;
     Ok(AskOutcome {
@@ -505,9 +616,17 @@ mod tests {
             slo,
             create_test_hit("2", "Second", "beta", 0.7),
         ];
-        let outcome = answer_candidates(&oa, candidates, 2, "q", None, &StageTimeouts::default())
-            .await
-            .unwrap();
+        let outcome = answer_candidates(
+            &oa,
+            candidates,
+            2,
+            "q",
+            None,
+            &AskWindow::default(),
+            &StageTimeouts::default(),
+        )
+        .await
+        .unwrap();
         assert_eq!(outcome.evidence, Evidence::Found);
 
         let prompt = last_prompt(&server).await;
@@ -557,6 +676,131 @@ mod tests {
         );
     }
 
+    /// Hits for the day documents (one chunk each) of `logs` (id, time, message).
+    fn pattern_days(logs: &[(&str, &str, &str)], score: f32) -> Vec<Hit> {
+        let events: Vec<log_patterns::LogEvent> = logs
+            .iter()
+            .map(|(id, at, message)| log_patterns::LogEvent {
+                id: id.to_string(),
+                timestamp: at.parse().unwrap(),
+                service: "checkout".into(),
+                environment: "prod".into(),
+                status: "error".into(),
+                message: message.to_string(),
+            })
+            .collect();
+        log_patterns::group(&events)
+            .iter()
+            .map(|p| Hit {
+                doc: crate::chunk::chunk(1800, 200, &p.to_document("https://dd")).swap_remove(0),
+                score,
+            })
+            .collect()
+    }
+
+    /// The days of one pattern are one source and one `[DOC #n]` with its count per
+    /// local day in the window; a day with no log in the window's hours is dropped
+    /// before reranking, and a pattern with no day left is not evidence at all.
+    #[tokio::test]
+    async fn pattern_days_are_one_source_counted_in_the_window() {
+        let (server, oa) = chat_server(200, "see [DOC #1]").await;
+        let mut candidates = pattern_days(
+            &[
+                ("mon", "2026-09-21T10:00:00Z", "redis refused 1"),
+                ("tue-1", "2026-09-22T21:30:00Z", "redis refused 2"),
+                ("tue-2", "2026-09-22T22:30:00Z", "redis refused 3"),
+                ("wed", "2026-09-23T08:00:00Z", "redis refused 4"),
+            ],
+            0.9,
+        );
+        // Logged only outside the window's hours, although its span overlaps it.
+        candidates.extend(pattern_days(
+            &[
+                ("gap-1", "2026-09-22T08:00:00Z", "disk full"),
+                ("gap-2", "2026-09-23T23:30:00Z", "disk full"),
+            ],
+            0.95,
+        ));
+        candidates.push(create_test_hit("monitor_1", "Redis", "redis", 0.5));
+        // "Wednesday" in Stockholm (UTC+2).
+        let window = AskWindow {
+            from: Some("2026-09-22T22:00:00Z".parse().unwrap()),
+            to: Some("2026-09-23T22:00:00Z".parse().unwrap()),
+            tz: "Europe/Stockholm".parse().unwrap(),
+        };
+        let outcome = answer_candidates(
+            &oa,
+            candidates.clone(),
+            5,
+            "q",
+            None,
+            &window,
+            &StageTimeouts::default(),
+        )
+        .await
+        .unwrap();
+        let prompt = last_prompt(&server).await;
+        let ids: Vec<&str> = outcome.sources.iter().map(|s| s.id.as_str()).collect();
+        let tuesday = candidates[1].doc.parent_id();
+        let wednesday = candidates[2].doc.parent_id();
+        // Tuesday and Wednesday (UTC) score alike; the lower ID represents the pattern.
+        assert_eq!(ids.len(), 2, "{ids:?}");
+        assert!(ids.contains(&tuesday.min(wednesday)), "{ids:?}");
+        assert!(ids.contains(&"monitor_1"), "{ids:?}");
+        assert_eq!(prompt.matches("[DOC #").count(), 2, "{prompt}");
+        assert_eq!(
+            prompt
+                .matches("Occurrences in the question's window")
+                .count(),
+            1
+        );
+        assert!(prompt.contains(
+            "Occurrences in the question's window: 2 (Wed 2026-09-23: 2; \
+             days in Europe/Stockholm, hour precision)\nExcerpt:\n"
+        ));
+        assert!(prompt.contains("use that line for how often and when"));
+        assert!(!prompt.contains("disk full"));
+
+        // Without a window: every retrieved day, per day in the asker's zone.
+        let outcome = answer_candidates(
+            &oa,
+            candidates.clone(),
+            5,
+            "q",
+            None,
+            &AskWindow {
+                from: None,
+                to: None,
+                ..window
+            },
+            &StageTimeouts::default(),
+        )
+        .await
+        .unwrap();
+        let prompt = last_prompt(&server).await;
+        assert_eq!(outcome.sources.len(), 3);
+        assert!(prompt.contains(
+            "Occurrences on the retrieved days: 4 (Mon 2026-09-21: 1 · Tue 2026-09-22: 1 · \
+             Wed 2026-09-23: 2; days in Europe/Stockholm, hour precision)"
+        ));
+
+        // Only days outside the window: no evidence, the LLM is not called again.
+        let calls = server.received_requests().await.unwrap().len();
+        let outcome = answer_candidates(
+            &oa,
+            candidates[3..5].to_vec(),
+            5,
+            "q",
+            None,
+            &window,
+            &StageTimeouts::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.evidence, Evidence::None);
+        assert_eq!(server.received_requests().await.unwrap().len(), calls);
+    }
+
     #[tokio::test]
     async fn no_evidence_outcome_has_no_sources() {
         let oa = OpenAiClient::new(
@@ -565,9 +809,17 @@ mod tests {
             "e".into(),
             "c".into(),
         );
-        let outcome = answer_candidates(&oa, vec![], 5, "q", None, &StageTimeouts::default())
-            .await
-            .unwrap();
+        let outcome = answer_candidates(
+            &oa,
+            vec![],
+            5,
+            "q",
+            None,
+            &AskWindow::default(),
+            &StageTimeouts::default(),
+        )
+        .await
+        .unwrap();
         assert_eq!(outcome.evidence, Evidence::None);
         assert!(outcome.sources.is_empty());
         assert_eq!(outcome.answer, NO_EVIDENCE_ANSWER);

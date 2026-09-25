@@ -106,9 +106,11 @@ pub fn embed(text: &str) -> Vec<f32> {
 /// What the fake answer model cites for one question.
 #[derive(Debug, Clone, Default)]
 pub struct AnswerScript {
-    /// Source URIs of the documents to cite; each becomes the `[DOC #n]` the prompt
-    /// gave that document. Documents missing from the prompt are not cited.
-    pub cite_uris: Vec<String>,
+    /// Documents to cite, each as the source URIs it may appear under (a log pattern
+    /// is listed under the link of whichever of its days represents it). Each becomes
+    /// the `[DOC #n]` of the first prompt document with one of those URIs; documents
+    /// missing from the prompt are not cited.
+    pub cite_uris: Vec<Vec<String>>,
     /// Observation IDs cited verbatim, e.g. `obs-2`.
     pub cite_observations: Vec<String>,
     /// Appended verbatim (negative controls cite unknown documents here).
@@ -151,6 +153,27 @@ pub fn prompt_numbers(prompt: &str) -> Vec<(usize, String, String)> {
     out
 }
 
+/// Each `[DOC #n]` block of an answer prompt with its number: the lines from its
+/// header up to the next document, the live-evidence timeline or the instructions.
+pub fn prompt_blocks(prompt: &str) -> Vec<(usize, String)> {
+    let mut out: Vec<(usize, String)> = vec![];
+    let mut open = false;
+    for line in prompt.lines() {
+        if let Some(rest) = line.strip_prefix("[DOC #") {
+            let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+            out.push((digits.parse().unwrap_or(0), String::new()));
+            open = true;
+        } else if line.starts_with("Live evidence timeline") || line == "Instructions:" {
+            open = false;
+        }
+        if open && let Some((_, block)) = out.last_mut() {
+            block.push_str(line);
+            block.push('\n');
+        }
+    }
+    out
+}
+
 impl FakeOpenAi {
     fn answer(&self, question: &str, prompt: &str) -> String {
         let mut script = self.script.lock().unwrap();
@@ -164,7 +187,7 @@ impl FakeOpenAi {
         let docs: Vec<String> = spec
             .cite_uris
             .iter()
-            .filter_map(|uri| numbers.iter().find(|(_, _, u)| u == uri))
+            .filter_map(|uris| numbers.iter().find(|(_, _, u)| uris.contains(u)))
             .map(|(n, _, _)| format!("[DOC #{n}]"))
             .collect();
         let obs: Vec<String> = spec

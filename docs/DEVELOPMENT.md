@@ -110,9 +110,7 @@ INDEXER_WATERMARK=./watermark.json DD_API_KEY=... DD_APP_KEY=... DD_SITE=datadog
 How the indexer windows, checkpoints and deduplicates is described in
 [ARCHITECTURE.md](ARCHITECTURE.md#how-the-indexer-resumes). Unchanged documents are not
 re-embedded, and obsolete chunks and deleted monitors, dashboards and SLOs are removed
-([Incremental indexing](ARCHITECTURE.md#incremental-indexing)). The first run after
-upgrading to incremental indexing re-embeds everything once, because existing points
-have no content hash yet.
+([Incremental indexing](ARCHITECTURE.md#incremental-indexing)).
 
 ## Docker
 
@@ -273,7 +271,7 @@ variant, ignored by default, that uses a fresh collection on `QDRANT_TEST_ENDPOI
 
 | Test | Checks |
 |------|--------|
-| `pipeline_tests::contract` | Every stored point decodes (reader's `QdrantPayload`) to the chunk the adapters produced, under the UUIDv5 of its ID; `Kind` equals the filter's value; `Timestamp` is RFC 3339; `Service`/`Environment` are lowercase; `ContentHash`/`ChunkCount`/`SyncId` never reach `sources`. `/ask` returns the right documents for service (`Auth-API` from Datadog vs `AUTH-API` from the planner), environment, kind and time filters (half-open window, timeless kinds, a log pattern spanning the window); logs are grouped by pattern with their count; a multi-chunk log pattern is one source; `sources` are stored documents numbered like the prompt; unknown citations appear in `citationWarnings`; a second run rewrites nothing. |
+| `pipeline_tests::contract` | Every stored point decodes (reader's `QdrantPayload`) to the chunk the adapters produced, under the UUIDv5 of its ID; `Kind` equals the filter's value; `Timestamp` is RFC 3339; `Service`/`Environment` are lowercase; `ContentHash`/`ChunkCount`/`SyncId` never reach `sources`. `/ask` returns the right documents for service (`Auth-API` from Datadog vs `AUTH-API` from the planner), environment, kind and time filters (half-open window, timeless kinds, a log pattern day whose first and last log lie outside a short window it logged in, a day that logged only around the window left out); logs are grouped by pattern and UTC day with their count; a multi-chunk log pattern and the days of one pattern are one source, counted per day in the asker's timezone in the prompt; `sources` are stored documents numbered like the prompt; unknown citations appear in `citationWarnings`; a second run rewrites nothing. |
 | `pipeline_tests::unicode` | See [Unicode policy](#unicode-policy). |
 | `pipeline_tests::quality` | The [incident question set](#incident-question-set). |
 
@@ -319,15 +317,16 @@ and every payload survives the write/read round trip unchanged.
 ### Incident question set
 
 `crates/rag-indexer/tests/incident_questions/` holds a versioned, human-readable
-evaluation set: `questions.json` (19 incident questions) and `corpus.json` (monitors,
+evaluation set: `questions.json` (23 incident questions) and `corpus.json` (monitors,
 incidents, SLOs, logs, dashboards and metrics in Datadog response shape, with
 distractors: a similarly named service, another environment, events outside the window,
-a burst of 300 near-identical logs). `logBursts` in the corpus are expanded by the
+a burst of 300 near-identical logs, patterns logged on other days of the week). `logBursts` in the corpus are expanded by the
 harness into individual logs (`support/datadog.rs`, `expand_burst`).
 The recorded fixtures are indexed alongside. Each question has a fixed `now` and
 timezone, the canned planner reply (`plan`), optional explicit request fields, the
 expected `scope`, `mustRetrieve`/`mayRetrieve`/`mustNotRetrieve` document IDs, expected
-timeline observations with the live data that produces them, and what the answer cites.
+timeline observations with the live data that produces them, the `evidence` the prompt
+must state, and what the answer cites.
 
 Run it and print the report:
 
@@ -336,10 +335,10 @@ cargo test -p rag-indexer incident_questions_in_memory -- --nocapture
 ```
 
 ```
-question                     recall prec@R exclude scope   cites  intent   obs srcs  notes
-q01-checkout-slow-yesterday    1.00   1.00     8/8    ok     5/5     5/5   2/2    5
+question                     recall prec@R exclude scope   cites  intent   obs  evid srcs  notes
+q01-checkout-slow-yesterday    1.00   1.00     8/8    ok     5/5     5/5   2/2   0/0    5
 ...
-aggregate over 18 questions (known gaps excluded):
+aggregate over 22 questions (known gaps excluded):
   recall@k                   1.000 (threshold 0.95)
 ```
 
@@ -350,20 +349,25 @@ aggregate over 18 questions (known gaps excluded):
 - `cites`: citations in the answer that resolve / all citations (deliberate negative
   controls excluded). `intent`: intended citations that point at the intended document
   (`[DOC #n]` is `sources[n-1]`), and intended observations cited. `obs`: expected
-  observations present with their ID, kind and service. `srcs`: number of sources.
+  observations present with their ID, kind and service. `evid` (evidence accuracy):
+  `evidence` entries met, each naming a document that must appear as exactly one
+  `[DOC #n]` block of the answer prompt containing the given texts, such as a log
+  pattern's count in the question's window. `srcs`: number of sources.
 - `notes` lists misses, leaked distractors, scope differences, the top sources when
   precision drops, and the observations actually collected.
 
 Every question also asserts, regardless of thresholds, that `sources` are stored
-documents numbered like the prompt and that `citationWarnings` equals
+documents numbered like the prompt, that no document or log pattern is listed twice, and
+that `citationWarnings` equals
 `validate_citations` on the answer. The test fails when an aggregate drops below
 `thresholds` in `questions.json`.
 
 **Adding a question:** add documents to `corpus.json` if needed (IDs become
 `monitor_<id>`, `incident_<id>`, `slo_<id>`, `dashboard_<id>`,
 `metric_<name with dots as underscores>`; logs are indexed as
-[pattern documents](ARCHITECTURE.md#log-patterns), and `log_<id>` in a question names the
-pattern document holding log `<id>`), then an entry to `questions`. Unknown IDs fail the
+[pattern documents](ARCHITECTURE.md#log-patterns) per UTC day, and `log_<id>` in a
+question names the log pattern holding log `<id>`, which is one source whichever of its
+days represents it), then an entry to `questions`. Unknown IDs fail the
 run. The fake embeddings are a hashed bag of words, so a question tests ranking only when
 the words it shares with the relevant and the distracting documents decide the order. For live evidence add `live` (hourly series with `spikes`, log `bursts`); the
 observation IDs are assigned chronologically, so run once and read the collected

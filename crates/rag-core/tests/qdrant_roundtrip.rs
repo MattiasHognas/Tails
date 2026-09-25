@@ -124,7 +124,7 @@ async fn check_roundtrip(qdrant: &Qdrant) -> Result<()> {
 
 /// The retrieval scope filter must select events inside the window while keeping
 /// timestamp-less documents and configuration kinds (monitor/dashboard/SLO), and log
-/// patterns whose span overlaps the window.
+/// pattern days whose first..last log overlaps the window.
 async fn check_scope_filter(qdrant: &Qdrant) -> Result<()> {
     let doc = |id: &str, kind: SourceKind, ts: Option<&str>| RagDocument {
         id: id.into(),
@@ -137,22 +137,23 @@ async fn check_scope_filter(qdrant: &Qdrant) -> Result<()> {
         environment: "prod".into(),
         metadata: serde_json::Map::new(),
     };
-    // Log patterns span [Metadata.first_seen, Timestamp].
+    // A log pattern day spans [Metadata.first_seen, Timestamp] within one UTC day.
     let pattern = |id: &str, first: &str, last: &str| {
         let mut d = doc(id, SourceKind::Logs, Some(last));
         d.metadata.insert("first_seen".into(), json!(first));
         d
     };
     let docs = [
+        // Last log after the window: only `first_seen` places it inside.
         pattern(
-            "pattern_spanning",
-            "2026-09-22T20:00:00.000Z",
-            "2026-09-24T08:00:00.000Z",
+            "pattern_ending_after",
+            "2026-09-23T21:00:00.000Z",
+            "2026-09-23T23:00:00.000Z",
         ),
         pattern(
             "pattern_after",
             "2026-09-23T22:00:00.000Z",
-            "2026-09-24T08:00:00.000Z",
+            "2026-09-23T23:30:00.000Z",
         ),
         pattern(
             "pattern_before",
@@ -160,13 +161,21 @@ async fn check_scope_filter(qdrant: &Qdrant) -> Result<()> {
             "2026-09-22T21:59:59.999Z",
         ),
         doc(
-            "log_inside",
-            SourceKind::Logs,
+            "incident_inside",
+            SourceKind::Incident,
             Some("2026-09-23T10:00:00.123Z"),
         ),
-        doc("log_before", SourceKind::Logs, Some("2026-09-22T21:59:59Z")),
-        doc("log_at_end", SourceKind::Logs, Some("2026-09-23T22:00:00Z")),
-        doc("log_untimed", SourceKind::Logs, None),
+        doc(
+            "incident_before",
+            SourceKind::Incident,
+            Some("2026-09-22T21:59:59Z"),
+        ),
+        doc(
+            "incident_at_end",
+            SourceKind::Incident,
+            Some("2026-09-23T22:00:00Z"),
+        ),
+        doc("incident_untimed", SourceKind::Incident, None),
         doc("monitor", SourceKind::Monitor, None),
         doc(
             "dashboard_old",
@@ -207,21 +216,18 @@ async fn check_scope_filter(qdrant: &Qdrant) -> Result<()> {
         ids(hits),
         [
             "dashboard_old",
-            "log_inside",
-            "log_untimed",
+            "incident_inside",
+            "incident_untimed",
             "metric_old",
             "monitor",
-            "pattern_spanning",
+            "pattern_ending_after",
             "slo"
         ]
     );
 
     scope.kinds = vec![SourceKind::Logs, SourceKind::SLO];
     let hits = qdrant.search(vector, 100, scope.to_qdrant_filter()).await?;
-    assert_eq!(
-        ids(hits),
-        ["log_inside", "log_untimed", "pattern_spanning", "slo"]
-    );
+    assert_eq!(ids(hits), ["pattern_ending_after", "slo"]);
     Ok(())
 }
 

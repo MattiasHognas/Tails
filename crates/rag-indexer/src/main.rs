@@ -128,10 +128,10 @@ impl<E: Embedder, S: PointStore> DocumentSink for IncrementalSink<E, S> {
     }
 }
 
-/// Log pattern documents count only the logs of this run's fetch. Combines each with
-/// its stored point, so the stored count, first and last time seen cover every run and
-/// logs in the overlap with the previous run are counted once (see
-/// [`rag_core::log_patterns`]).
+/// Log pattern documents (one per pattern and UTC day) count only the logs of this
+/// run's fetch. Combines each with its stored point, so the stored hourly counts, first
+/// and last time seen cover every run and logs in the overlap with the previous run are
+/// counted once (see [`rag_core::log_patterns`]).
 async fn merge_log_patterns(
     sink: &impl DocumentSink,
     docs: Vec<RagDocument>,
@@ -889,15 +889,26 @@ mod tests {
         }
     }
 
-    /// Stored state of the only log pattern point.
-    fn stored_pattern(sink: &IncrementalSink<FakeEmbedder, FakeStore>) -> RagDocument {
+    /// Stored log pattern points by their UTC day.
+    fn stored_days(
+        sink: &IncrementalSink<FakeEmbedder, FakeStore>,
+    ) -> HashMap<String, RagDocument> {
         let points = sink.store.points.lock().unwrap();
-        let logs: Vec<_> = points
+        points
             .values()
             .filter(|p| p.payload.kind == SourceKind::Logs)
-            .collect();
-        assert_eq!(logs.len(), 1, "one point per pattern");
-        RagDocument::from(logs[0].payload.clone())
+            .map(|p| {
+                let doc = RagDocument::from(p.payload.clone());
+                (doc.metadata["day"].as_str().unwrap().to_string(), doc)
+            })
+            .collect()
+    }
+
+    /// Stored state of the only log pattern point.
+    fn stored_pattern(sink: &IncrementalSink<FakeEmbedder, FakeStore>) -> RagDocument {
+        let days = stored_days(sink);
+        assert_eq!(days.len(), 1, "one point per pattern and day");
+        days.into_values().next().unwrap()
     }
 
     /// Runs overlap by `INDEXER_OVERLAP_MINUTES`; a pattern seen in both is one point that
@@ -948,9 +959,15 @@ mod tests {
         assert_eq!(doc.metadata["last_seen"], "2025-01-01T12:10:00.000Z");
         assert_eq!(doc.timestamp.as_deref(), Some("2025-01-01T12:10:00.000Z"));
         assert!(
-            doc.text.contains("Occurrences: 5 error log(s)"),
+            doc.text
+                .contains("Occurrences on 2025-01-01 (UTC): 5 error log(s)"),
             "{}",
             doc.text
+        );
+        let hours = &doc.metadata["hour_counts"];
+        assert_eq!(
+            (&hours[10], &hours[11], &hours[12]),
+            (&1.into(), &3.into(), &1.into())
         );
 
         // The same window again (the checkpoint save failed): nothing changes and nothing
@@ -960,6 +977,66 @@ mod tests {
         index_sources(&fetcher, &sink, &mut retry, &path, &config(), second).await;
         assert_eq!(sink.embedder.embedded_texts().len(), embedded);
         assert_eq!(stored_pattern(&sink).metadata["count"], 5);
+    }
+
+    /// A window across UTC midnight updates the old day (a late log in the overlap is
+    /// added, the others are counted once) and starts the new one; the day after, only
+    /// the new day changes.
+    #[tokio::test]
+    async fn test_log_patterns_merge_both_days_of_a_window_across_midnight() {
+        let path = temp_checkpoint("log-patterns-midnight");
+        let fetcher = LogFetcher {
+            events: Mutex::new(vec![
+                log_event("1", "2025-01-01T23:00:00Z"),
+                log_event("2", "2025-01-01T23:52:00Z"),
+            ]),
+        };
+        let sink = incremental_sink();
+        let mut checkpoints = Checkpoints::default();
+        let first = ts("2025-01-01T23:55:00Z");
+        assert!(
+            index_sources(&fetcher, &sink, &mut checkpoints, &path, &config(), first)
+                .await
+                .is_empty()
+        );
+        fetcher.events.lock().unwrap().extend([
+            log_event("late", "2025-01-01T23:50:30Z"),
+            log_event("3", "2025-01-02T00:05:00Z"),
+            log_event("4", "2025-01-02T00:09:00Z"),
+        ]);
+        // Window 23:45..00:10.
+        let second = ts("2025-01-02T00:10:00Z");
+        assert!(
+            index_sources(&fetcher, &sink, &mut checkpoints, &path, &config(), second)
+                .await
+                .is_empty()
+        );
+        let days = stored_days(&sink);
+        assert_eq!(days.len(), 2);
+        let (old, new) = (&days["2025-01-01"], &days["2025-01-02"]);
+        assert_eq!(old.metadata["count"], 3);
+        assert_eq!(old.metadata["hour_counts"][23], 3);
+        assert_eq!(old.metadata["first_seen"], "2025-01-01T23:00:00.000Z");
+        assert_eq!(old.timestamp.as_deref(), Some("2025-01-01T23:52:00.000Z"));
+        assert_eq!(new.metadata["count"], 2);
+        assert_eq!(new.metadata["first_seen"], "2025-01-02T00:05:00.000Z");
+        assert_eq!(new.metadata["pattern_id"], old.metadata["pattern_id"]);
+        assert_ne!(new.id, old.id);
+
+        // Window 00:00..00:30: the old day is not fetched and stays as it is.
+        fetcher
+            .events
+            .lock()
+            .unwrap()
+            .push(log_event("5", "2025-01-02T00:25:00Z"));
+        let third = ts("2025-01-02T00:30:00Z");
+        index_sources(&fetcher, &sink, &mut checkpoints, &path, &config(), third).await;
+        let after = stored_days(&sink);
+        assert_eq!(
+            serde_json::to_value(&after["2025-01-01"]).unwrap(),
+            serde_json::to_value(old).unwrap()
+        );
+        assert_eq!(after["2025-01-02"].metadata["count"], 3);
     }
 
     /// Chunks plus the embedding header stay far below the per-request budget and the

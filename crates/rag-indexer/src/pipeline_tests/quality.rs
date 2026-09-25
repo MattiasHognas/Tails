@@ -21,10 +21,18 @@
 //!   document, i.e. `[DOC #n]` in the answer is `sources[n-1]`;
 //! - observation recall: expected timeline observations present with kind and service;
 //! - negative controls flagged: deliberately unknown citations reported in
-//!   `citationWarnings`.
+//!   `citationWarnings`;
+//! - evidence accuracy: share of `evidence` entries met, i.e. the document appears as
+//!   exactly one `[DOC #n]` block of the answer prompt and that block states the given
+//!   facts (for example a log pattern's count in the question's window).
+//!
+//! Documents are compared as the sources they are listed as: the days of one log pattern
+//! (`Metadata.pattern_id`) are one source, so `log_<id>` matches whichever day
+//! represents the pattern.
 //!
 //! Hard checks on every question: `sources` are stored documents numbered like the
-//! prompt, and `citationWarnings` equals [`validate_citations`] on the answer.
+//! prompt, no source is listed twice, and `citationWarnings` equals
+//! [`validate_citations`] on the answer.
 //!
 //! The test fails when an aggregate drops below `thresholds` in `questions.json`. Run
 //! with `-- --nocapture` for the report. See docs/DEVELOPMENT.md.
@@ -70,6 +78,7 @@ struct Thresholds {
     citation_accuracy: f64,
     observation_recall: f64,
     negative_controls_flagged: f64,
+    evidence_accuracy: f64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -100,6 +109,20 @@ struct Expect {
     #[serde(default)]
     must_not_retrieve: Vec<String>,
     timeline: Option<TimelineExpect>,
+    /// Facts the answer model must be given about a source (see [`EvidenceExpect`]).
+    #[serde(default)]
+    evidence: Vec<EvidenceExpect>,
+}
+
+/// What the prompt must tell the answer model about one source: `document` appears as
+/// exactly one `[DOC #n]` block, and that block contains every string in `contains`
+/// (for example the count of a log pattern in the question's window). This checks the
+/// evidence text itself, which retrieval metrics cannot see.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EvidenceExpect {
+    document: String,
+    contains: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -195,6 +218,9 @@ fn load() -> (Dataset, Corpus) {
         resolve(&mut q.expect.may_retrieve);
         resolve(&mut q.expect.must_not_retrieve);
         resolve(&mut q.answer.cite_documents);
+        for x in &mut q.expect.evidence {
+            x.document = corpus.resolve(&x.document);
+        }
     }
     (dataset, corpus)
 }
@@ -272,6 +298,8 @@ struct Row {
     obs_expected: usize,
     negatives_flagged: usize,
     negatives_total: usize,
+    evidence_ok: usize,
+    evidence_total: usize,
     sources: usize,
     problems: Vec<String>,
 }
@@ -289,6 +317,7 @@ struct Aggregate {
     citation_accuracy: f64,
     observation_recall: f64,
     negative_controls_flagged: f64,
+    evidence_accuracy: f64,
 }
 
 fn aggregate(rows: &[Row]) -> Aggregate {
@@ -304,11 +333,12 @@ fn aggregate(rows: &[Row]) -> Aggregate {
         citation_accuracy: ratio(sum(|r| r.intended_ok), sum(|r| r.intended_total)),
         observation_recall: ratio(sum(|r| r.obs_found), sum(|r| r.obs_expected)),
         negative_controls_flagged: ratio(sum(|r| r.negatives_flagged), sum(|r| r.negatives_total)),
+        evidence_accuracy: ratio(sum(|r| r.evidence_ok), sum(|r| r.evidence_total)),
     }
 }
 
 async fn run(store: Store, models: Models) -> (Vec<Row>, Thresholds) {
-    let (dataset, corpus) = load();
+    let (mut dataset, corpus) = load();
     let fake = FakeOpenAi::default();
     let fake_server = fake.start().await;
     let oa: OpenAiClient = match models {
@@ -332,12 +362,33 @@ async fn run(store: Store, models: Models) -> (Vec<Row>, Thresholds) {
             .chain(&e.may_retrieve)
             .chain(&e.must_not_retrieve)
             .chain(&q.answer.cite_documents)
+            .chain(e.evidence.iter().map(|x| &x.document))
         {
             assert!(
                 parents.contains_key(id.as_str()),
                 "{}: unknown document {id}",
                 q.id
             );
+        }
+    }
+    // Expectations name sources: the days of one log pattern are one source.
+    let groups = source_groups(&parents);
+    for q in &mut dataset.questions {
+        let to_groups = |ids: &mut Vec<String>| {
+            let mut out: Vec<String> = vec![];
+            for g in ids.iter().map(|id| groups[id].clone()) {
+                if !out.contains(&g) {
+                    out.push(g);
+                }
+            }
+            *ids = out;
+        };
+        to_groups(&mut q.expect.must_retrieve);
+        to_groups(&mut q.expect.may_retrieve);
+        to_groups(&mut q.expect.must_not_retrieve);
+        to_groups(&mut q.answer.cite_documents);
+        for x in &mut q.expect.evidence {
+            x.document = groups[&x.document].clone();
         }
     }
 
@@ -352,8 +403,17 @@ async fn run(store: Store, models: Models) -> (Vec<Row>, Thresholds) {
         }
     );
     println!(
-        "{:<28} {:>6} {:>6} {:>7} {:>5} {:>7} {:>7} {:>5} {:>4}  notes",
-        "question", "recall", "prec@R", "exclude", "scope", "cites", "intent", "obs", "srcs"
+        "{:<28} {:>6} {:>6} {:>7} {:>5} {:>7} {:>7} {:>5} {:>5} {:>4}  notes",
+        "question",
+        "recall",
+        "prec@R",
+        "exclude",
+        "scope",
+        "cites",
+        "intent",
+        "obs",
+        "evid",
+        "srcs"
     );
 
     let mut rows = vec![];
@@ -375,7 +435,13 @@ async fn run(store: Store, models: Models) -> (Vec<Row>, Thresholds) {
                         .answer
                         .cite_documents
                         .iter()
-                        .map(|id| parents[id.as_str()].source_uri.clone())
+                        .map(|g| {
+                            parents
+                                .iter()
+                                .filter(|(id, _)| groups[**id] == *g)
+                                .map(|(_, d)| d.source_uri.clone())
+                                .collect()
+                        })
                         .collect(),
                     cite_observations: q.answer.cite_observations.clone(),
                     extra: q.answer.extra.clone(),
@@ -403,9 +469,9 @@ async fn run(store: Store, models: Models) -> (Vec<Row>, Thresholds) {
             .prompts
             .get(&q.question)
             .cloned();
-        let row = score(q, &resp, prompt.as_deref(), &parents, models);
+        let row = score(q, &resp, prompt.as_deref(), &parents, &groups, models);
         println!(
-            "{:<28} {:>6.2} {:>6.2} {:>7} {:>5} {:>7} {:>7} {:>5} {:>4}  {}{}",
+            "{:<28} {:>6.2} {:>6.2} {:>7} {:>5} {:>7} {:>7} {:>5} {:>5} {:>4}  {}{}",
             q.id.chars().take(28).collect::<String>(),
             row.recall,
             row.precision,
@@ -414,6 +480,7 @@ async fn run(store: Store, models: Models) -> (Vec<Row>, Thresholds) {
             format!("{}/{}", row.citations_valid, row.citations_total),
             format!("{}/{}", row.intended_ok, row.intended_total),
             format!("{}/{}", row.obs_found, row.obs_expected),
+            format!("{}/{}", row.evidence_ok, row.evidence_total),
             row.sources,
             if row.known_gap { "KNOWN GAP; " } else { "" },
             row.problems.join("; "),
@@ -455,6 +522,11 @@ async fn run(store: Store, models: Models) -> (Vec<Row>, Thresholds) {
             a.negative_controls_flagged,
             t.negative_controls_flagged,
         ),
+        (
+            "evidence accuracy",
+            a.evidence_accuracy,
+            t.evidence_accuracy,
+        ),
     ] {
         println!(
             "  {name:<26} {got:.3} (threshold {min:.2}){}",
@@ -483,10 +555,15 @@ fn score(
     resp: &Value,
     prompt: Option<&str>,
     parents: &BTreeMap<&str, &rag_core::domain::RagDocument>,
+    groups: &BTreeMap<String, String>,
     models: Models,
 ) -> Row {
     let e = &q.expect;
-    let ids = support::source_ids(resp);
+    // Sources as the groups the expectations name (see `source_groups`).
+    let ids: Vec<String> = support::source_ids(resp)
+        .iter()
+        .map(|id| groups.get(id).cloned().unwrap_or_else(|| id.clone()))
+        .collect();
     let sources = resp["sources"].as_array().unwrap();
     let mut row = Row {
         id: q.id.clone(),
@@ -596,6 +673,13 @@ fn score(
         assert_eq!(s["uri"], doc.source_uri, "{}: {id}", q.id);
         assert_eq!(s["title"], doc.title, "{}: {id}", q.id);
     }
+    for (i, id) in ids.iter().enumerate() {
+        assert!(
+            !ids[..i].contains(id),
+            "{}: {id} is listed twice in sources",
+            q.id
+        );
+    }
     if let Some(prompt) = prompt.filter(|_| models == Models::Fake) {
         let numbered = support::openai::prompt_numbers(prompt);
         assert_eq!(numbered.len(), sources.len(), "{}: prompt vs sources", q.id);
@@ -607,6 +691,40 @@ fn score(
                 "{}",
                 q.id
             );
+        }
+    }
+
+    // Evidence given to the answer model.
+    if models == Models::Fake {
+        let blocks = support::openai::prompt_blocks(prompt.unwrap_or_default());
+        for x in &e.evidence {
+            row.evidence_total += 1;
+            let mine: Vec<&String> = blocks
+                .iter()
+                .filter(|(n, _)| ids.get(n.wrapping_sub(1)) == Some(&x.document))
+                .map(|(_, b)| b)
+                .collect();
+            let [block] = mine.as_slice() else {
+                row.problems.push(format!(
+                    "{} is in {} prompt documents, want 1",
+                    x.document,
+                    mine.len()
+                ));
+                continue;
+            };
+            let missing: Vec<&String> = x.contains.iter().filter(|c| !block.contains(*c)).collect();
+            if missing.is_empty() {
+                row.evidence_ok += 1;
+            } else {
+                let facts: Vec<&str> = block
+                    .lines()
+                    .filter(|l| l.starts_with("Occurrences") || l.starts_with("Excerpt"))
+                    .collect();
+                row.problems.push(format!(
+                    "{} evidence lacks {missing:?} (has {facts:?})",
+                    x.document
+                ));
+            }
         }
     }
 
@@ -677,6 +795,20 @@ fn score(
     row
 }
 
+/// The source each stored document is listed as: a log pattern's day documents share
+/// `Metadata.pattern_id` and are one source; any other document is its own.
+fn source_groups(
+    parents: &BTreeMap<&str, &rag_core::domain::RagDocument>,
+) -> BTreeMap<String, String> {
+    parents
+        .iter()
+        .map(|(id, d)| {
+            let group = d.metadata.get("pattern_id").and_then(Value::as_str);
+            (id.to_string(), group.unwrap_or(id).to_string())
+        })
+        .collect()
+}
+
 fn assert_thresholds(rows: &[Row], t: Thresholds, models: Models) {
     let a = aggregate(rows);
     let mut failures = vec![];
@@ -713,6 +845,11 @@ fn assert_thresholds(rows: &[Row], t: Thresholds, models: Models) {
             "negative controls flagged",
             a.negative_controls_flagged,
             t.negative_controls_flagged,
+        );
+        check(
+            "evidence accuracy",
+            a.evidence_accuracy,
+            t.evidence_accuracy,
         );
     }
     assert!(
