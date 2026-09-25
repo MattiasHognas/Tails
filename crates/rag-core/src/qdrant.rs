@@ -493,10 +493,10 @@ impl Qdrant {
     ///
     /// Returns at most `limit` hits. A hit's score is its fused RRF score divided by the
     /// best possible one (first in every prefetch list), so it lies in (0, 1]: 1 means
-    /// ranked first by every search, 0.5 first by half of them (or second by all, with
-    /// [`RRF_K`] = 2). Only ranks count, not the raw similarities, so scores of different
-    /// questions are comparable and the reranker's kind priors and recency decay scale
-    /// them like before.
+    /// ranked first by every search, 0.667 second by all, 0.5 first by half of them or
+    /// third by all (with [`RRF_K`] = 2). Only ranks count, not the raw similarities, so
+    /// scores of different questions are comparable and the reranker's kind priors and
+    /// recency weight ([`crate::reranker::recency_weight`]) scale them like before.
     pub async fn hybrid_search(
         &self,
         queries: &[SearchQuery],

@@ -469,10 +469,12 @@ async fn ask(
             &st.limits.stages,
         )
         .await?;
-        // Log pattern days are counted in the asked window, in the asker's timezone.
+        // Log pattern days are counted in the asked window, in the asker's timezone;
+        // recency is weighted against the window, or without one against the clock.
         let window = AskWindow {
             from: scope.from_utc,
             to: scope.to_utc,
+            now: ctx.now,
             tz: ctx.tz,
         };
         let hits = logged_in_window(hits, &window);

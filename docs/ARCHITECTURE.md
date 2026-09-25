@@ -356,9 +356,9 @@ with `--json`) on stderr and exits with status 1.
   search finds paraphrases; keyword search finds the exact error code, exception, metric
   name or host a question quotes, which a dense vector blurs with similar ones.
 - **Scores:** a hit's score is its fused score divided by the best possible one (first in
-  every list), so it is in (0, 1]: 1 is first everywhere, 0.5 first in half of the lists
-  or second in all. Only ranks count, not raw similarities, so the scale is the same for
-  every question; the reranker's kind priors, recency decay and relevance/diversity
+  every list), so it is in (0, 1]: 1 is first everywhere, 0.667 second in all, 0.5 first
+  in half of the lists or third in all. Only ranks count, not raw similarities, so the scale is the same for
+  every question; the reranker's kind priors, recency weight and relevance/diversity
   balance apply to it as they did to cosine similarities. The answer prompt shows the
   reranked score.
 - **Top-K:** `choose_topk()` picks how many hits the answer uses. It starts at
@@ -371,12 +371,45 @@ with `--json`) on stderr and exits with status 1.
   the window between the day's first and last log.
 - **Reranking:** `rerank_mmr_signals()`:
   - weights scores by source kind (incident 1.10, monitor 1.05, SLO 1.03, logs 0.98);
-  - applies a 24-hour recency half-life, never cutting a score below half;
+  - weights scores by recency (see below), given the question's window and `now` (the
+    API's clock) explicitly, so the ranking never depends on the wall clock;
   - keeps the best hit per source, also when there are fewer candidates than K, so a
     source is never numbered twice. A source is a document (its chunks share
     `Metadata.chunk_of`) or a log pattern (its days share `Metadata.pattern_id`); ties go
     to the lower ID;
   - selects the top-K with maximal marginal relevance, so near-duplicate text is skipped.
+- **Recency weight** (`recency_weight()`): a factor from a baseline `B` up to 1. Only
+  events (logs, incidents, change events) can earn more than `B`, because only their
+  `Timestamp` says when something happened:
+
+  | Document | With a window (`B` = 0.5) | Without a window (`B` = 0.75) |
+  |---|---|---|
+  | Monitor, dashboard, SLO, metric (`TIMELESS_KINDS`), any timestamp | `B` | `B` |
+  | Undated event, or unparsable timestamp | `B` | `B` |
+  | Event in the window (a log pattern day from its first to its last log) | 1, however long ago | – |
+  | Other event | `B + (1 − B)·2^(−d / 24 h)`, `d` = distance to the window | `B + (1 − B)·2^(−age / 24 h)`, age from `now` |
+
+  - The timestamp of a timeless document is a creation or last-seen date, not relevance,
+    so it is ignored. An old event and a timeless document therefore compare on retrieval
+    score and kind prior alone: recency is a bonus for fresh or in-window events, never a
+    penalty below what a timeless document gets. (Before, dated documents were halved a
+    day after their timestamp and undated ones never were, so with rank fusion a
+    week-old incident ranked first by every search lost to a monitor ranked second:
+    1.0 × 1.10 × 0.5 = 0.55 against 0.667 × 1.05 = 0.70.)
+  - With a window the user named the time, so being in it is strong evidence: up to 2×,
+    about two ranks of the fused score (1st in every list 1.0, 3rd 0.5). An event in
+    the window beats a timeless document that merely shares more words, such as the
+    service's overview dashboard for "what happened on 2 March". Events outside the
+    window rarely reach the reranker: the retrieval filter drops dated events outside
+    it, and log pattern days that logged nothing in it are dropped before reranking.
+  - Without a window, "recent" is only a preference: at most 1.33×, less than the gap
+    between 1st and 2nd in every list (1.5×). It orders comparable matches (the error
+    from 20 minutes ago before an equally matching one from five days ago) but never
+    lifts a fresh event over one that clearly matches better. A day old weighs 0.875,
+    five days 0.758, a week or more ≈ 0.75.
+  - Age is measured from `now`, not from the newest candidate: relative to the newest
+    candidate, a stale index would give its newest event the full bonus, and a
+    document's weight would change with which other documents were retrieved.
 - **Answering:** `answer_candidates()` sends the selected documents (title, kind, time,
   service, environment, source link and key metadata) and, when collected, the rendered
   live-evidence timeline to the chat model. A log pattern is shown as its representative

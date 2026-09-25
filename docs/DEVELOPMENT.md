@@ -336,12 +336,13 @@ and every payload survives the write/read round trip unchanged.
 ### Incident question set
 
 `crates/rag-indexer/tests/incident_questions/` holds a versioned, human-readable
-evaluation set: `questions.json` (30 incident questions) and `corpus.json` (monitors,
+evaluation set: `questions.json` (33 incident questions) and `corpus.json` (monitors,
 incidents with their timelines and postmortem notebooks, SLOs, logs, dashboards with
 their definitions, and metrics in Datadog response shape, with
 distractors: a similarly named service, another environment, events outside the window,
 a burst of 300 near-identical logs, patterns logged on other days of the week, error
-codes and metric names that differ from the asked one in a single word). `logBursts` in the corpus are expanded by the
+codes and metric names that differ from the asked one in a single word, and events of
+different ages next to timeless monitors and dashboards). `logBursts` in the corpus are expanded by the
 harness into individual logs (`support/datadog.rs`, `expand_burst`).
 The recorded fixtures are indexed alongside. Each question has a fixed `now` and
 timezone, the canned planner reply (`plan`), optional explicit request fields, the
@@ -359,7 +360,7 @@ cargo test -p rag-indexer incident_questions_in_memory -- --nocapture
 question                     recall prec@R exclude scope   cites  intent   obs  evid srcs  notes
 q01-checkout-slow-yesterday    1.00   1.00     8/8    ok     5/5     5/5   2/2   0/0    5
 ...
-aggregate over 30 questions (known gaps excluded):
+aggregate over 33 questions (known gaps excluded):
   recall@k                   1.000 (threshold 0.95)
 ```
 

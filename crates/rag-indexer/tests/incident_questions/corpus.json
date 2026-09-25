@@ -1,6 +1,6 @@
 {
   "version": 4,
-  "description": "Crafted Datadog corpus for the incident question set (questions.json). Objects have the shape of Datadog API responses so the real adapters parse them. Services: checkout, checkout-worker (similar name), payments, auth-api, sökmotor, inventory, orders, recommendations, ledger, orders-db, edge-gateway, checkout-api, storefront; environments prod and staging. 'logBursts' are runs of near-identical logs that the harness expands into individual logs (support/datadog.rs, expand_burst). Dashboards are full dashboard definitions (the fake list endpoint returns only the summary keys; GET /api/v1/dashboard/{id} returns the rest). 'incidentTimelines' and 'incidentAttachments' (per incident ID) and 'notebooks' are served by the per-incident timeline, attachments and notebook endpoints. The questions are asked at 2026-03-12T09:00:00Z in Europe/Stockholm, so 'yesterday' is 2026-03-10T23:00:00Z..2026-03-11T23:00:00Z. The recorded fixtures' monitors, dashboards, SLOs and metrics are indexed alongside as unrelated distractors. Checkout logs in January and February belong to q20-q23, which set their own 'now'.",
+  "description": "Crafted Datadog corpus for the incident question set (questions.json). Objects have the shape of Datadog API responses so the real adapters parse them. Services: checkout, checkout-worker (similar name), payments, auth-api, sökmotor, inventory, orders, recommendations, ledger, orders-db, fulfillment, notifications, billing, edge-gateway, checkout-api, storefront; environments prod and staging. 'logBursts' are runs of near-identical logs that the harness expands into individual logs (support/datadog.rs, expand_burst). Dashboards are full dashboard definitions (the fake list endpoint returns only the summary keys; GET /api/v1/dashboard/{id} returns the rest). 'incidentTimelines' and 'incidentAttachments' (per incident ID) and 'notebooks' are served by the per-incident timeline, attachments and notebook endpoints. The questions are asked at 2026-03-12T09:00:00Z in Europe/Stockholm, so 'yesterday' is 2026-03-10T23:00:00Z..2026-03-11T23:00:00Z. The recorded fixtures' monitors, dashboards, SLOs and metrics are indexed alongside as unrelated distractors. Checkout logs in January and February belong to q20-q23, which set their own 'now'.",
   "monitors": [
     {
       "id": 1001,
@@ -56,7 +56,9 @@
     {"id": 1101, "type": "query alert", "name": "Storefront 5xx responses", "query": "sum(last_5m):sum:trace.http.request.errors{service:storefront,env:prod}.as_count() > 50", "message": "Storefront returns 5xx responses. Check recent deploys.", "tags": ["service:storefront", "env:prod", "team:web"]},
     {"id": 1102, "type": "query alert", "name": "Storefront traffic monitor", "query": "sum(last_10m):sum:trace.http.request.hits{service:storefront,env:prod}.as_count() < 100", "message": "This monitor pages storefront when storefront traffic drops.", "tags": ["service:storefront", "env:prod", "team:web"]},
     {"id": 1103, "type": "query alert", "name": "Storefront latency above 3s", "query": "avg(last_5m):avg:trace.http.request.duration{service:storefront,env:prod} > 3", "message": "Page load is slow; timeouts turn into errors for shoppers at the payment step.", "tags": ["service:storefront", "env:prod", "team:web"]},
-    {"id": 1104, "type": "query alert", "name": "Storefront Apdex", "query": "avg(last_15m):avg:trace.http.request.apdex{service:storefront,env:prod} < 0.8", "message": "User satisfaction dropped.", "tags": ["service:storefront", "env:prod", "team:web"]}
+    {"id": 1104, "type": "query alert", "name": "Storefront Apdex", "query": "avg(last_15m):avg:trace.http.request.apdex{service:storefront,env:prod} < 0.8", "message": "User satisfaction dropped.", "tags": ["service:storefront", "env:prod", "team:web"]},
+    {"id": 4001, "type": "query alert", "name": "Fulfillment shipping label printer errors", "query": "sum(last_5m):sum:fulfillment.label.print.errors{service:fulfillment,env:prod}.as_count() > 20", "message": "The fulfillment label printer fails to print shipping labels. Check the printer queue and the carrier API.", "tags": ["service:fulfillment", "env:prod", "team:logistics"]},
+    {"id": 4101, "type": "query alert", "name": "Billing invoice generation errors", "query": "sum(last_15m):sum:billing.invoice.errors{service:billing,env:prod}.as_count() > 10", "message": "Billing fails to generate invoices: what went wrong is usually the tax rate service. Check it before rerunning the invoice batch.", "tags": ["service:billing", "env:prod", "team:finance-platform"]}
   ],
   "slos": [
     {
@@ -322,6 +324,70 @@
         }
       },
       "relationships": {"attachments": {"data": []}}
+    },
+    {
+      "id": "inc-fulfillment-labels",
+      "type": "incidents",
+      "attributes": {
+        "public_id": 50,
+        "title": "Every shipping label printed twice",
+        "created": "2026-03-04T15:00:00+00:00",
+        "state": "resolved",
+        "customer_impact_scope": "Fulfillment printed every shipping label twice and parcels were shipped twice: the label printer retried each print job after a carrier API timeout.",
+        "fields": {
+          "severity": {
+            "type": "dropdown",
+            "value": "SEV-3"
+          },
+          "services": {
+            "type": "autocomplete",
+            "value": [
+              "fulfillment"
+            ]
+          },
+          "env": {
+            "type": "dropdown",
+            "value": "prod"
+          }
+        }
+      },
+      "relationships": {
+        "attachments": {
+          "data": []
+        }
+      }
+    },
+    {
+      "id": "inc-billing-vat",
+      "type": "incidents",
+      "attributes": {
+        "public_id": 51,
+        "title": "Invoices sent at the previous VAT rate",
+        "created": "2026-03-10T09:30:00+00:00",
+        "state": "resolved",
+        "customer_impact_scope": "Billing sent 1,200 invoices at the previous VAT rate: the tax rate cache was not refreshed.",
+        "fields": {
+          "severity": {
+            "type": "dropdown",
+            "value": "SEV-3"
+          },
+          "services": {
+            "type": "autocomplete",
+            "value": [
+              "billing"
+            ]
+          },
+          "env": {
+            "type": "dropdown",
+            "value": "prod"
+          }
+        }
+      },
+      "relationships": {
+        "attachments": {
+          "data": []
+        }
+      }
     }
   ],
   "logs": [
@@ -348,7 +414,9 @@
     {"id": "ca-retry", "type": "log", "attributes": {"service": "checkout-api", "status": "error", "timestamp": "2026-03-11T15:03:00.000Z", "message": "card payment retry failures: gateway timeout after 2 attempts", "tags": ["env:prod"]}},
     {"id": "ca-exhausted", "type": "log", "attributes": {"service": "checkout-api", "status": "error", "timestamp": "2026-03-11T15:02:00.000Z", "message": "retries exhausted: card vault did not respond within 5s", "tags": ["env:prod"]}},
     {"id": "ca-3ds", "type": "log", "attributes": {"service": "checkout-api", "status": "error", "timestamp": "2026-03-11T15:01:00.000Z", "message": "3-D Secure challenge failed for card, retries disabled for this merchant", "tags": ["env:prod"]}},
-    {"id": "ca-cart", "type": "log", "attributes": {"service": "checkout-api", "status": "error", "timestamp": "2026-03-11T15:00:00.000Z", "message": "throw away stale cart session after checkout timeout", "tags": ["env:prod"]}}
+    {"id": "ca-cart", "type": "log", "attributes": {"service": "checkout-api", "status": "error", "timestamp": "2026-03-11T15:00:00.000Z", "message": "throw away stale cart session after checkout timeout", "tags": ["env:prod"]}},
+    {"id": "ntf-push", "type": "log", "attributes": {"service": "notifications", "status": "error", "timestamp": "2026-03-07T10:00:00.000Z", "message": "notifications failing now: push delivery rejected by APNs, key expired", "tags": ["env:prod"]}},
+    {"id": "ntf-email", "type": "log", "attributes": {"service": "notifications", "status": "error", "timestamp": "2026-03-12T08:40:00.000Z", "message": "notifications failing: email delivery rejected by the SMTP relay", "tags": ["env:prod"]}}
   ],
   "logBursts": [
     {"idPrefix": "rec-burst-", "count": 300, "start": "2026-03-12T06:00:00.000Z", "everySeconds": 10, "service": "recommendations", "env": "prod", "status": "error", "message": "recommendations cache timeout: redis GET took {ms}ms for key user:{uuid}"},

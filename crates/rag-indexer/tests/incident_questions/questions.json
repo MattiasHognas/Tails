@@ -339,6 +339,40 @@
       "answer": {"citeDocuments": ["log_co-inv-fri-0"]}
     },
     {
+      "id": "q24-last-week-incident-vs-monitor",
+      "question": "Why did fulfillment print every shipping label twice?",
+      "note": "No window. The incident from a week ago answers the question and ranks first in every search; the fulfillment monitor matches only some of the words. Recency must not decide between an event and a timeless document: when dated evidence older than a day was halved and undated monitors were not, the monitor ranked first.",
+      "plan": {"intent": "rootCause", "service": "fulfillment", "environment": "prod"},
+      "expect": {
+        "scope": {"service": "fulfillment", "environment": "prod", "fromUtc": null, "toUtc": null, "kinds": []},
+        "mustRetrieve": ["incident_inc-fulfillment-labels"]
+      },
+      "answer": {"citeDocuments": ["incident_inc-fulfillment-labels"]}
+    },
+    {
+      "id": "q25-failing-right-now",
+      "question": "What is failing in notifications right now?",
+      "note": "No window. Two notification error patterns match about equally; the one from five days ago matches slightly better, the one from 20 minutes ago is what is failing now. Without any recency preference, or with every dated document at the same floor, the old one ranks first.",
+      "plan": {"intent": "semanticLogSearch", "service": "notifications", "environment": "prod", "rewrittenQuery": "notifications delivery failing errors"},
+      "expect": {
+        "scope": {"service": "notifications", "environment": "prod", "fromUtc": null, "toUtc": null, "kinds": []},
+        "mustRetrieve": ["log_ntf-email"]
+      },
+      "answer": {"citeDocuments": ["log_ntf-email"]}
+    },
+    {
+      "id": "q26-last-tuesday-in-window",
+      "question": "What went wrong with billing invoices last Tuesday?",
+      "note": "Window: Tuesday in Stockholm, two days before 'now'. The billing monitor repeats the question's words and ranks above the incident, but the incident is the event in the window. An in-window event is not penalised for its age and a timeless monitor is no evidence of what happened then; when dated evidence was decayed from the wall clock and undated monitors were not, the monitor ranked first.",
+      "plan": {"intent": "incidentSummary", "service": "billing", "environment": "prod",
+               "window": {"fromUtc": "2026-03-09T23:00:00Z", "toUtc": "2026-03-10T23:00:00Z"}},
+      "expect": {
+        "scope": {"service": "billing", "environment": "prod", "fromUtc": "2026-03-09T23:00:00Z", "toUtc": "2026-03-10T23:00:00Z", "kinds": []},
+        "mustRetrieve": ["incident_inc-billing-vat"]
+      },
+      "answer": {"citeDocuments": ["incident_inc-billing-vat"]}
+    },
+    {
       "id": "q30-exact-error-code",
       "question": "Why does edge-gateway log ERR_CONN_RESET when calling payments upstream?",
       "note": "Six edge-gateway error patterns share the question's words. A timeout while calling payments upstream shares more of them than the ERR_CONN_RESET log, so dense search alone ranks it first; the keyword search matches the exact code, which only eg-reset contains.",
