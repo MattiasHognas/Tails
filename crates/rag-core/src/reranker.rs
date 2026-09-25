@@ -124,6 +124,12 @@ fn prior(kind: &SourceKind) -> f32 {
         SourceKind::Metrics => 1.00,
         SourceKind::Logs => 0.98,
         SourceKind::Git => 1.0,
+        // A deploy or config change is a frequent root-cause lead, so slightly above
+        // neutral; below incidents and monitors, which state the problem itself.
+        SourceKind::Change => 1.02,
+        // Reference data (owners, runbooks, dependencies): neutral, or it would top
+        // every question about its service.
+        SourceKind::ServiceCatalog => 1.00,
     }
 }
 
@@ -325,14 +331,27 @@ mod tests {
             hit("slo", "s s", 1.0, SourceKind::SLO),
             hit("incident", "i i", 1.0, SourceKind::Incident),
             hit("monitor", "m m", 1.0, SourceKind::Monitor),
+            hit("change", "c c", 1.0, SourceKind::Change),
+            hit("catalog", "k k", 1.0, SourceKind::ServiceCatalog),
         ];
-        let out = rerank_mmr_signals(&candidates, 5, &no_window());
+        let out = rerank_mmr_signals(&candidates, 7, &no_window());
         assert_eq!(
             ids(&out),
-            ["incident", "monitor", "slo", "dashboard", "logs"]
+            [
+                "incident",
+                "monitor",
+                "slo",
+                "change",
+                "catalog",
+                "dashboard",
+                "logs"
+            ]
         );
         let scores: Vec<f32> = out.iter().map(|h| h.score).collect();
-        for (got, want) in scores.iter().zip([1.10, 1.05, 1.03, 1.00, 0.98]) {
+        for (got, want) in scores
+            .iter()
+            .zip([1.10, 1.05, 1.03, 1.02, 1.00, 1.00, 0.98])
+        {
             assert!(close(*got, want * 0.75), "{scores:?}");
         }
     }

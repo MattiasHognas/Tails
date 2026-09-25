@@ -40,7 +40,7 @@ flowchart TB
         resil["resilience: run_stage() timeouts,<br/>send_with_retry() backoff for 429/5xx"]
         oaClient["OpenAiClient<br/>embed() / embed_batch()<br/>chat_json() / chat_complete()"]
         qdClient["Qdrant<br/>hybrid_search() / upsert()<br/>check_collection() / create_collection()<br/>retrieve_states() / set_payload()<br/>count() / delete_by_filter()"]
-        ddClient["Datadog adapters<br/>indexing: get_monitors() list_dashboards() list_slos()<br/>list_metrics() get_incidents() search_logs() (grouped by pattern and day)<br/>live: query_metrics() search_log_events()"]
+        ddClient["Datadog adapters<br/>indexing: get_monitors() list_dashboards() list_slos()<br/>list_metrics() get_incidents() search_logs() (grouped by pattern and day)<br/>list_service_definitions() search_change_events()<br/>live: query_metrics() search_log_events()"]
         chunker["chunk() + stable_id()<br/>content_hash() embedding_input()<br/>sparse: keyword vectors<br/>log_patterns: group / merge"]
         liveCore["live_evidence<br/>discover(): services + metrics from hits<br/>analysis: spikes, drops, gaps, log bursts vs baseline<br/>timeline: observations / hypotheses / missing"]
     end
@@ -59,7 +59,7 @@ flowchart TB
     subgraph ext ["External services"]
         openai[["OpenAI<br/>/v1/embeddings<br/>/v1/chat/completions"]]
         qdrant[("Qdrant<br/>POST /collections/{c}/points/query<br/>GET, PUT /collections/{c}<br/>PUT /collections/{c}/points<br/>POST /collections/{c}/points (retrieve)<br/>POST .../points/payload, /delete, /count")]
-        datadog[["Datadog API<br/>/api/v1/monitor, /dashboard, /dashboard/{id}, /slo, /metrics<br/>/api/v1/notebooks/{id} (postmortems)<br/>/api/v1/query (live time series)<br/>/api/v2/incidents/search, /incidents/{id}/timeline, /incidents/{id}/attachments<br/>/api/v2/logs/events/search"]]
+        datadog[["Datadog API<br/>/api/v1/monitor, /dashboard, /dashboard/{id}, /slo, /metrics<br/>/api/v1/notebooks/{id} (postmortems)<br/>/api/v1/query (live time series)<br/>/api/v2/incidents/search, /incidents/{id}/timeline, /incidents/{id}/attachments<br/>/api/v2/logs/events/search<br/>/api/v2/services/definitions<br/>/api/v2/events/search"]]
     end
 
     %% Question flow
@@ -151,12 +151,13 @@ What each part does:
   checkpoint (with overlap for late data). It then fetches, deduplicates (for logs, merges
   each message pattern's day with its stored counts) and chunks,
   skips documents whose stored content hash is unchanged, embeds the rest in batches and
-  upserts them, removes obsolete chunks (and, for monitors, dashboards and SLOs, documents
-  deleted in Datadog), and advances that source's checkpoint only after success. One
-  failing source doesn't block the others.
+  upserts them, removes obsolete chunks (and, for monitors, dashboards, SLOs and service
+  definitions, documents deleted in Datadog), and advances that source's checkpoint only
+  after success. One failing source doesn't block the others.
 - **External services**:
-  - **Datadog**: the source of monitors, dashboards, SLOs, metric names, incidents and
-    logs for indexing, and of live time series and logs for diagnostic questions.
+  - **Datadog**: the source of monitors, dashboards, SLOs, metric names, incidents, logs,
+    service definitions (Software Catalog) and change events (deploys, configuration
+    changes) for indexing, and of live time series and logs for diagnostic questions.
   - **OpenAI**: embeddings, planning, and answers.
   - **Qdrant**: the vector store the API searches (dense and sparse vectors).
 
@@ -164,7 +165,7 @@ What each part does:
 
 | Crate | Description |
 |-------|--------------|
-| `rag-core` | Domain models, OpenAI (chat, single and batched embeddings), Qdrant (hybrid search, upsert, collection setup, and the incremental-indexing retrieve/set-payload/count/delete calls), keyword (sparse) vectors, Datadog client (monitors, incidents, logs, dashboards, metrics, SLOs), chunker, planner, reranker, RAG service. |
+| `rag-core` | Domain models, OpenAI (chat, single and batched embeddings), Qdrant (hybrid search, upsert, collection setup, and the incremental-indexing retrieve/set-payload/count/delete calls), keyword (sparse) vectors, Datadog client (monitors, incidents, logs, dashboards, metrics, SLOs, service catalog, change events), chunker, planner, reranker, RAG service. |
 | `rag-api` | Axum REST API — `/ask/plan` (intent + inferred filters) and `/ask` (server-side planning + filtered retrieval + live Datadog evidence for diagnostic questions + answer). |
 | `rag-cli` | CLI that calls the API. The server plans (service/env/time) and decides top-K. |
 | `rag-indexer` | One-shot, resumable indexer for Datadog → Qdrant with per-source checkpoints. Perfect for Kubernetes CronJob. |
@@ -184,7 +185,9 @@ is how the server interprets a request:
   - Time: if either `from_utc` or `to_utc` is given, the caller's window replaces the
     inferred one entirely (a missing bound is open-ended).
   - Source kinds: `kinds`, then `kind:` entries in `filters`, then planner `kind:` filters.
-    Valid kinds: `logs`, `metrics`, `monitor`, `incident`, `dashboard`, `slo`, `git`.
+    Valid kinds: `logs`, `metrics`, `monitor`, `incident`, `dashboard`, `slo`, `git`,
+    `catalog` (service catalog entries; also `service_catalog`) and `change` (deploys and
+    configuration changes; also `deploy`, `deployment`).
   - The rewrite is `rewritten_query`, else the planner's `rewrittenQuery`. The `question`
     is always searched; the rewrite too when it differs from it (ignoring case and
     whitespace), so a detail the rewrite dropped is still found.
@@ -217,10 +220,13 @@ is how the server interprets a request:
   timestamp, and monitors, dashboards, SLOs (whose timestamp,
   if any, is a creation date) and metric catalog entries (stamped with the indexing run's
   time), always pass the time condition, so "yesterday" still surfaces the relevant
-  monitor, SLO or metric. Incidents are filtered by creation time. Dashboards take their
+  monitor, SLO or metric. Service catalog entries are undated and pass it too. Incidents
+  are filtered by creation time and change events by event time. Dashboards take their
   service and environment from their definition (see
   [Incidents and dashboards](#incidents-and-dashboards)); a dashboard without one, and
-  metric catalog entries, are excluded by a service or environment scope.
+  metric catalog entries, are excluded by a service or environment scope. Service
+  catalog entries carry a service but no environment, so an environment scope excludes
+  them.
 
 ## Live evidence (`timeline`)
 
@@ -370,7 +376,10 @@ with `--json`) on stderr and exits with status 1.
   asked about 10:00–12:00) is dropped before reranking. An hour counts when it overlaps
   the window between the day's first and last log.
 - **Reranking:** `rerank_mmr_signals()`:
-  - weights scores by source kind (incident 1.10, monitor 1.05, SLO 1.03, logs 0.98);
+  - weights scores by source kind (incident 1.10, monitor 1.05, SLO 1.03, change 1.02,
+    service catalog, dashboard and metrics 1.00, logs 0.98). A deploy or config change is a
+    frequent root-cause lead but does not state the problem itself; a higher weight for
+    catalog entries would put a service's entry on top of every question about it;
   - weights scores by recency (see below), given the question's window and `now` (the
     API's clock) explicitly, so the ranking never depends on the wall clock;
   - keeps the best hit per source, also when there are fewer candidates than K, so a
@@ -433,8 +442,9 @@ with `--json`) on stderr and exits with status 1.
 
 ### How the indexer resumes
 
-Each run indexes every source (monitors, dashboards, SLOs, metrics, incidents, logs)
-independently and records its progress in the checkpoint file at `INDEXER_WATERMARK`:
+Each run indexes every source (monitors, dashboards, SLOs, metrics, incidents, logs,
+service catalog, change events) independently and records its progress in the checkpoint
+file at `INDEXER_WATERMARK`:
 
 ```json
 { "sources": { "logs": { "indexed_until": "2025-01-01T12:00:00Z" }, "incidents": { "indexed_until": "2025-01-01T11:45:00Z" } } }
@@ -444,16 +454,22 @@ independently and records its progress in the checkpoint file at `INDEXER_WATERM
   `meta.page.after` cursor, 1000 per page, oldest first).
 - **Per-source checkpoints:** a source's checkpoint advances to the run's start time only
   after all of its writes succeeded (upserts, obsolete-chunk deletes and, for monitors,
-  dashboards and SLOs, sync markers and stale-document deletes), and the file is rewritten
+  dashboards, SLOs and service definitions, sync markers and stale-document deletes), and the file is rewritten
   atomically (temp file + rename). A failing source is logged and retried from its old
   checkpoint on the next run while the others advance; the run then exits non-zero.
-- **Windows:** logs, incidents and metrics are fetched from their checkpoint minus
+- **Windows:** logs, incidents, metrics and change events are fetched from their
+  checkpoint minus
   `INDEXER_OVERLAP_MINUTES` (default 10) until now, so records that reach Datadog late
   are picked up by the next run. A source without a checkpoint starts
   `INDEXER_LOOKBACK_MINUTES` (default 90) back. After an outage, the whole gap since the
-  checkpoint is fetched. Monitors, dashboards and SLOs are re-synced in full each run
+  checkpoint is fetched. Monitors, dashboards, SLOs and service definitions are re-synced in full each run
   (a dashboard's definition only when its `modified_at` changed; see
   [Incidents and dashboards](#incidents-and-dashboards)).
+- **Optional sources:** the service catalog is on by default and change events are off
+  by default (`INDEXER_SERVICE_CATALOG_ENABLED`, `INDEXER_CHANGE_EVENTS_ENABLED`; `true`/`1`/`on`
+  or `false`/`0`/`off`). A disabled source is not fetched; its checkpoint and stored points
+  are left as they are. When the application key lacks a source's permission (HTTP 403),
+  the source is skipped with a warning naming the permission, and the run does not fail.
 - **No duplicates:** documents are deduplicated by ID within a run, and Qdrant point IDs
   are derived from document IDs, so re-indexing overlapping records overwrites them. An
   overlapping record that hasn't changed is not embedded again (see
@@ -489,7 +505,7 @@ longer belong to a document are removed. Per source, after the fetch:
    earlier cleanup failed: after the upserts, its points with `Metadata.chunk_index >= n`
    are deleted by filter. A document's chunks always form a prefix `#c0..#c{m-1}`, so
    probing `#c{n}` is enough.
-6. **Disappeared documents (monitors, dashboards and SLOs only).** These sources are
+6. **Disappeared documents (monitors, dashboards, SLOs and service definitions only).** These sources are
    fetched in full, so after a successful fetch every seen document is marked with the
    run's sync ID (`SyncId`, the run's start time): changed ones through the upsert,
    unchanged ones with `POST /collections/{c}/points/payload`, without re-embedding.
@@ -497,8 +513,8 @@ longer belong to a document are removed. Per source, after the fetch:
    deletes nothing, and an empty fetch while points of that kind exist is treated as
    suspicious: it logs a warning and deletes nothing unless
    `INDEXER_ALLOW_EMPTY_SYNC_DELETE=true`.
-7. Logs, incidents and metrics are windowed: a record missing from a window is never
-   deleted. Only shrink cleanup applies to them.
+7. Logs, incidents, metrics and change events are windowed: a record missing from a
+   window is never deleted. Only shrink cleanup applies to them.
 
 Each source logs how many documents were fetched, unchanged and embedded (with their
 chunk count), how many shrank, and how many stale points were deleted.
@@ -519,7 +535,9 @@ service: checkout · env: prod · severity: SEV-2 · state: resolved
 ```
 
 The header holds the kind, the title, service and environment, and a few fields per kind:
-incident severity and state, log status, monitor type, SLO type and target. Empty fields
+incident severity and state, log status, monitor type, SLO type and target, service catalog
+team and tier, change type (`deployment`, `configuration`, `feature_flag` or `change`) and
+version. Empty fields
 are left out; the title is cut at 300 bytes and other values at 100 (at a char
 boundary), so a header adds at most about 800 chars to an 1800-char chunk, well within the
 per-request `INDEXER_EMBED_BATCH_MAX_CHARS` budget and the model's per-input limit. Every
@@ -618,6 +636,50 @@ list entry.
 notebook; attachments only when listed), at most 100 incidents; dashboards one request per
 new or changed dashboard, at most 200.
 
+### Service catalog and change events
+
+**Service catalog** (`rag_core::service_catalog`, kind `catalog`, payload `serviceCatalog`):
+`GET /api/v2/services/definitions` with `page[size]=100` (the documented maximum) and
+`page[number]` from 0 until a short page; the response has no total or cursor. Each entry
+is `{"id", "type", "attributes": {"schema", "meta"}}` with `schema` in the version it
+was written in: v1 (`info`, `org`, `contact`, `external-resources`), v2 (`dd-service`,
+`team`, `contacts`, `links`, `repos`, `docs`, PagerDuty as a URL string), v2.1 (adds
+`description`, `application`, `tier`, `lifecycle`, PagerDuty/Opsgenie objects) and v2.2
+(adds `languages`, `type`). A v3 entity-shaped schema (`apiVersion: v3`, `metadata`,
+`spec`) is read too; it is the only version with dependencies (`spec.dependsOn`). One
+document per service, ID `catalog_<service>`: the service name (lowercased, the `Service`
+payload), no environment and no timestamp (the definition's last modification is kept in
+`Metadata.last_modified`). The text leads with owner team, contacts, on-call
+(PagerDuty/Opsgenie), links (runbooks, repos, docs), then dependencies, tier, lifecycle,
+type, application, languages and tags. Descriptions are cut at 2000 bytes, other values
+at 300 and lists at 30 entries, at char boundaries. Fully synced like monitors.
+
+**Change events** (`rag_core::change_events`, kind `change`): `POST /api/v2/events/search`
+with `{"filter": {"from", "to", "query"}, "page": {"limit": 1000, "cursor"}, "sort":
+"timestamp"}`, following `meta.page.after` like the log search. The query is
+`INDEXER_CHANGE_EVENTS_QUERY`, by default
+`@evt.category:change OR source:(argocd OR spinnaker OR jenkins OR gitlab OR github OR launchdarkly OR terraform)`:
+Datadog change events (Change Tracking deployments, feature flags, configuration
+changes) plus events from common deployment tools. Adjust it to the `source:` values and
+tags your deploy pipeline uses. One document per event, ID `change_<event id>`, stamped
+with the event time: title, change type, time, service (the event's `service` attribute,
+else the `service:` tag, else an impacted resource of type service; `undefined` is
+ignored), environment (`env:` or `environment:` tag), version (`version:` tag), commit
+(`git.commit.sha:` tag and similar), author (`author.name`), changed resource and source,
+then the message (at most 4000 bytes, cut at a char boundary). Windowed like logs.
+
+Both use `send_with_retry` (429 honouring `Retry-After`, 5xx and timeouts, per
+`RAG_RETRY_*`). They need the application key permissions `apm_service_catalog_read`
+and `events_read`; without one, Datadog answers 403 and the source is skipped with a
+warning naming the permission. That is not a failure: the others advance, the run exits
+zero, and the skipped source keeps its checkpoint so it catches up once the permission is
+granted. Change events are off by default (`INDEXER_CHANGE_EVENTS_ENABLED=true` turns them
+on); each run logs how many change events it fetched per `source:`, and warns when the
+query matched none, so a query that doesn't fit the organization's deploy tooling shows
+up on the first run. API calls per run: the catalog costs
+`ceil(services / 100)` requests, change events `ceil(events in the window / 1000)`
+(usually one).
+
 ### Log patterns
 
 Error and warning logs are not indexed one document per log. During an incident Datadog
@@ -708,7 +770,7 @@ They are not part of the returned documents, so the answer model never sees them
 |-----|-------------|---------|
 | `ContentHash` | every chunk | Content hash of the parent document (64 hex chars) |
 | `ChunkCount` | every chunk | Number of chunks of the parent document |
-| `SyncId` | monitors, dashboards, SLOs | Start time of the last run whose full fetch included the document |
+| `SyncId` | monitors, dashboards, SLOs, service definitions | Start time of the last run whose full fetch included the document |
 
 Shrink cleanup filters on `Kind`, `Metadata.chunk_of` and `Metadata.chunk_index`; stale
 cleanup on `Kind` and `SyncId`.

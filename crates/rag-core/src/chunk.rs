@@ -43,6 +43,8 @@ fn kind_label(kind: &SourceKind) -> &'static str {
         SourceKind::Dashboard => "Dashboard",
         SourceKind::SLO => "SLO",
         SourceKind::Git => "Git",
+        SourceKind::ServiceCatalog => "Catalog",
+        SourceKind::Change => "Change",
     }
 }
 
@@ -53,6 +55,8 @@ fn header_fields(kind: &SourceKind) -> &'static [(&'static str, &'static str)] {
         SourceKind::Logs => &[("status", "status")],
         SourceKind::Monitor => &[("type", "monitor_type")],
         SourceKind::SLO => &[("type", "slo_type"), ("target", "target")],
+        SourceKind::ServiceCatalog => &[("team", "team"), ("tier", "tier")],
+        SourceKind::Change => &[("change", "change_type"), ("version", "version")],
         SourceKind::Metrics | SourceKind::Dashboard | SourceKind::Git => &[],
     }
 }
@@ -358,6 +362,41 @@ mod tests {
             embedding_input(&log),
             "[Log] Log: inventory - error\nservice: inventory · env: test · status: error\n\n\
              lock wait timeout exceeded"
+        );
+
+        let mut catalog = create_test_doc("Owners: shop team");
+        catalog.kind = SourceKind::ServiceCatalog;
+        catalog.title = "Service: checkout".into();
+        catalog.service = "checkout".into();
+        catalog.environment = String::new();
+        catalog
+            .metadata
+            .insert("team".into(), serde_json::json!("shop"));
+        catalog
+            .metadata
+            .insert("tier".into(), serde_json::json!("tier-1"));
+        assert_eq!(
+            embedding_input(&catalog),
+            "[Catalog] Service: checkout\nservice: checkout · team: shop · tier: tier-1\n\n\
+             Owners: shop team"
+        );
+
+        let mut change = create_test_doc("Deployed checkout 2.14.0");
+        change.kind = SourceKind::Change;
+        change.title = "Deploy checkout 2.14.0".into();
+        change.service = "checkout".into();
+        change.environment = "prod".into();
+        change
+            .metadata
+            .insert("change_type".into(), serde_json::json!("deployment"));
+        change
+            .metadata
+            .insert("version".into(), serde_json::json!("2.14.0"));
+        assert_eq!(
+            embedding_input(&change),
+            "[Change] Deploy checkout 2.14.0\n\
+             service: checkout · env: prod · change: deployment · version: 2.14.0\n\n\
+             Deployed checkout 2.14.0"
         );
     }
 

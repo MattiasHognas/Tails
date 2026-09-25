@@ -1,6 +1,6 @@
 {
   "version": 4,
-  "description": "Crafted Datadog corpus for the incident question set (questions.json). Objects have the shape of Datadog API responses so the real adapters parse them. Services: checkout, checkout-worker (similar name), payments, auth-api, sökmotor, inventory, orders, recommendations, ledger, orders-db, fulfillment, notifications, billing, edge-gateway, checkout-api, storefront; environments prod and staging. 'logBursts' are runs of near-identical logs that the harness expands into individual logs (support/datadog.rs, expand_burst). Dashboards are full dashboard definitions (the fake list endpoint returns only the summary keys; GET /api/v1/dashboard/{id} returns the rest). 'incidentTimelines' and 'incidentAttachments' (per incident ID) and 'notebooks' are served by the per-incident timeline, attachments and notebook endpoints. The questions are asked at 2026-03-12T09:00:00Z in Europe/Stockholm, so 'yesterday' is 2026-03-10T23:00:00Z..2026-03-11T23:00:00Z. The recorded fixtures' monitors, dashboards, SLOs and metrics are indexed alongside as unrelated distractors. Checkout logs in January and February belong to q20-q23, which set their own 'now'.",
+  "description": "Crafted Datadog corpus for the incident question set (questions.json). Objects have the shape of Datadog API responses so the real adapters parse them. Services: checkout, checkout-worker (similar name), payments, auth-api, sökmotor, inventory, orders, recommendations, ledger, orders-db, fulfillment, notifications, billing, edge-gateway, checkout-api, storefront; environments prod and staging. 'serviceDefinitions' are Software Catalog entries (GET /api/v2/services/definitions) and 'events' are change events (POST /api/v2/events/search, the deploys on 2026-03-05 for q50-q52). 'logBursts' are runs of near-identical logs that the harness expands into individual logs (support/datadog.rs, expand_burst). Dashboards are full dashboard definitions (the fake list endpoint returns only the summary keys; GET /api/v1/dashboard/{id} returns the rest). 'incidentTimelines' and 'incidentAttachments' (per incident ID) and 'notebooks' are served by the per-incident timeline, attachments and notebook endpoints. The questions are asked at 2026-03-12T09:00:00Z in Europe/Stockholm, so 'yesterday' is 2026-03-10T23:00:00Z..2026-03-11T23:00:00Z. The recorded fixtures' monitors, dashboards, SLOs and metrics are indexed alongside as unrelated distractors. Checkout logs in January and February belong to q20-q23, which set their own 'now'.",
   "monitors": [
     {
       "id": 1001,
@@ -438,7 +438,8 @@
     {"idPrefix": "co-inv-thu-am-", "count": 40, "start": "2026-02-05T08:00:00.000Z", "everySeconds": 60, "service": "checkout", "env": "prod", "status": "error", "message": "checkout inventory sync failed: warehouse-api returned 502 after {ms}ms"},
     {"idPrefix": "co-inv-thu-pm-", "count": 20, "start": "2026-02-05T22:10:00.000Z", "everySeconds": 120, "service": "checkout", "env": "prod", "status": "error", "message": "checkout inventory sync failed: warehouse-api returned 502 after {ms}ms"},
     {"idPrefix": "co-inv-fri-", "count": 100, "start": "2026-02-06T09:00:00.000Z", "everySeconds": 30, "service": "checkout", "env": "prod", "status": "error", "message": "checkout inventory sync failed: warehouse-api returned 502 after {ms}ms"},
-    {"idPrefix": "co-inv-mon-", "count": 45, "start": "2026-02-09T07:00:00.000Z", "everySeconds": 60, "service": "checkout", "env": "prod", "status": "error", "message": "checkout inventory sync failed: warehouse-api returned 502 after {ms}ms"}
+    {"idPrefix": "co-inv-mon-", "count": 45, "start": "2026-02-09T07:00:00.000Z", "everySeconds": 60, "service": "checkout", "env": "prod", "status": "error", "message": "checkout inventory sync failed: warehouse-api returned 502 after {ms}ms"},
+    {"idPrefix": "co-npe-", "count": 40, "start": "2026-03-05T13:02:00.000Z", "everySeconds": 15, "service": "checkout", "env": "prod", "status": "error", "message": "payment session creation failed: NullPointerException in CartSerializer after {ms}ms for order {uuid}"}
   ],
   "incidentTimelines": {
     "inc-orders-db-failover": [
@@ -459,5 +460,41 @@
       {"id": "c2", "type": "notebook_cells", "attributes": {"definition": {"type": "timeseries", "requests": [{"q": "sum:payments.gateway.errors{env:prod}"}]}}},
       {"id": "c3", "type": "notebook_cells", "attributes": {"definition": {"type": "markdown", "text": "# Action items\n- Automate renewal of the expired certificate bundle.\n- Alert 30 days before any certificate in the trust store expires.\n- Add a synthetic test that exercises the full TLS chain."}}}
     ]}}
+  ],
+  "serviceDefinitions": [
+    {"id": "sd-checkout", "type": "service-definition", "attributes": {
+      "meta": {"last-modified-time": "2026-01-20T08:00:00Z", "ingestion-source": "api", "ingested-schema-version": "v2.2", "warnings": []},
+      "schema": {"schema-version": "v2.2", "dd-service": "checkout", "team": "shop", "description": "Checkout API: carts, payment sessions and order placement.",
+        "contacts": [{"name": "Shop team", "type": "email", "contact": "shop-team@example.com"}, {"name": "#shop-oncall", "type": "slack", "contact": "https://example.slack.com/archives/C0SHOP"}],
+        "links": [{"name": "Checkout runbook", "type": "runbook", "url": "https://wiki.example.com/runbooks/checkout"}, {"name": "checkout", "type": "repo", "provider": "github", "url": "https://github.com/example/checkout"}],
+        "integrations": {"pagerduty": {"service-url": "https://example.pagerduty.com/service-directory/PCHECKOUT"}},
+        "tier": "tier-1", "lifecycle": "production", "type": "web", "languages": ["go"], "tags": ["domain:shop"]}}},
+    {"id": "sd-checkout-worker", "type": "service-definition", "attributes": {
+      "meta": {"last-modified-time": "2026-01-20T08:00:00Z", "ingestion-source": "api", "ingested-schema-version": "v2.1", "warnings": []},
+      "schema": {"schema-version": "v2.1", "dd-service": "checkout-worker", "team": "fulfilment", "description": "Consumes the checkout order queue and sends confirmations.",
+        "contacts": [{"name": "Fulfilment team", "type": "email", "contact": "fulfilment@example.com"}],
+        "links": [{"name": "Checkout worker runbook", "type": "runbook", "url": "https://wiki.example.com/runbooks/checkout-worker"}],
+        "tier": "tier-2", "lifecycle": "production"}}},
+    {"id": "sd-payments", "type": "service-definition", "attributes": {
+      "meta": {"last-modified-time": "2026-02-02T10:00:00Z", "ingestion-source": "api", "ingested-schema-version": "v3", "warnings": []},
+      "schema": {"apiVersion": "v3", "kind": "service",
+        "metadata": {"name": "payments", "owner": "payments", "description": "Card payments and refunds towards the bank gateway.",
+          "contacts": [{"name": "Payments on-call", "type": "slack", "contact": "https://example.slack.com/archives/C0PAY"}],
+          "links": [{"name": "Payments runbook", "type": "runbook", "url": "https://wiki.example.com/runbooks/payments"}]},
+        "spec": {"tier": "tier-1", "lifecycle": "production", "dependsOn": ["service:bank-gateway", "service:ledger"]}}}}
+  ],
+  "events": [
+    {"id": "dep-co-1", "type": "event", "attributes": {"timestamp": "2026-03-05T12:55:00.000Z", "message": "Argo CD synced checkout to 2.14.0 (commit 9f3e2c1): new CartSerializer for payment sessions.",
+      "tags": ["service:checkout", "env:prod", "version:2.14.0", "git.commit.sha:9f3e2c1", "source:argocd"],
+      "attributes": {"title": "Deployed checkout 2.14.0 to prod", "service": "checkout", "author": {"name": "maria.lind", "type": "user"}, "evt": {"id": "7001", "type": "change"}}}},
+    {"id": "dep-pay-1", "type": "event", "attributes": {"timestamp": "2026-03-05T12:55:00.000Z", "message": "Argo CD synced payments to 3.1.0: new checkout callback for payment sessions.",
+      "tags": ["service:payments", "env:prod", "version:3.1.0", "source:argocd"],
+      "attributes": {"title": "Deployed payments 3.1.0 to prod (checkout callback)", "service": "payments", "author": {"name": "jon.berg", "type": "user"}, "evt": {"id": "7002", "type": "change"}}}},
+    {"id": "dep-co-stg", "type": "event", "attributes": {"timestamp": "2026-03-05T12:50:00.000Z", "message": "Argo CD synced checkout to 2.14.0 in staging.",
+      "tags": ["service:checkout", "env:staging", "version:2.14.0", "source:argocd"],
+      "attributes": {"title": "Deployed checkout 2.14.0 to staging", "service": "checkout", "author": {"name": "maria.lind", "type": "user"}, "evt": {"id": "7003", "type": "change"}}}},
+    {"id": "dep-co-old", "type": "event", "attributes": {"timestamp": "2026-03-04T09:00:00.000Z", "message": "Argo CD synced checkout to 2.13.2.",
+      "tags": ["service:checkout", "env:prod", "version:2.13.2", "source:argocd"],
+      "attributes": {"title": "Deployed checkout 2.13.2 to prod", "service": "checkout", "author": {"name": "maria.lind", "type": "user"}, "evt": {"id": "7004", "type": "change"}}}}
   ]
 }

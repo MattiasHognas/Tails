@@ -10,6 +10,7 @@ use incremental::{
     Embedder, IncrementalSink, IndexParams, IndexStats, Metadata, PointStore, SyncScope,
 };
 use rag_core::{
+    change_events,
     datadog::Datadog,
     datadog_dashboards::dashboard_doc_id,
     domain::{RagDocument, SourceKind},
@@ -42,16 +43,22 @@ enum Source {
     Metrics,
     Incidents,
     Logs,
+    /// Service definitions from the Software Catalog (`INDEXER_SERVICE_CATALOG_ENABLED`).
+    ServiceCatalog,
+    /// Deployment and configuration change events (`INDEXER_CHANGE_EVENTS_ENABLED`).
+    ChangeEvents,
 }
 
 impl Source {
-    const ALL: [Source; 6] = [
+    const ALL: [Source; 8] = [
         Source::Monitors,
         Source::Dashboards,
         Source::Slos,
         Source::Metrics,
         Source::Incidents,
         Source::Logs,
+        Source::ServiceCatalog,
+        Source::ChangeEvents,
     ];
 
     /// Key of the source in the checkpoint file.
@@ -63,6 +70,35 @@ impl Source {
             Source::Metrics => "metrics",
             Source::Incidents => "incidents",
             Source::Logs => "logs",
+            Source::ServiceCatalog => "service_catalog",
+            Source::ChangeEvents => "change_events",
+        }
+    }
+
+    /// The variable that switches an optional source on (`1`, `true`, `yes`, `on`) or off
+    /// (`0`, `false`, `no`, `off`); `None` for sources that always run.
+    fn enabled_var(self) -> Option<&'static str> {
+        match self {
+            Source::ServiceCatalog => Some("INDEXER_SERVICE_CATALOG_ENABLED"),
+            Source::ChangeEvents => Some("INDEXER_CHANGE_EVENTS_ENABLED"),
+            _ => None,
+        }
+    }
+
+    /// Whether an optional source runs when its variable is unset (or not a recognized
+    /// value). Change events are off until `INDEXER_CHANGE_EVENTS_QUERY` has been checked
+    /// against the organization's deploy tooling.
+    fn enabled_by_default(self) -> bool {
+        !matches!(self, Source::ChangeEvents)
+    }
+
+    /// The application key permission an optional source needs. Without it Datadog answers
+    /// 403 and the source is skipped with a warning instead of failing the run.
+    fn required_permission(self) -> Option<&'static str> {
+        match self {
+            Source::ServiceCatalog => Some("apm_service_catalog_read"),
+            Source::ChangeEvents => Some("events_read"),
+            _ => None,
         }
     }
 
@@ -70,14 +106,18 @@ impl Source {
         Self::ALL.iter().map(|s| s.name()).collect()
     }
 
-    /// Monitors, dashboards and SLOs are fetched in full, so documents missing from a
-    /// successful fetch were deleted in Datadog. The other sources are windowed.
+    /// Monitors, dashboards, SLOs and service definitions are fetched in full, so
+    /// documents missing from a successful fetch were deleted in Datadog. The other
+    /// sources are windowed.
     fn sync_scope(self, sync_id: &str) -> SyncScope {
         let kind = match self {
             Source::Monitors => SourceKind::Monitor,
             Source::Dashboards => SourceKind::Dashboard,
             Source::Slos => SourceKind::SLO,
-            Source::Metrics | Source::Incidents | Source::Logs => return SyncScope::Window,
+            Source::ServiceCatalog => SourceKind::ServiceCatalog,
+            Source::Metrics | Source::Incidents | Source::Logs | Source::ChangeEvents => {
+                return SyncScope::Window;
+            }
         };
         SyncScope::Full {
             kind,
@@ -126,6 +166,11 @@ impl SourceFetcher for Datadog {
             Source::Logs => {
                 let from = log_patterns::fetch_start(window.from).to_rfc3339();
                 self.search_logs(&from, &to_iso).await
+            }
+            Source::ServiceCatalog => self.list_service_definitions().await,
+            Source::ChangeEvents => {
+                self.search_change_events(&from_iso, &to_iso, &change_events_query())
+                    .await
             }
         }
     }
@@ -190,6 +235,77 @@ fn dedupe_by_id(docs: Vec<RagDocument>) -> Vec<RagDocument> {
 struct IndexerConfig {
     lookback: Duration,
     overlap: Duration,
+    /// Sources switched off: not fetched; their checkpoints and stored points are kept.
+    disabled: Vec<Source>,
+}
+
+/// `INDEXER_CHANGE_EVENTS_QUERY`, or [`change_events::DEFAULT_QUERY`] when unset or blank.
+fn change_events_query() -> String {
+    std::env::var("INDEXER_CHANGE_EVENTS_QUERY")
+        .ok()
+        .map(|q| q.trim().to_string())
+        .filter(|q| !q.is_empty())
+        .unwrap_or_else(|| change_events::DEFAULT_QUERY.to_string())
+}
+
+/// Optional sources whose `*_ENABLED` variable is set to a false value.
+fn disabled_sources_from_env() -> Vec<Source> {
+    Source::ALL
+        .into_iter()
+        .filter(|s| {
+            let Some(var) = s.enabled_var() else {
+                return false;
+            };
+            let enabled = match std::env::var(var)
+                .map(|v| v.trim().to_lowercase())
+                .as_deref()
+            {
+                Ok("1" | "true" | "yes" | "on") => true,
+                Ok("0" | "false" | "no" | "off") => false,
+                _ => s.enabled_by_default(),
+            };
+            !enabled
+        })
+        .collect()
+}
+
+/// Whether `e` is Datadog refusing the request with 403 (the application key lacks a
+/// permission).
+fn is_forbidden(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| {
+        matches!(
+            c.downcast_ref::<rag_core::error::UpstreamError>(),
+            Some(rag_core::error::UpstreamError::Status { status: 403, .. })
+        )
+    })
+}
+
+/// Logs how many change events a run fetched, per `source:` (deploy tool), so an empty or
+/// noisy `INDEXER_CHANGE_EVENTS_QUERY` is visible on the first run.
+fn log_change_event_sources(docs: &[RagDocument]) {
+    if docs.is_empty() {
+        tracing::warn!(
+            "No change events matched INDEXER_CHANGE_EVENTS_QUERY in this window; \
+             check the query against the sources and tags your deploy tooling sends"
+        );
+        return;
+    }
+    let mut by_source: std::collections::BTreeMap<&str, usize> = Default::default();
+    for d in docs {
+        let source = d
+            .metadata
+            .get("source")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or("unknown");
+        *by_source.entry(source).or_default() += 1;
+    }
+    let breakdown: Vec<String> = by_source.iter().map(|(s, n)| format!("{s}: {n}")).collect();
+    tracing::info!(
+        "Fetched {} change events by source: {}",
+        docs.len(),
+        breakdown.join(", ")
+    );
 }
 
 /// Indexes every source, advancing and persisting each source's checkpoint only after
@@ -207,6 +323,10 @@ async fn index_sources(
     // Marks the points of full-sync documents seen in this run.
     let sync_id = now.to_rfc3339();
     for source in Source::ALL {
+        if config.disabled.contains(&source) {
+            tracing::info!("Skipping {} (disabled)", source.name());
+            continue;
+        }
         let window = checkpoint::window(
             checkpoints.get(source.name()),
             now,
@@ -225,6 +345,9 @@ async fn index_sources(
             let mut docs = dedupe_by_id(fetcher.fetch_reusing(source, &window, sink).await?);
             if source == Source::Logs {
                 docs = merge_log_patterns(sink, docs, &window).await?;
+            }
+            if source == Source::ChangeEvents {
+                log_change_event_sources(&docs);
             }
             sink.index(&docs, &source.sync_scope(&sync_id)).await
         }
@@ -248,6 +371,17 @@ async fn index_sources(
                     tracing::error!("Failed to save {} checkpoint: {:#}", source.name(), e);
                     failures.push((source, e));
                 }
+            }
+            Err(e) if is_forbidden(&e) && source.required_permission().is_some() => {
+                // Not a failure: the organization hasn't granted the permission. The
+                // checkpoint stays, so the source catches up once it is granted.
+                tracing::warn!(
+                    "Skipping {}: Datadog returned 403. Grant the application key the `{}` \
+                     permission, or set {}=false",
+                    source.name(),
+                    source.required_permission().unwrap_or_default(),
+                    source.enabled_var().unwrap_or_default()
+                );
             }
             Err(e) => {
                 tracing::error!("Failed to index {}: {:#}", source.name(), e);
@@ -319,6 +453,7 @@ async fn main() -> Result<()> {
     let config = IndexerConfig {
         lookback: Duration::minutes(env_minutes("INDEXER_LOOKBACK_MINUTES", 90)),
         overlap: Duration::minutes(env_minutes("INDEXER_OVERLAP_MINUTES", 10)),
+        disabled: disabled_sources_from_env(),
     };
 
     let dd = Datadog::new_from_env()?;
@@ -449,6 +584,8 @@ mod tests {
             SourceKind::Metrics,
             SourceKind::SLO,
             SourceKind::Git,
+            SourceKind::ServiceCatalog,
+            SourceKind::Change,
         ];
 
         for kind in kinds {
@@ -461,10 +598,12 @@ mod tests {
         }
     }
 
-    /// Serves canned documents per source; sources in `failing` return an error.
+    /// Serves canned documents per source; sources in `failing` return an error, and
+    /// sources in `forbidden` the error Datadog's 403 becomes.
     struct FakeFetcher {
         docs: HashMap<&'static str, Vec<RagDocument>>,
         failing: Vec<Source>,
+        forbidden: Vec<Source>,
         windows: Mutex<Vec<(Source, Window)>>,
     }
 
@@ -473,6 +612,7 @@ mod tests {
             Self {
                 docs: HashMap::new(),
                 failing: Vec::new(),
+                forbidden: Vec::new(),
                 windows: Mutex::new(Vec::new()),
             }
         }
@@ -494,6 +634,14 @@ mod tests {
             self.windows.lock().unwrap().push((source, *window));
             if self.failing.contains(&source) {
                 anyhow::bail!("{} unavailable", source.name());
+            }
+            if self.forbidden.contains(&source) {
+                let status = rag_core::error::UpstreamError::Status {
+                    status: 403,
+                    retry_after: None,
+                };
+                return Err(anyhow::Error::new(status)
+                    .context(format!("Failed to fetch {}", source.name())));
             }
             Ok(self.docs.get(source.name()).cloned().unwrap_or_default())
         }
@@ -564,6 +712,7 @@ mod tests {
         IndexerConfig {
             lookback: Duration::minutes(90),
             overlap: Duration::minutes(10),
+            disabled: vec![],
         }
     }
 
@@ -782,7 +931,10 @@ mod tests {
             let full = matches!(source.sync_scope("run"), SyncScope::Full { .. });
             assert_eq!(
                 full,
-                matches!(source, Source::Monitors | Source::Dashboards | Source::Slos),
+                matches!(
+                    source,
+                    Source::Monitors | Source::Dashboards | Source::Slos | Source::ServiceCatalog
+                ),
                 "{}",
                 source.name()
             );
@@ -1153,6 +1305,177 @@ mod tests {
         let saved = Checkpoints::load(&path, &Source::names()).await.unwrap();
         assert_eq!(saved.get("dashboards"), Some(first));
         assert_eq!(saved.get("monitors"), Some(second));
+    }
+
+    /// A disabled source is neither fetched nor checkpointed; the others still run.
+    #[tokio::test]
+    async fn test_disabled_sources_are_skipped() {
+        let path = temp_checkpoint("disabled");
+        let fetcher = FakeFetcher::new();
+        let sink = FakeSink::default();
+        let mut checkpoints = Checkpoints::default();
+        let now = ts("2025-01-01T12:00:00Z");
+        let config = IndexerConfig {
+            disabled: vec![Source::ServiceCatalog, Source::ChangeEvents],
+            ..config()
+        };
+
+        let failures = index_sources(&fetcher, &sink, &mut checkpoints, &path, &config, now).await;
+
+        assert!(failures.is_empty());
+        let fetched: Vec<Source> = fetcher
+            .windows
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(s, _)| *s)
+            .collect();
+        assert!(!fetched.contains(&Source::ServiceCatalog));
+        assert!(!fetched.contains(&Source::ChangeEvents));
+        assert!(fetched.contains(&Source::Logs));
+        assert_eq!(checkpoints.get("service_catalog"), None);
+        assert_eq!(checkpoints.get("change_events"), None);
+        assert_eq!(checkpoints.get("logs"), Some(now));
+    }
+
+    #[test]
+    fn test_optional_sources_are_configured_from_the_environment() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let vars = [
+            "INDEXER_SERVICE_CATALOG_ENABLED",
+            "INDEXER_CHANGE_EVENTS_ENABLED",
+            "INDEXER_CHANGE_EVENTS_QUERY",
+        ];
+        // SAFETY: tests touching the environment hold ENV_LOCK.
+        unsafe {
+            for v in vars {
+                std::env::remove_var(v);
+            }
+        }
+        assert_eq!(
+            disabled_sources_from_env(),
+            [Source::ChangeEvents],
+            "the catalog is on and change events are off by default"
+        );
+        assert_eq!(change_events_query(), change_events::DEFAULT_QUERY);
+
+        unsafe {
+            std::env::set_var("INDEXER_CHANGE_EVENTS_ENABLED", "maybe");
+        }
+        assert_eq!(
+            disabled_sources_from_env(),
+            [Source::ChangeEvents],
+            "an unrecognized value keeps the default"
+        );
+
+        unsafe {
+            std::env::set_var("INDEXER_SERVICE_CATALOG_ENABLED", " Off ");
+            std::env::set_var("INDEXER_CHANGE_EVENTS_ENABLED", "true");
+            std::env::set_var("INDEXER_CHANGE_EVENTS_QUERY", "  ");
+        }
+        assert_eq!(disabled_sources_from_env(), [Source::ServiceCatalog]);
+        assert_eq!(change_events_query(), change_events::DEFAULT_QUERY);
+
+        unsafe {
+            std::env::set_var("INDEXER_SERVICE_CATALOG_ENABLED", "1");
+            std::env::set_var("INDEXER_CHANGE_EVENTS_ENABLED", "0");
+            std::env::set_var("INDEXER_CHANGE_EVENTS_QUERY", " source:argocd ");
+        }
+        assert_eq!(disabled_sources_from_env(), [Source::ChangeEvents]);
+        assert_eq!(change_events_query(), "source:argocd");
+        unsafe {
+            for v in vars {
+                std::env::remove_var(v);
+            }
+        }
+    }
+
+    /// A 403 on an optional source means the application key lacks its permission: the
+    /// source is skipped with a warning, is not a failure and keeps its checkpoint. The
+    /// same 403 on a core source is a failure.
+    #[tokio::test]
+    async fn test_forbidden_optional_sources_are_skipped_not_failed() {
+        let path = temp_checkpoint("forbidden");
+        let mut fetcher = FakeFetcher::new();
+        fetcher.forbidden = vec![Source::ServiceCatalog, Source::ChangeEvents, Source::Slos];
+        let sink = FakeSink::default();
+        let mut checkpoints = Checkpoints::default();
+        let now = ts("2025-01-01T12:00:00Z");
+
+        let failures =
+            index_sources(&fetcher, &sink, &mut checkpoints, &path, &config(), now).await;
+
+        let failed: Vec<_> = failures.iter().map(|(s, _)| *s).collect();
+        assert_eq!(failed, [Source::Slos]);
+        assert_eq!(checkpoints.get("service_catalog"), None);
+        assert_eq!(checkpoints.get("change_events"), None);
+        assert_eq!(checkpoints.get("logs"), Some(now));
+    }
+
+    #[test]
+    fn test_only_a_403_counts_as_forbidden() {
+        let status = |status| rag_core::error::UpstreamError::Status {
+            status,
+            retry_after: None,
+        };
+        assert!(is_forbidden(
+            &anyhow::Error::new(status(403)).context("fetch")
+        ));
+        assert!(!is_forbidden(
+            &anyhow::Error::new(status(401)).context("fetch")
+        ));
+        assert!(!is_forbidden(&anyhow::anyhow!("HTTP 403 in a message")));
+    }
+
+    /// A failing new source (for example a 500 from the catalog) does not stop the
+    /// others, and a deleted service definition is cleaned up by the full sync.
+    #[tokio::test]
+    async fn test_new_sources_fail_independently_and_catalog_is_fully_synced() {
+        let path = temp_checkpoint("new-sources");
+        let mut fetcher = FakeFetcher::new();
+        fetcher.docs.insert(
+            "service_catalog",
+            vec![
+                doc("catalog_checkout", SourceKind::ServiceCatalog),
+                doc("catalog_payments", SourceKind::ServiceCatalog),
+            ],
+        );
+        fetcher
+            .docs
+            .insert("change_events", vec![doc("change_1", SourceKind::Change)]);
+        let sink = incremental_sink();
+        let mut checkpoints = Checkpoints::default();
+        let first = ts("2025-01-01T12:00:00Z");
+        assert!(
+            index_sources(&fetcher, &sink, &mut checkpoints, &path, &config(), first)
+                .await
+                .is_empty()
+        );
+        assert_eq!(
+            sink.store.chunk_ids(),
+            ["catalog_checkout#c0", "catalog_payments#c0", "change_1#c0"]
+        );
+
+        // payments was removed from the catalog; the change search now fails.
+        fetcher.docs.insert(
+            "service_catalog",
+            vec![doc("catalog_checkout", SourceKind::ServiceCatalog)],
+        );
+        fetcher.docs.remove("change_events");
+        fetcher.failing = vec![Source::ChangeEvents];
+        let second = ts("2025-01-01T12:15:00Z");
+        let failures =
+            index_sources(&fetcher, &sink, &mut checkpoints, &path, &config(), second).await;
+
+        let failed: Vec<_> = failures.iter().map(|(s, _)| *s).collect();
+        assert_eq!(failed, [Source::ChangeEvents]);
+        assert_eq!(
+            sink.store.chunk_ids(),
+            ["catalog_checkout#c0", "change_1#c0"],
+            "the deleted definition is removed, windowed change events are kept"
+        );
+        assert_eq!(checkpoints.get("change_events"), Some(first));
+        assert_eq!(checkpoints.get("service_catalog"), Some(second));
     }
 
     #[tokio::test]

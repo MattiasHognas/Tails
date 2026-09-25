@@ -453,6 +453,47 @@
         "mustNotRetrieve": ["dashboard_dash-golden-signals", "dashboard_dash-checkout"]
       },
       "answer": {"citeDocuments": ["dashboard_dash-orders-db"]}
+    },
+    {
+      "id": "q50-checkout-owner-runbook",
+      "question": "Who owns checkout and where is its runbook?",
+      "note": "Answered only by the service catalog entry (team, contacts, runbook link). checkout-worker's entry has a similar name and its own runbook; the service scope must keep it out.",
+      "plan": {"intent": "unknown", "service": "checkout", "rewrittenQuery": "checkout owner team contacts runbook"},
+      "expect": {
+        "scope": {"service": "checkout", "environment": null, "fromUtc": null, "toUtc": null, "kinds": []},
+        "mustRetrieve": ["catalog_checkout"],
+        "mustNotRetrieve": ["catalog_checkout-worker", "catalog_payments"]
+      },
+      "answer": {"citeDocuments": ["catalog_checkout"]}
+    },
+    {
+      "id": "q51-checkout-change-before-errors",
+      "question": "What changed in checkout right before the errors started at 14:02?",
+      "note": "On 5 March a burst of checkout errors starts at 14:02 Stockholm (13:02Z), seven minutes after checkout 2.14.0 was deployed to prod. The deploy event is the answer; the same version in staging and an older prod deploy are out of scope.",
+      "now": "2026-03-05T16:00:00Z",
+      "plan": {"intent": "rootCauseWindow", "service": "checkout", "environment": "prod", "rewrittenQuery": "checkout prod changes deploys before errors",
+               "window": {"fromUtc": "2026-03-05T12:00:00Z", "toUtc": "2026-03-05T13:05:00Z"}},
+      "expect": {
+        "scope": {"service": "checkout", "environment": "prod", "fromUtc": "2026-03-05T12:00:00Z", "toUtc": "2026-03-05T13:05:00Z", "kinds": []},
+        "mustRetrieve": ["change_dep-co-1"],
+        "mayRetrieve": ["log_co-npe-0", "monitor_1001", "slo_slo-checkout-avail"],
+        "mustNotRetrieve": ["change_dep-co-stg", "change_dep-co-old", "change_dep-pay-1"]
+      },
+      "answer": {"citeDocuments": ["change_dep-co-1"]}
+    },
+    {
+      "id": "q52-deploy-negative-control",
+      "question": "Was the checkout error burst at 14:02 caused by a deploy?",
+      "note": "Negative control: payments 3.1.0 was deployed to prod at the same minute and its title and message mention checkout, so it matches the question as well as the checkout deploy; it belongs to another service and must be neither retrieved nor cited.",
+      "now": "2026-03-05T16:00:00Z",
+      "plan": {"intent": "rootCauseWindow", "service": "checkout", "environment": "prod", "filters": ["kind:change"],
+               "window": {"fromUtc": "2026-03-05T12:00:00Z", "toUtc": "2026-03-05T13:05:00Z"}},
+      "expect": {
+        "scope": {"service": "checkout", "environment": "prod", "fromUtc": "2026-03-05T12:00:00Z", "toUtc": "2026-03-05T13:05:00Z", "kinds": ["change"]},
+        "mustRetrieve": ["change_dep-co-1"],
+        "mustNotRetrieve": ["change_dep-pay-1", "change_dep-co-stg", "change_dep-co-old"]
+      },
+      "answer": {"citeDocuments": ["change_dep-co-1"]}
     }
   ]
 }

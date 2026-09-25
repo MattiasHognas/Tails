@@ -26,6 +26,9 @@ QDRANT_COLLECTION=datadog_rag
 DD_API_KEY=...
 DD_APP_KEY=...
 DD_SITE=datadoghq.eu    # or datadoghq.com
+# The application key needs read access to what is indexed. The service catalog needs
+# `apm_service_catalog_read` and change events `events_read`; disable those sources
+# below if the key lacks them.
 
 # Indexer
 INDEXER_WATERMARK=/data/watermark.json   # per-source checkpoint file
@@ -34,7 +37,11 @@ INDEXER_OVERLAP_MINUTES=10               # re-read before each checkpoint for la
 INDEXER_EMBED_BATCH_SIZE=128             # texts per embeddings request (1-2048)
 INDEXER_EMBED_BATCH_MAX_CHARS=200000     # characters per embeddings request (rough token budget)
 INDEXER_EMBED_CONCURRENCY=4              # embedding batches/upserts, lookups or deletes in flight (1-32)
-INDEXER_ALLOW_EMPTY_SYNC_DELETE=false    # true: an empty monitor/dashboard/SLO fetch deletes all indexed ones
+INDEXER_ALLOW_EMPTY_SYNC_DELETE=false    # true: an empty monitor/dashboard/SLO/service catalog fetch deletes all indexed ones
+INDEXER_SERVICE_CATALOG_ENABLED=true     # false: skip service definitions (GET /api/v2/services/definitions)
+INDEXER_CHANGE_EVENTS_ENABLED=false      # true: index change events (POST /api/v2/events/search); off until the query below fits your deploy tooling
+INDEXER_CHANGE_EVENTS_QUERY=             # event search query for deploys/config changes; default:
+                                         # @evt.category:change OR source:(argocd OR spinnaker OR jenkins OR gitlab OR github OR launchdarkly OR terraform)
 
 # Retrieval tuning (optional)
 RAG_TOPK_DEFAULT=16
@@ -289,7 +296,7 @@ variant, ignored by default, that uses a fresh collection on `QDRANT_TEST_ENDPOI
 
 | Test | Checks |
 |------|--------|
-| `pipeline_tests::contract` | Every stored point decodes (reader's `QdrantPayload`) to the chunk the adapters produced, under the UUIDv5 of its ID, and has exactly the `dense` and `sparse` vectors the reader queries, the sparse one built from the chunk's embedding input; the collection passes the indexer's layout check; `Kind` equals the filter's value; `Timestamp` is RFC 3339; `Service`/`Environment` are lowercase; `ContentHash`/`ChunkCount`/`SyncId` never reach `sources`. `/ask` returns the right documents for service (`Auth-API` from Datadog vs `AUTH-API` from the planner), environment, kind and time filters (half-open window, timeless kinds, a log pattern day whose first and last log lie outside a short window it logged in, a day that logged only around the window left out); logs are grouped by pattern and UTC day with their count; a multi-chunk log pattern and the days of one pattern are one source, counted per day in the asker's timezone in the prompt; `sources` are stored documents numbered like the prompt; unknown citations appear in `citationWarnings`; a second run rewrites nothing. |
+| `pipeline_tests::contract` | Every stored point decodes (reader's `QdrantPayload`) to the chunk the adapters produced, under the UUIDv5 of its ID, and has exactly the `dense` and `sparse` vectors the reader queries, the sparse one built from the chunk's embedding input; the collection passes the indexer's layout check; `Kind` equals the filter's value; `Timestamp` is RFC 3339; `Service`/`Environment` are lowercase; `ContentHash`/`ChunkCount`/`SyncId` never reach `sources`. `/ask` returns the right documents for service (`Auth-API` from Datadog vs `AUTH-API` from the planner), environment, kind and time filters (half-open window, timeless kinds, a log pattern day whose first and last log lie outside a short window it logged in, a day that logged only around the window left out); logs are grouped by pattern and UTC day with their count; service catalog entries (kind `catalog`) are stored undated with no environment and pass any window, change events (kind `change`) are filtered by event time, service and environment from their tags; a multi-chunk log pattern and the days of one pattern are one source, counted per day in the asker's timezone in the prompt; `sources` are stored documents numbered like the prompt; unknown citations appear in `citationWarnings`; a second run rewrites nothing. |
 | `pipeline_tests::unicode` | See [Unicode policy](#unicode-policy). |
 | `pipeline_tests::quality` | The [incident question set](#incident-question-set). |
 
@@ -318,7 +325,9 @@ no code may cut text at a byte offset that is not a char boundary:
   at or below the limit, never separating a character from a following combining mark,
   variation selector, skin-tone modifier or zero-width-joiner sequence) or
   `truncate_with_marker`. Prompt excerpts (`EXCERPT_MAX_BYTES`, 1500 bytes, then
-  ` …[truncated]`), log pattern sample messages (4000 bytes), embedding header values
+  ` …[truncated]`), log pattern sample messages (4000 bytes), change event messages
+  (4000 bytes), service catalog descriptions (2000 bytes) and values (300 bytes),
+  embedding header values
   (300 bytes for the title, 100 for other fields) and logged upstream error bodies (512
   bytes) use them.
 - Character-limited cuts use `chars()`: the chunker (1800 chars, 200 overlap), log
@@ -336,9 +345,10 @@ and every payload survives the write/read round trip unchanged.
 ### Incident question set
 
 `crates/rag-indexer/tests/incident_questions/` holds a versioned, human-readable
-evaluation set: `questions.json` (33 incident questions) and `corpus.json` (monitors,
+evaluation set: `questions.json` (36 incident questions) and `corpus.json` (monitors,
 incidents with their timelines and postmortem notebooks, SLOs, logs, dashboards with
-their definitions, and metrics in Datadog response shape, with
+their definitions, metrics, service definitions (`serviceDefinitions`) and change events
+(`events`) in Datadog response shape, with
 distractors: a similarly named service, another environment, events outside the window,
 a burst of 300 near-identical logs, patterns logged on other days of the week, error
 codes and metric names that differ from the asked one in a single word, and events of
@@ -360,7 +370,7 @@ cargo test -p rag-indexer incident_questions_in_memory -- --nocapture
 question                     recall prec@R exclude scope   cites  intent   obs  evid srcs  notes
 q01-checkout-slow-yesterday    1.00   1.00     8/8    ok     5/5     5/5   2/2   0/0    5
 ...
-aggregate over 33 questions (known gaps excluded):
+aggregate over 36 questions (known gaps excluded):
   recall@k                   1.000 (threshold 0.95)
 ```
 
@@ -386,7 +396,8 @@ that `citationWarnings` equals
 
 **Adding a question:** add documents to `corpus.json` if needed (IDs become
 `monitor_<id>`, `incident_<id>`, `slo_<id>`, `dashboard_<id>`,
-`metric_<name with dots as underscores>`; logs are indexed as
+`metric_<name with dots as underscores>`, `catalog_<service>`, `change_<event id>`; logs
+are indexed as
 [pattern documents](ARCHITECTURE.md#log-patterns) per UTC day, and `log_<id>` in a
 question names the log pattern holding log `<id>`, which is one source whichever of its
 days represents it), then an entry to `questions`. Unknown IDs fail the

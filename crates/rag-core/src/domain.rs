@@ -10,10 +10,15 @@ pub enum SourceKind {
     Dashboard,
     SLO,
     Git,
+    /// A service definition from the Datadog Software Catalog: owners, on-call, links,
+    /// tier and dependencies of one service.
+    ServiceCatalog,
+    /// A deployment or configuration change event from the Datadog Events API.
+    Change,
 }
 
 impl SourceKind {
-    pub const ALL: [SourceKind; 7] = [
+    pub const ALL: [SourceKind; 9] = [
         SourceKind::Logs,
         SourceKind::Metrics,
         SourceKind::Monitor,
@@ -21,6 +26,8 @@ impl SourceKind {
         SourceKind::Dashboard,
         SourceKind::SLO,
         SourceKind::Git,
+        SourceKind::ServiceCatalog,
+        SourceKind::Change,
     ];
 
     /// Human-facing name used in filters and API requests (e.g. `kind:slo`).
@@ -33,6 +40,8 @@ impl SourceKind {
             SourceKind::Dashboard => "dashboard",
             SourceKind::SLO => "slo",
             SourceKind::Git => "git",
+            SourceKind::ServiceCatalog => "catalog",
+            SourceKind::Change => "change",
         }
     }
 
@@ -46,6 +55,16 @@ impl SourceKind {
             "dashboard" | "dashboards" => SourceKind::Dashboard,
             "slo" | "slos" => SourceKind::SLO,
             "git" => SourceKind::Git,
+            "catalog"
+            | "service_catalog"
+            | "service-catalog"
+            | "servicecatalog"
+            | "software_catalog"
+            | "service_definition"
+            | "service_definitions" => SourceKind::ServiceCatalog,
+            "change" | "changes" | "deploy" | "deploys" | "deployment" | "deployments" => {
+                SourceKind::Change
+            }
             _ => return None,
         })
     }
@@ -113,6 +132,8 @@ mod tests {
             SourceKind::Dashboard,
             SourceKind::SLO,
             SourceKind::Git,
+            SourceKind::ServiceCatalog,
+            SourceKind::Change,
         ];
 
         for kind in kinds {
@@ -120,6 +141,31 @@ mod tests {
             let deserialized: SourceKind = serde_json::from_str(&json).unwrap();
             assert_eq!(kind, deserialized);
         }
+    }
+
+    #[test]
+    fn test_new_kinds_payload_values_and_names() {
+        assert_eq!(
+            SourceKind::ServiceCatalog.payload_value(),
+            serde_json::json!("serviceCatalog")
+        );
+        assert_eq!(
+            SourceKind::Change.payload_value(),
+            serde_json::json!("change")
+        );
+        for kind in SourceKind::ALL {
+            assert_eq!(SourceKind::parse_lenient(kind.name()), Some(kind.clone()));
+        }
+        assert_eq!(
+            SourceKind::parse_lenient("Service_Catalog"),
+            Some(SourceKind::ServiceCatalog)
+        );
+        assert_eq!(
+            SourceKind::parse_lenient("deployments"),
+            Some(SourceKind::Change)
+        );
+        // `service` is the scope key, never a kind.
+        assert_eq!(SourceKind::parse_lenient("service"), None);
     }
 
     #[test]

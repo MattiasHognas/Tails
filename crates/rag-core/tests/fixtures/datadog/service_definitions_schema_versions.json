@@ -1,0 +1,205 @@
+{
+  "data": [
+    {
+      "type": "service-definition",
+      "id": "a1",
+      "attributes": {
+        "meta": {
+          "last-modified-time": "2024-05-02T12:00:00Z",
+          "github-html-url": "",
+          "ingestion-source": "api",
+          "origin": "unknown",
+          "origin-detail": "",
+          "warnings": [],
+          "ingested-schema-version": "v2.2"
+        },
+        "schema": {
+          "application": "my-app",
+          "ci-pipeline-fingerprints": [
+            "j88xdEy0J5lc",
+            "eZ7LMljCk8vo"
+          ],
+          "contacts": [
+            {
+              "contact": "https://teams.microsoft.com/myteam",
+              "name": "My team channel",
+              "type": "slack"
+            }
+          ],
+          "dd-service": "my-service",
+          "description": "My service description",
+          "extensions": {
+            "myorg/extension": "extensionValue"
+          },
+          "integrations": {
+            "opsgenie": {
+              "region": "US",
+              "service-url": "https://my-org.opsgenie.com/service/123e4567-e89b-12d3-a456-426614174000"
+            },
+            "pagerduty": {
+              "service-url": "https://my-org.pagerduty.com/service-directory/PMyService"
+            }
+          },
+          "languages": [
+            "dotnet",
+            "go",
+            "java",
+            "js",
+            "php",
+            "python",
+            "ruby",
+            "c++"
+          ],
+          "lifecycle": "sandbox",
+          "links": [
+            {
+              "name": "Runbook",
+              "provider": "Github",
+              "type": "runbook",
+              "url": "https://my-runbook"
+            }
+          ],
+          "schema-version": "v2.2",
+          "tags": [
+            "my:tag",
+            "service:tag"
+          ],
+          "team": "my-team",
+          "tier": "High",
+          "type": "web"
+        }
+      }
+    },
+    {
+      "type": "service-definition",
+      "id": "b2",
+      "attributes": {
+        "meta": {
+          "last-modified-time": "2024-05-02T12:00:00Z",
+          "github-html-url": "",
+          "ingestion-source": "api",
+          "origin": "unknown",
+          "origin-detail": "",
+          "warnings": [],
+          "ingested-schema-version": "v1"
+        },
+        "schema": {
+          "schema-version": "v1",
+          "info": {
+            "dd-service": "MyService",
+            "description": "A shopping cart service",
+            "display-name": "My Service",
+            "service-tier": "Tier 1"
+          },
+          "org": {
+            "application": "E-Commerce",
+            "team": "my-team"
+          },
+          "contact": {
+            "email": "contact@datadoghq.com",
+            "slack": "https://yourcompany.slack.com/archives/channel123"
+          },
+          "external-resources": [
+            {
+              "name": "Runbook",
+              "type": "runbook",
+              "url": "https://my-runbook"
+            }
+          ],
+          "integrations": {
+            "pagerduty": "https://my-org.pagerduty.com/service-directory/PMyService"
+          },
+          "tags": [
+            "my:tag"
+          ]
+        }
+      }
+    },
+    {
+      "type": "service-definition",
+      "id": "c3",
+      "attributes": {
+        "meta": {
+          "last-modified-time": "2024-05-02T12:00:00Z",
+          "github-html-url": "",
+          "ingestion-source": "api",
+          "origin": "unknown",
+          "origin-detail": "",
+          "warnings": [],
+          "ingested-schema-version": "v3"
+        },
+        "schema": {
+          "apiVersion": "v3",
+          "kind": "service",
+          "integrations": {
+            "opsgenie": {
+              "serviceURL": "https://www.opsgenie.com/service/shopping-cart"
+            },
+            "pagerduty": {
+              "serviceURL": "https://www.pagerduty.com/service-directory/Pshopping-cart"
+            }
+          },
+          "metadata": {
+            "name": "shopping-cart",
+            "description": "Kundvagn för webbshoppen – håller varukorgen 🛒",
+            "owner": "e-commerce",
+            "additionalOwners": [
+              {
+                "name": "finance-oncall",
+                "type": "team"
+              }
+            ],
+            "contacts": [
+              {
+                "contact": "https://slack/",
+                "type": "slack"
+              }
+            ],
+            "links": [
+              {
+                "name": "mylink",
+                "type": "link",
+                "url": "https://mylink"
+              }
+            ],
+            "tags": [
+              "this:tag",
+              "that:tag"
+            ]
+          },
+          "spec": {
+            "lifecycle": "production",
+            "tier": "1",
+            "type": "web",
+            "languages": [
+              "go"
+            ],
+            "dependsOn": [
+              "service:payments",
+              "service:inventory"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "type": "service-definition",
+      "id": "d4",
+      "attributes": {
+        "meta": {
+          "last-modified-time": "2024-05-02T12:00:00Z",
+          "github-html-url": "",
+          "ingestion-source": "api",
+          "origin": "unknown",
+          "origin-detail": "",
+          "warnings": [],
+          "ingested-schema-version": "v2.2"
+        },
+        "schema": {
+          "schema-version": "v2.2",
+          "team": "orphan"
+        }
+      }
+    }
+  ]
+}

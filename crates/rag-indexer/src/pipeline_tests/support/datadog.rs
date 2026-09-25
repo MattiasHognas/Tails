@@ -1,8 +1,9 @@
 //! A fake Datadog API serving a corpus in the shape of real responses, so the real
-//! adapters (`rag_core::datadog`) parse it: monitors, dashboards (list and definition),
-//! SLOs, metrics, incidents (search, timeline, attachments and postmortem notebooks) and
-//! logs, each with the pagination the adapter follows, plus the live time-series and log
-//! queries of `/ask`.
+//! adapters (`rag_core::datadog`, `service_catalog`, `change_events`) parse it:
+//! monitors, dashboards (list and definition), SLOs, metrics, incidents (search,
+//! timeline, attachments and postmortem notebooks), logs, service definitions and
+//! change events, each with the pagination the adapter follows, plus the live
+//! time-series and log queries of `/ask`.
 
 use chrono::{DateTime, Duration, Utc};
 use rag_core::datadog::Datadog;
@@ -14,6 +15,8 @@ use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 /// The indexing query the adapter must send for logs.
 const LOG_INDEX_QUERY: &str = "status:error OR status:warn";
+/// The indexing query the adapter must send for change events.
+const CHANGE_INDEX_QUERY: &str = rag_core::change_events::DEFAULT_QUERY;
 
 /// Datadog objects as the list/search endpoints return them.
 #[derive(Debug, Clone, Default)]
@@ -26,6 +29,10 @@ pub struct Corpus {
     pub incidents: Vec<Value>,
     /// Log events (`{"id", "type": "log", "attributes": {...}}`).
     pub logs: Vec<Value>,
+    /// Service definitions (`{"id", "type", "attributes": {"schema", "meta"}}`).
+    pub service_definitions: Vec<Value>,
+    /// Events (`{"id", "type": "event", "attributes": {...}}`) matching the change query.
+    pub events: Vec<Value>,
     /// Timeline cells per incident ID (`GET /api/v2/incidents/{id}/timeline`).
     pub incident_timelines: HashMap<String, Vec<Value>>,
     /// Attachments per incident ID (`GET /api/v2/incidents/{id}/attachments`).
@@ -94,6 +101,18 @@ impl Corpus {
             .iter()
             .flat_map(|p| array(&f(p)["data"]))
             .collect();
+        let service_definitions = [
+            "service_definitions_page1.json",
+            "service_definitions_page2.json",
+            "service_definitions_schema_versions.json",
+        ]
+        .iter()
+        .flat_map(|p| array(&f(p)["data"]))
+        .collect();
+        let events = ["events_search_page1.json", "events_search_page2.json"]
+            .iter()
+            .flat_map(|p| array(&f(p)["data"]))
+            .collect();
         let mut dashboards = array(&f("dashboards.json")["dashboards"]);
         dashboards.push(f("dashboard_get.json"));
         Self {
@@ -106,6 +125,8 @@ impl Corpus {
                 .collect(),
             incidents,
             logs,
+            service_definitions,
+            events,
             ..Self::default()
         }
     }
@@ -128,6 +149,8 @@ impl Corpus {
                 .collect(),
             incidents: array("incidents"),
             logs,
+            service_definitions: array("serviceDefinitions"),
+            events: array("events"),
             incident_timelines: by_incident(&v["incidentTimelines"]),
             incident_attachments: by_incident(&v["incidentAttachments"]),
             notebooks: array("notebooks"),
@@ -158,6 +181,8 @@ impl Corpus {
         self.metrics.extend(other.metrics);
         self.incidents.extend(other.incidents);
         self.logs.extend(other.logs);
+        self.service_definitions.extend(other.service_definitions);
+        self.events.extend(other.events);
         self.incident_timelines.extend(other.incident_timelines);
         self.incident_attachments.extend(other.incident_attachments);
         self.notebooks.extend(other.notebooks);
@@ -330,6 +355,50 @@ impl IndexApi {
                 let next = offset + data.len();
                 let mut resp = json!({"data": data, "meta": {"page": {}}});
                 if next < logs.len() {
+                    resp["meta"]["page"]["after"] = json!(next.to_string());
+                }
+                json(resp)
+            }
+            ("GET", "/api/v2/services/definitions") => {
+                let size = param(req, "page[size]").ok_or("page[size]")?;
+                let number = param(req, "page[number]").ok_or("page[number]")?;
+                if size > 100 {
+                    return Err(format!("page[size] {size} above the maximum 100"));
+                }
+                json(json!({"data": page(&c.service_definitions, number * size, size)}))
+            }
+            ("POST", "/api/v2/events/search") => {
+                let body: Value = serde_json::from_slice(&req.body).map_err(|e| e.to_string())?;
+                let f = &body["filter"];
+                if f["query"] != CHANGE_INDEX_QUERY {
+                    return Err(format!("unexpected event query {}", f["query"]));
+                }
+                if body["sort"] != "timestamp" {
+                    return Err(format!("unexpected event sort {}", body["sort"]));
+                }
+                let (from, to) = (ts(&f["from"]).ok_or("from")?, ts(&f["to"]).ok_or("to")?);
+                let mut events: Vec<Value> = c
+                    .events
+                    .iter()
+                    .filter(|e| {
+                        ts(&e["attributes"]["timestamp"]).is_some_and(|t| t >= from && t <= to)
+                    })
+                    .cloned()
+                    .collect();
+                events.sort_by_key(|e| ts(&e["attributes"]["timestamp"]));
+                let offset: usize = body["page"]["cursor"]
+                    .as_str()
+                    .map(|c| c.parse().map_err(|_| "bad cursor"))
+                    .transpose()?
+                    .unwrap_or(0);
+                let limit = body["page"]["limit"].as_u64().ok_or("limit")? as usize;
+                if limit > 1000 {
+                    return Err(format!("page.limit {limit} above the maximum 1000"));
+                }
+                let data = page(&events, offset, limit);
+                let next = offset + data.len();
+                let mut resp = json!({"data": data, "meta": {"page": {}}});
+                if next < events.len() {
                     resp["meta"]["page"]["after"] = json!(next.to_string());
                 }
                 json(resp)

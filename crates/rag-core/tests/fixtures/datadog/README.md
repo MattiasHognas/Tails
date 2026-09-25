@@ -1,6 +1,7 @@
 # Datadog response fixtures
 
-Response bodies used by the adapter tests in `src/datadog.rs`. Each body is a
+Response bodies used by the adapter tests in `src/datadog.rs`, `src/service_catalog.rs`
+and `src/change_events.rs`. Each body is a
 recorded Datadog API response from the official client's test cassettes
 (`DataDog/datadog-api-client-rust`, `tests/scenarios/cassettes`):
 
@@ -21,6 +22,12 @@ recorded Datadog API response from the official client's test cassettes
 | `incident_timeline.json` | `GET /api/v2/incidents/{incident_id}/timeline` | **none; crafted.** The read endpoint is not in the API reference or the OpenAPI spec. The cells use the documented timeline cell *create* shape (`incident_timeline_cells`, `attributes.cell_type`, `attributes.content.content`, `important`), plus `created`/`display_time`, an alternate `content.message` and an empty cell. Replace it with a recording once one exists. |
 | `metrics.json` | `GET /api/v1/metrics` | no cassette; documented response example from the v1 OpenAPI spec |
 | `metrics_query.json` | `GET /api/v1/query` | `v1/metrics/Query-timeseries-points-returns-OK-response` (`from=1641343852&to=1641430252&query=system.cpu.idle{*}`) |
+| `service_definitions_page1.json` | `GET /api/v2/services/definitions` | `v2/service_definition/Get-all-service-definitions-returns-OK-response-with-pagination` (1st page, `page[size]=2`: a v2.1 and a v2 definition) |
+| `service_definitions_page2.json` | `GET /api/v2/services/definitions` | same cassette (2nd page: a v2 definition with an empty team and schema warnings) |
+| `service_definitions_schema_versions.json` | `GET /api/v2/services/definitions` | no cassette; crafted from the OpenAPI spec: the documented v2.2 request example, a v1 definition built from the v1 schema's field examples, a v3 entity (`apiVersion: v3`, from the Software Catalog upsert example plus `spec.dependsOn` and a multibyte description), and a definition without `dd-service` |
+| `events_search_page1.json` | `POST /api/v2/events/search` | `v2/events/Search-events-returns-OK-response-with-pagination` (1st page, `page.limit=2`) |
+| `events_search_page2.json` | `POST /api/v2/events/search` | same cassette (2nd page, requested with the 1st page's `meta.page.after` cursor) |
+| `events_search_page3.json` | `POST /api/v2/events/search` | same cassette (3rd page: `{"data": []}`) |
 
 The incident search `facets` object is emptied to keep the fixtures small; the
 adapter does not read it. Everything else is as recorded.

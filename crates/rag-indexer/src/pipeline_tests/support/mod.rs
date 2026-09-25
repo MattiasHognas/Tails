@@ -36,6 +36,7 @@ fn config() -> IndexerConfig {
     IndexerConfig {
         lookback: Duration::days(5 * 365),
         overlap: Duration::minutes(10),
+        disabled: vec![],
     }
 }
 

@@ -128,7 +128,18 @@ fn corpus() -> Corpus {
             "modified_at": "2026-01-01T00:00:00+00:00", "template_variables": null,
             "widgets": [{"definition": {"type": "timeseries", "title": "Indexering per sida ⏱ 決済",
                 "requests": [{"q": "avg:search.index.duration{service:Sökmotor-Åäö,env:prod}"}]}}]}],
-        "logs": logs
+        "logs": logs,
+        // Descriptions and messages longer than the adapters' byte bounds, cut inside
+        // multibyte runs.
+        "serviceDefinitions": [{"id": "sd-1", "type": "service-definition", "attributes": {
+            "meta": {}, "schema": {"schema-version": "v2.2", "dd-service": "Kassa-Å",
+                "team": "Butik 🛒", "description": UNITS.concat().repeat(200),
+                "links": [{"name": "Körbok 📖", "type": "runbook", "url": "https://wiki/kassa-å"}]}}}],
+        "events": [{"id": "ev-1", "type": "event", "attributes": {
+            "timestamp": LOGGED_AT, "tags": ["service:Kassa-Å", "env:prod"],
+            "message": UNITS.concat().repeat(400),
+            "attributes": {"title": "Driftsättning 決済 🚀 e\u{0301}",
+                           "author": {"name": "Åsa 👩\u{200D}💻"}}}}]
     }))
 }
 
@@ -160,6 +171,40 @@ async fn run_unicode(store: Store) {
     assert_eq!(
         stored["incident_inc-jp#c0"].doc.title,
         "決済ゲートウェイ タイムアウト 🚨"
+    );
+    let catalog = &stored["catalog_kassa-å#c0"].doc;
+    assert_eq!(catalog.service, "kassa-å");
+    assert!(
+        catalog
+            .text
+            .contains("Körbok 📖 (runbook): https://wiki/kassa-å")
+    );
+    assert!(
+        catalog.text.contains(TRUNCATION_MARKER),
+        "the description is bounded"
+    );
+    let change = &stored["change_ev-1#c0"].doc;
+    assert_eq!(change.title, "Driftsättning 決済 🚀 e\u{0301}");
+    assert_eq!(change.service, "kassa-å");
+    assert_eq!(change.metadata["author"], "Åsa 👩\u{200D}💻");
+    let change_text: String = (0..)
+        .map_while(|i| stored.get(&format!("change_ev-1#c{i}")))
+        .enumerate()
+        .flat_map(|(i, c)| {
+            c.doc
+                .text
+                .chars()
+                .skip(if i == 0 { 0 } else { CHUNK_OVERLAP })
+        })
+        .collect();
+    let body = change_text.split_once("\n\n").unwrap().1;
+    assert!(body.ends_with(TRUNCATION_MARKER), "the message is bounded");
+    assert!(body.len() <= rag_core::change_events::MESSAGE_MAX_BYTES + TRUNCATION_MARKER.len());
+    assert!(
+        UNITS
+            .concat()
+            .repeat(400)
+            .starts_with(body.strip_suffix(TRUNCATION_MARKER).unwrap())
     );
     // The incident with its multibyte timeline and postmortem spans several chunks that
     // reassemble to its text; the dashboard's service comes from a multibyte query tag.
@@ -287,6 +332,17 @@ async fn run_unicode(store: Store) {
         titles.contains(&"Betalningar – översikt 📊 決済"),
         "{titles:?}"
     );
+
+    // The new kinds with multibyte service names reach `sources` and the prompt.
+    let resp = support::ask(
+        &base,
+        &json!({"question": "Kassa-Å körbok driftsättning", "service": "Kassa-Å",
+                "kinds": ["catalog", "change"]}),
+    )
+    .await;
+    let mut ids = support::source_ids(&resp);
+    ids.sort();
+    assert_eq!(ids, ["catalog_kassa-å", "change_ev-1"], "{resp}");
     store.finish().await;
 }
 

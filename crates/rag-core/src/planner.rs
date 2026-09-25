@@ -128,8 +128,12 @@ Inference rules:
 - If not confident, add them to `missingFields` and include precise `clarifyingQuestions`.
 - If a concrete time is mentioned (e.g., "yesterday 14:00-15:00 CET"),
   convert to UTC and set `window.fromUtc` and `window.toUtc`.
-- `filters` may only contain `kind:<logs|metrics|monitor|incident|dashboard|slo|git>`
-  entries, and only when the user explicitly restricts the kind of evidence.
+- `filters` may only contain
+  `kind:<logs|metrics|monitor|incident|dashboard|slo|git|catalog|change>` entries, and only
+  when the user explicitly restricts the kind of evidence. `catalog` is the service
+  catalog (owners, team, on-call, runbook/repo/doc links, tier, dependencies of a service);
+  `change` is deployments and configuration changes (deploys, releases, rollbacks,
+  feature flags, config edits), e.g. "which deploys ..." -> `kind:change`.
 - Set `rewrittenQuery` to a crisp, search-friendly paraphrase (include inferred service/env words).
 "#,
         local_now = local_now.to_rfc3339_opts(SecondsFormat::Secs, false),
@@ -634,6 +638,15 @@ mod tests {
             let plan = sanitize_plan(&serde_json::json!({"service": bad}), "q", &ctx);
             assert_eq!(plan.service, None, "{bad:?} should be rejected");
         }
+
+        // The planner may request the service catalog and change events.
+        let raw = serde_json::json!({
+            "filters": ["kind:catalog", "kind:Deployments", "source:service_catalog", "kind:change"]
+        });
+        let plan = sanitize_plan(&raw, "who owns checkout", &ctx);
+        assert_eq!(plan.filters, vec!["kind:catalog", "kind:change"]);
+        let prompt = planner_system_prompt(&ctx);
+        assert!(prompt.contains("|catalog|change>"), "{prompt}");
         for env in ["environment:Prod", "env:prod", "prod"] {
             let plan = sanitize_plan(&serde_json::json!({"environment": env}), "q", &ctx);
             assert_eq!(plan.environment.as_deref(), Some("prod"), "{env}");
