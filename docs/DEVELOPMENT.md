@@ -451,9 +451,10 @@ observations in `notes` before writing `expect.timeline`. A question documenting
 known limitation gets `"knownGap": "<why>"`: it is reported but not counted, and the
 report says when it starts passing.
 
-**Comparing retrieval configurations:** the harness's API reads `RAG_FUSION` and
-`RAG_KEYWORD_STOPWORDS` like `rag-api` (the report's first line names them), so run it
-once per configuration and compare the aggregates and the per-question `margin`:
+**Comparing retrieval configurations:** the harness's API reads `RAG_FUSION`,
+`RAG_RRF_K`, `RAG_RRF_WEIGHTS` and `RAG_KEYWORD_STOPWORDS` like `rag-api` (the report's
+first line names them), so run it once per configuration and compare the aggregates and
+the per-question `margin`:
 
 ```bash
 for f in rrf dbsf; do for s in off on; do
@@ -546,13 +547,20 @@ QDRANT_ENDPOINT=http://localhost:6333 TEI_URL=http://localhost:8080 scripts/e2e.
 # No embedding model: tails-fakes' hashed bag-of-words embeddings. Checks the processes
 # and the plumbing; the scores then match the in-process harness.
 E2E_EMBEDDINGS=fake QDRANT_ENDPOINT=http://localhost:6333 scripts/e2e.sh
+
+# OpenAI's embeddings (OPENAI_EMBEDDING_MODEL, default text-embedding-3-small, at
+# OPENAI_EMBEDDING_BASE_URL, default https://api.openai.com); chat stays on the fakes
+E2E_EMBEDDINGS=openai OPENAI_EMBEDDING_API_KEY=... QDRANT_ENDPOINT=http://localhost:6333 scripts/e2e.sh
 ```
 
 Other variables: `TEI_IMAGE`, `TEI_MODEL`, `TEI_MODEL_REVISION`, `TEI_QUERY_PREFIX` (the
-model's query instruction, bge's by default; empty for a model without one), `TEI_DATA` (model
+model's query instruction, bge's by default; empty for a model without one),
+`TEI_DOCUMENT_PREFIX` (the model's document prefix, such as e5's `passage: `; none by
+default, as bge wants), `TEI_DATA` (model
 cache), `FAKES_ADDR` (default `127.0.0.1:8900`), `API_ADDR` (where the started `rag-api`
 listens via `RAG_API_ADDR`, default `127.0.0.1:5191`), `E2E_SKIP_BUILD=1`, `E2E_KEEP=1`
-(keep the collection and the logs). Both addresses must be free.
+(keep the collection and the logs), `E2E_OUT` (a directory to copy every run's
+`--summary` JSON into). Both addresses must be free.
 
 **Comparing query-side configurations:** fusion (`RAG_FUSION`) and keyword stopwords
 (`RAG_KEYWORD_STOPWORDS`) only change how `rag-api` queries, so one index serves them
@@ -566,6 +574,10 @@ with the other three combinations:
 ```bash
 E2E_COMPARE="dbsf:off rrf:on dbsf:on" E2E_DOCKER=qdrant,tei scripts/e2e.sh
 ```
+
+An `rrf` entry can add RRF's parameters as `:k=<RAG_RRF_K>` and
+`:w=<dense>,<keyword>` (`RAG_RRF_WEIGHTS`), e.g.
+`E2E_COMPARE="rrf:off:k=60 rrf:off:w=1,2 rrf:on:k=10:w=2,1"`.
 
 For a question whose must-retrieve documents are not all ranked first, `tails-e2e`
 also prints ("explain") the top documents of dense and keyword search alone, the fused

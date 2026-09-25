@@ -554,6 +554,7 @@ fn summary(hybrid: &HybridConfig, rows: &[Row], hard: &[String], below: &[String
     let a = questions::aggregate(rows);
     json!({
         "fusion": hybrid.fusion.name(),
+        "fusionLabel": hybrid.fusion.label(),
         "stopwords": hybrid.query_stopwords,
         "aggregate": {
             "recallAtK": a.recall_at_k,

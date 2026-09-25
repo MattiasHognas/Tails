@@ -7,8 +7,9 @@
 //! against a real server in [`tests::query_api_matches_real_qdrant`]): named cosine
 //! dense vectors, sparse vectors scored as `Σ query value · idf · stored value` over
 //! shared indices with Qdrant's IDF modifier, and prefetches fused by reciprocal rank
-//! fusion or distribution-based score fusion (the fused scores checked against a real
-//! server in [`tests::dbsf_matches_real_qdrant`]). Anything it does not implement (an
+//! fusion (any `k`, optionally weighted per prefetch) or distribution-based score fusion
+//! (the fused scores checked against a real server in
+//! [`tests::dbsf_matches_real_qdrant`]). Anything it does not implement (an
 //! endpoint, a filter condition, a query form, a collection option) is recorded and
 //! fails [`Store::finish`] rather than silently matching.
 
@@ -286,13 +287,16 @@ fn sum_lists(lists: impl IntoIterator<Item = Scored>) -> Scored {
     fused
 }
 
-/// Qdrant's reciprocal rank fusion: a point at 0-based position `r` of a list scores
-/// `1 / (k + r)`, summed over the lists it appears in.
-fn rrf(lists: &[Scored], k: f32) -> Scored {
-    sum_lists(lists.iter().map(|list| {
+/// Qdrant's reciprocal rank fusion (`lib/segment/src/common/reciprocal_rank_fusion.rs`,
+/// v1.19): a point at 0-based position `r` of a list of weight `w` scores
+/// `1 / ((r + 1) / w + k - 1)` in f32, which is `1 / (k + r)` at weight 1, summed over
+/// the lists it appears in. `weights` has one entry per list, or is empty for all 1.
+fn rrf(lists: &[Scored], k: f32, weights: &[f32]) -> Scored {
+    sum_lists(lists.iter().enumerate().map(|(i, list)| {
+        let weight = weights.get(i).copied().unwrap_or(1.0);
         list.iter()
             .enumerate()
-            .map(|(rank, (_, id))| (1.0 / (k + rank as f32), id.clone()))
+            .map(|(rank, (_, id))| (1.0 / ((rank + 1) as f32 / weight + k - 1.0), id.clone()))
             .collect()
     }))
 }
@@ -332,40 +336,66 @@ fn dbsf(lists: &[Scored]) -> Scored {
 /// How a fused query combines its prefetches.
 #[derive(Debug, PartialEq)]
 enum Fusion {
-    Rrf { k: f32 },
+    /// `weights`: one per prefetch, or none (all 1).
+    Rrf {
+        k: f32,
+        weights: Vec<f32>,
+    },
     Dbsf,
 }
 
-/// The fusion of a query: `{"fusion": "dbsf"}`, or RRF ([`rrf_k`]).
+/// The fusion of a query: `{"fusion": "dbsf"}`, or RRF ([`rrf_params`]).
 fn fusion(query: &Value) -> Result<Fusion, String> {
     if query == &json!({"fusion": "dbsf"}) {
         return Ok(Fusion::Dbsf);
     }
-    rrf_k(query).map(|k| Fusion::Rrf { k })
+    rrf_params(query).map(|(k, weights)| Fusion::Rrf { k, weights })
 }
 
-/// `k` of an RRF query: `{"fusion": "rrf"}` (Qdrant's default k = 2) or
-/// `{"rrf": {"k": n}}`.
-fn rrf_k(query: &Value) -> Result<f32, String> {
+/// `k` and weights of an RRF query: `{"fusion": "rrf"}` (Qdrant's default k = 2) or
+/// `{"rrf": {"k": n, "weights": [w, ...]}}`, both keys optional. Qdrant accepts weights
+/// of 0 or below (their lists then add nothing); Tails never sends them, so the fake
+/// refuses them. That their number equals the prefetches' is checked by the query.
+fn rrf_params(query: &Value) -> Result<(f32, Vec<f32>), String> {
     if query == &json!({"fusion": "rrf"}) {
-        return Ok(2.0);
+        return Ok((2.0, vec![]));
     }
     let params = query
         .get("rrf")
         .and_then(Value::as_object)
         .filter(|_| query.as_object().is_some_and(|q| q.len() == 1))
         .ok_or_else(|| format!("unsupported fusion query {query}"))?;
-    if let Some(key) = params.keys().find(|k| *k != "k") {
+    if let Some(key) = params
+        .keys()
+        .find(|k| !["k", "weights"].contains(&k.as_str()))
+    {
         return Err(format!("unsupported rrf parameter {key}"));
     }
-    match params.get("k") {
-        None => Ok(2.0),
+    let k = match params.get("k") {
+        None => 2.0,
         Some(k) => k
             .as_u64()
             .filter(|k| *k > 0)
             .map(|k| k as f32)
-            .ok_or_else(|| format!("invalid rrf k {k}")),
-    }
+            .ok_or_else(|| format!("invalid rrf k {k}"))?,
+    };
+    let weights = match params.get("weights") {
+        None => vec![],
+        Some(w) => w
+            .as_array()
+            .filter(|w| !w.is_empty())
+            .and_then(|w| {
+                w.iter()
+                    .map(|w| {
+                        w.as_f64()
+                            .map(|w| w as f32)
+                            .filter(|w| w.is_finite() && *w > 0.0)
+                    })
+                    .collect::<Option<Vec<f32>>>()
+            })
+            .ok_or_else(|| format!("unsupported rrf weights {w}"))?,
+    };
+    Ok((k, weights))
 }
 
 /// Qdrant's IDF modifier: `ln(1 + (N - n + 0.5) / (n + 0.5))` with N the points that
@@ -567,7 +597,17 @@ impl Collection {
             .map(|p| self.prefetch(p))
             .collect::<Result<Vec<_>, _>>()?;
         let fused = match fusion {
-            Fusion::Rrf { k } => rrf(&lists, k),
+            Fusion::Rrf { k, weights } => {
+                // Qdrant: "RRF weights length (1) does not match number of prefetches (2)".
+                if !weights.is_empty() && weights.len() != lists.len() {
+                    return Err(format!(
+                        "{} rrf weights for {} prefetches",
+                        weights.len(),
+                        lists.len()
+                    ));
+                }
+                rrf(&lists, k, &weights)
+            }
             Fusion::Dbsf => dbsf(&lists),
         };
         let points: Vec<Value> = fused
@@ -985,7 +1025,7 @@ mod tests {
         // Only the order counts, not the scores.
         let list = |ids: &[&str]| -> Scored { ids.iter().map(|s| (0.0, s.to_string())).collect() };
         // k = 2, 0-based ranks: a 1/2 + 1/4, b 1/3 + 1/2, c 1/4, d 1/3.
-        let fused = rrf(&[list(&["a", "b", "c"]), list(&["b", "d", "a"])], 2.0);
+        let fused = rrf(&[list(&["a", "b", "c"]), list(&["b", "d", "a"])], 2.0, &[]);
         let want = [
             ("b", 1.0 / 3.0 + 1.0 / 2.0),
             ("a", 1.0 / 2.0 + 1.0 / 4.0),
@@ -998,19 +1038,55 @@ mod tests {
             assert!((score - want_score).abs() < 1e-6, "{id}: {score}");
         }
         // Equal scores are ordered by point ID, numbers numerically.
-        let tied = rrf(&[list(&["10", "7"]), list(&["7", "10"])], 60.0);
+        let tied = rrf(&[list(&["10", "7"]), list(&["7", "10"])], 60.0, &[]);
         assert_eq!(tied[0].1, "7");
         // `fusion: rrf` is Qdrant's default k = 2.
-        assert_eq!(rrf_k(&json!({"fusion": "rrf"})).unwrap(), 2.0);
-        assert_eq!(rrf_k(&json!({"rrf": {}})).unwrap(), 2.0);
-        assert_eq!(rrf_k(&json!({"rrf": {"k": 60}})).unwrap(), 60.0);
-        assert!(rrf_k(&json!({"fusion": "dbsf"})).is_err());
-        assert!(rrf_k(&json!({"rrf": {"k": 2, "weights": [1, 2]}})).is_err());
+        assert_eq!(
+            rrf_params(&json!({"fusion": "rrf"})).unwrap(),
+            (2.0, vec![])
+        );
+        assert_eq!(rrf_params(&json!({"rrf": {}})).unwrap(), (2.0, vec![]));
+        assert_eq!(
+            rrf_params(&json!({"rrf": {"k": 60}})).unwrap(),
+            (60.0, vec![])
+        );
+        assert_eq!(
+            rrf_params(&json!({"rrf": {"k": 2, "weights": [1, 2.5]}})).unwrap(),
+            (2.0, vec![1.0, 2.5])
+        );
+        assert!(rrf_params(&json!({"fusion": "dbsf"})).is_err());
+        assert!(rrf_params(&json!({"rrf": {"k": 0}})).is_err());
+        assert!(rrf_params(&json!({"rrf": {"k": 2.5}})).is_err());
+        assert!(rrf_params(&json!({"rrf": {"weights": []}})).is_err());
+        assert!(rrf_params(&json!({"rrf": {"weights": [1, 0]}})).is_err());
+        assert!(rrf_params(&json!({"rrf": {"weights": [1, -1]}})).is_err());
+        assert!(rrf_params(&json!({"rrf": {"weights": [1, "2"]}})).is_err());
+        assert!(rrf_params(&json!({"rrf": {"k": 2, "bias": 1}})).is_err());
         assert_eq!(fusion(&json!({"fusion": "dbsf"})).unwrap(), Fusion::Dbsf);
         assert_eq!(
             fusion(&json!({"rrf": {"k": 2}})).unwrap(),
-            Fusion::Rrf { k: 2.0 }
+            Fusion::Rrf {
+                k: 2.0,
+                weights: vec![]
+            }
         );
+        // Weight w divides the 1-based rank: k = 2, weights 1 and 2. a: 1/2 + 1/(3/2 + 1),
+        // b: 1/3 + 1/(1/2 + 1), c: 1/4, d: 1/(2/2 + 1).
+        let fused = rrf(
+            &[list(&["a", "b", "c"]), list(&["b", "d", "a"])],
+            2.0,
+            &[1.0, 2.0],
+        );
+        let want = [
+            ("b", 1.0 / 3.0 + 2.0 / 3.0),
+            ("a", 0.5 + 0.4),
+            ("d", 0.5),
+            ("c", 0.25),
+        ];
+        for ((score, id), (want_id, want_score)) in fused.iter().zip(want) {
+            assert_eq!(id, want_id);
+            assert!((score - want_score).abs() < 1e-6, "{id}: {score}");
+        }
         // Qdrant has no DBSF parameters; it ignores unknown keys, the fake refuses them.
         assert!(fusion(&json!({"fusion": "dbsf", "weights": [1, 2]})).is_err());
         assert!(fusion(&json!({"dbsf": {}})).is_err());
@@ -1075,10 +1151,10 @@ mod tests {
         }
     }
 
-    /// Sparse IDF scoring, prefetch filters and limits, and RRF fusion on a tiny
-    /// collection with the production layout, against scores computed by hand. The
-    /// same checks pass on Qdrant 1.19.1. No two points tie in any list, because
-    /// Qdrant orders ties arbitrarily.
+    /// Sparse IDF scoring, prefetch filters and limits, and RRF fusion (several k,
+    /// weighted) on a tiny collection with the production layout, against scores
+    /// computed by hand. The same checks pass on Qdrant 1.19.1. No two points tie in any
+    /// list, because Qdrant orders ties arbitrarily.
     async fn upsert(store: &Store, body: Value) {
         let url = format!(
             "{}/collections/{}/points?wait=true",
@@ -1183,6 +1259,47 @@ mod tests {
         assert_scores(
             &post_query(&store, fused(json!({"rrf": {"k": 60}}), 10, 2)).await,
             &[(3, 1.0 / 63.0 + 1.0 / 60.0), (4, 1.0 / 62.0 + 1.0 / 61.0)],
+        );
+        // Weighted RRF: rank r of a list of weight w scores 1 / ((r + 1) / w + k - 1).
+        // Keyword twice the dense weight, k = 2: 3: 1/5 + 1/1.5, 4: 1/4 + 1/2, 1: 1/2,
+        // 2: 1/3, 5: 1/6.
+        assert_scores(
+            &post_query(
+                &store,
+                fused(json!({"rrf": {"k": 2, "weights": [1.0, 2.0]}}), 10, 10),
+            )
+            .await,
+            &[
+                (3, 0.2 + 1.0 / 1.5),
+                (4, 0.25 + 0.5),
+                (1, 0.5),
+                (2, 1.0 / 3.0),
+                (5, 1.0 / 6.0),
+            ],
+        );
+        // Dense three times the keyword weight, k = 10 (k is optional with weights too):
+        // 1: 1/(1/3 + 9), 3: 1/(4/3 + 9) + 1/10, 4: 1/(3/3 + 9) + 1/11, 2: 1/(2/3 + 9).
+        assert_scores(
+            &post_query(
+                &store,
+                fused(json!({"rrf": {"k": 10, "weights": [3.0, 1.0]}}), 10, 4),
+            )
+            .await,
+            &[
+                (3, 1.0 / (4.0 / 3.0 + 9.0) + 0.1),
+                (4, 0.1 + 1.0 / 11.0),
+                (1, 1.0 / (1.0 / 3.0 + 9.0)),
+                (2, 1.0 / (2.0 / 3.0 + 9.0)),
+            ],
+        );
+        // Weights 1 equal plain RRF.
+        assert_scores(
+            &post_query(
+                &store,
+                fused(json!({"rrf": {"k": 2, "weights": [1.0, 1.0]}}), 10, 10),
+            )
+            .await,
+            &k2,
         );
         store.finish().await;
     }
@@ -1428,6 +1545,13 @@ mod tests {
                 Method::POST,
                 query,
                 json!({"prefetch": dense_prefetch, "query": {"fusion": "rrf"}, "filter": {}}),
+            )
+            .await,
+            // One weight per prefetch (Qdrant refuses other counts too).
+            send(
+                Method::POST,
+                query,
+                json!({"prefetch": dense_prefetch, "query": {"rrf": {"weights": [1, 2]}}}),
             )
             .await,
         ];
