@@ -670,8 +670,13 @@ then the message (at most 4000 bytes, cut at a char boundary). Windowed like log
 
 Both use `send_with_retry` (429 honouring `Retry-After`, 5xx and timeouts, per
 `RAG_RETRY_*`). They need the application key permissions `apm_service_catalog_read`
-and `events_read`; without them the source fails with 403, the others still run, and the
-run exits non-zero until the source is disabled. API calls per run: the catalog costs
+and `events_read`; without one, Datadog answers 403 and the source is skipped with a
+warning naming the permission. That is not a failure: the others advance, the run exits
+zero, and the skipped source keeps its checkpoint so it catches up once the permission is
+granted. Change events are off by default (`INDEXER_CHANGE_EVENTS_ENABLED=true` turns them
+on); each run logs how many change events it fetched per `source:`, and warns when the
+query matched none, so a query that doesn't fit the organization's deploy tooling shows
+up on the first run. API calls per run: the catalog costs
 `ceil(services / 100)` requests, change events `ceil(events in the window / 1000)`
 (usually one).
 

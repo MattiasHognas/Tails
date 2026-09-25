@@ -39,7 +39,7 @@ INDEXER_EMBED_BATCH_MAX_CHARS=200000     # characters per embeddings request (ro
 INDEXER_EMBED_CONCURRENCY=4              # embedding batches/upserts, lookups or deletes in flight (1-32)
 INDEXER_ALLOW_EMPTY_SYNC_DELETE=false    # true: an empty monitor/dashboard/SLO/service catalog fetch deletes all indexed ones
 INDEXER_SERVICE_CATALOG_ENABLED=true     # false: skip service definitions (GET /api/v2/services/definitions)
-INDEXER_CHANGE_EVENTS_ENABLED=true       # false: skip change events (POST /api/v2/events/search)
+INDEXER_CHANGE_EVENTS_ENABLED=false      # true: index change events (POST /api/v2/events/search); off until the query below fits your deploy tooling
 INDEXER_CHANGE_EVENTS_QUERY=             # event search query for deploys/config changes; default:
                                          # @evt.category:change OR source:(argocd OR spinnaker OR jenkins OR gitlab OR github OR launchdarkly OR terraform)
 

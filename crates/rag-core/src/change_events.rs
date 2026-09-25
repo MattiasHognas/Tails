@@ -242,7 +242,7 @@ impl Datadog {
                     .json(&body)
             })
             .await
-            .map_err(|f| anyhow::anyhow!("Failed to search change events: {}", f.error))?;
+            .map_err(|f| anyhow::Error::new(f.error).context("Failed to search change events"))?;
             let result: Value = response.json().await?;
             let events = result["data"]
                 .as_array()
@@ -405,6 +405,11 @@ mod tests {
             .await
             .unwrap_err();
         assert!(format!("{err:#}").contains("change events"), "{err:#}");
+        // The status stays typed, so the indexer can tell a missing permission apart.
+        assert!(err.chain().any(|c| matches!(
+            c.downcast_ref::<crate::error::UpstreamError>(),
+            Some(crate::error::UpstreamError::Status { status: 403, .. })
+        )));
 
         // 429 is retried.
         let server = MockServer::start().await;

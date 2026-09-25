@@ -348,7 +348,9 @@ impl Datadog {
                     .query(&params)
             })
             .await
-            .map_err(|f| anyhow::anyhow!("Failed to fetch service definitions: {}", f.error))?;
+            .map_err(|f| {
+                anyhow::Error::new(f.error).context("Failed to fetch service definitions")
+            })?;
             let result: Value = response.json().await?;
             let entries = result["data"].as_array().ok_or_else(|| {
                 anyhow::anyhow!("Unexpected service definition response: missing data")
@@ -636,6 +638,11 @@ mod tests {
             format!("{err:#}").contains("service definitions"),
             "{err:#}"
         );
+        // The status stays typed, so the indexer can tell a missing permission apart.
+        assert!(err.chain().any(|c| matches!(
+            c.downcast_ref::<crate::error::UpstreamError>(),
+            Some(crate::error::UpstreamError::Status { status: 403, .. })
+        )));
     }
 
     #[test]

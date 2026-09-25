@@ -58,6 +58,7 @@ rag-cli ask "what alerted overnight?" --kind monitor --kind incident
 rag-cli ask "who owns checkout and where is its runbook?"
 
 # Deploys and configuration changes are indexed as change events
+# (off by default; set INDEXER_CHANGE_EVENTS_ENABLED=true on the indexer)
 rag-cli ask "what changed in checkout right before the errors started at 14:02?" --env prod
 
 # Resolve "yesterday", "last 2 hours", ... in a specific timezone (default: your system zone)
