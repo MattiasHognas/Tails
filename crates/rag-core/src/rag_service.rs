@@ -2,9 +2,10 @@ use crate::domain::Hit;
 use crate::error::{RagError, Stage};
 use crate::log_patterns::{self, LogPattern};
 use crate::openai::OpenAiClient;
-use crate::qdrant::Qdrant;
+use crate::qdrant::{Qdrant, SearchQuery};
 use crate::reranker::rerank_mmr_signals;
 use crate::resilience::{env_duration_ms, run_stage};
+use crate::sparse::query_vector;
 use crate::text::{TRUNCATION_MARKER, truncate_with_marker};
 use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
@@ -331,7 +332,7 @@ impl StageTimeouts {
     }
 }
 
-/// Embed `query`, search Qdrant and answer `question`.
+/// Search with `queries` (see [`retrieve`]) and answer `question`.
 ///
 /// Any embedding or retrieval failure is returned as an error and the LLM is
 /// never called. A successful search with zero hits yields
@@ -340,14 +341,14 @@ impl StageTimeouts {
 pub async fn retrieve_and_answer(
     oa: &OpenAiClient,
     qd: &Qdrant,
-    query: &str,
+    queries: &[String],
     question: &str,
     filter: Option<serde_json::Value>,
     search_limit: usize,
     top_k: usize,
     timeouts: &StageTimeouts,
 ) -> Result<AskOutcome, RagError> {
-    let candidates = retrieve(oa, qd, query, filter, search_limit, timeouts).await?;
+    let candidates = retrieve(oa, qd, queries, filter, search_limit, timeouts).await?;
     answer_candidates(
         oa,
         candidates,
@@ -360,20 +361,57 @@ pub async fn retrieve_and_answer(
     .await
 }
 
-/// Embed `query` and search Qdrant. Failures are errors, never empty hits.
+/// The texts a question is searched with: the user's `question`, and the planner's (or
+/// caller's) `rewrite` when it says something else. Searching with both keeps a detail
+/// the rewrite dropped (an error code, a hostname) findable, and adds the rewrite's
+/// terms. Case and whitespace differences alone do not count as a rewrite.
+pub fn search_queries(question: &str, rewrite: Option<&str>) -> Vec<String> {
+    let normalized = |s: &str| {
+        s.split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase()
+    };
+    let question = question.trim();
+    let mut out = vec![question.to_string()];
+    if let Some(r) = rewrite.map(str::trim).filter(|r| !r.is_empty())
+        && normalized(r) != normalized(question)
+    {
+        out.push(r.to_string());
+    }
+    out
+}
+
+/// Embed `queries` (one embeddings request) and run one hybrid search: dense and
+/// keyword search per query, fused by Qdrant ([`Qdrant::hybrid_search`]). Failures are
+/// errors, never empty hits.
 pub async fn retrieve(
     oa: &OpenAiClient,
     qd: &Qdrant,
-    query: &str,
+    queries: &[String],
     filter: Option<serde_json::Value>,
     search_limit: usize,
     timeouts: &StageTimeouts,
 ) -> Result<Vec<Hit>, RagError> {
-    let vector = run_stage(Stage::Embedding, timeouts.embedding, oa.embed(query)).await?;
+    let embed = async {
+        match queries {
+            [one] => Ok(vec![oa.embed(one).await?]),
+            many => oa.embed_batch(many).await,
+        }
+    };
+    let dense = run_stage(Stage::Embedding, timeouts.embedding, embed).await?;
+    let searches: Vec<SearchQuery> = queries
+        .iter()
+        .zip(dense)
+        .map(|(text, dense)| SearchQuery {
+            dense,
+            sparse: query_vector(text),
+        })
+        .collect();
     run_stage(
         Stage::Retrieval,
         timeouts.retrieval,
-        qd.search(vector, search_limit, filter),
+        qd.hybrid_search(&searches, search_limit, filter),
     )
     .await
 }
@@ -823,5 +861,73 @@ mod tests {
         assert_eq!(outcome.evidence, Evidence::None);
         assert!(outcome.sources.is_empty());
         assert_eq!(outcome.answer, NO_EVIDENCE_ANSWER);
+    }
+
+    #[test]
+    fn search_queries_add_the_rewrite_only_when_it_differs() {
+        assert_eq!(search_queries(" why ERR_X? ", None), ["why ERR_X?"]);
+        assert_eq!(search_queries("why ERR_X?", Some("  ")), ["why ERR_X?"]);
+        assert_eq!(
+            search_queries("Why ERR_X?", Some("why  err_x?")),
+            ["Why ERR_X?"]
+        );
+        assert_eq!(
+            search_queries("why ERR_X?", Some(" checkout errors ")),
+            ["why ERR_X?", "checkout errors"]
+        );
+    }
+
+    #[tokio::test]
+    async fn retrieve_embeds_both_questions_at_once_and_fuses_four_searches() {
+        use wiremock::matchers::body_partial_json;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .and(body_partial_json(
+                serde_json::json!({"input": ["why ERR_X?", "checkout errors"]}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{"index": 1, "embedding": [0.0, 1.0]},
+                         {"index": 0, "embedding": [1.0, 0.0]}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/collections/c/points/query"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"result": {"points": []}})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let oa = OpenAiClient::new("k".into(), server.uri(), "e".into(), "c".into());
+        let qd = Qdrant::new(server.uri(), "c".into());
+        let queries = search_queries("why ERR_X?", Some("checkout errors"));
+        let hits = retrieve(&oa, &qd, &queries, None, 8, &StageTimeouts::default())
+            .await
+            .unwrap();
+        assert!(hits.is_empty());
+
+        let requests = server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+        let (want, lists) = crate::qdrant::hybrid_query_body(
+            &[
+                SearchQuery {
+                    dense: vec![1.0, 0.0],
+                    sparse: query_vector("why ERR_X?"),
+                },
+                SearchQuery {
+                    dense: vec![0.0, 1.0],
+                    sparse: query_vector("checkout errors"),
+                },
+            ],
+            8,
+            None,
+        );
+        assert_eq!(lists, 4);
+        assert_eq!(body, want);
     }
 }

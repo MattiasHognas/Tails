@@ -29,7 +29,7 @@ flowchart TB
         planner["run_planner()<br/>planner::plan_query()<br/>sanitize_plan(): untrusted LLM output,<br/>'yesterday' resolved in code"]
         scope["RetrievalScope::resolve()<br/>explicit fields win over inferred<br/>to_qdrant_filter()"]
         topk["choose_topk()"]
-        rna["rag_service::retrieve()<br/>embed + filtered search"]
+        rna["rag_service::retrieve()<br/>embed question (+ rewrite)<br/>hybrid dense + keyword search"]
         live["live_timeline()<br/>diagnostic intent + window?<br/>live_evidence::collect_timeline()"]
         answer["answer_candidates()<br/>rerank_mmr_signals() + prompt<br/>with timeline"]
         noev["no hits and no observations:<br/>fixed no-evidence answer (LLM not called)"]
@@ -39,9 +39,9 @@ flowchart TB
     subgraph core ["rag-core (shared library)"]
         resil["resilience: run_stage() timeouts,<br/>send_with_retry() backoff for 429/5xx"]
         oaClient["OpenAiClient<br/>embed() / embed_batch()<br/>chat_json() / chat_complete()"]
-        qdClient["Qdrant<br/>search() / upsert()<br/>retrieve_states() / set_payload()<br/>count() / delete_by_filter()"]
+        qdClient["Qdrant<br/>hybrid_search() / upsert()<br/>check_collection() / create_collection()<br/>retrieve_states() / set_payload()<br/>count() / delete_by_filter()"]
         ddClient["Datadog adapters<br/>indexing: get_monitors() list_dashboards() list_slos()<br/>list_metrics() get_incidents() search_logs() (grouped by pattern and day)<br/>live: query_metrics() search_log_events()"]
-        chunker["chunk() + stable_id()<br/>content_hash() embedding_input()<br/>log_patterns: group / merge"]
+        chunker["chunk() + stable_id()<br/>content_hash() embedding_input()<br/>sparse: keyword vectors<br/>log_patterns: group / merge"]
         liveCore["live_evidence<br/>discover(): services + metrics from hits<br/>analysis: spikes, drops, gaps, log bursts vs baseline<br/>timeline: observations / hypotheses / missing"]
     end
 
@@ -50,7 +50,7 @@ flowchart TB
         idx["index_sources()<br/>per source: window() with overlap"]
         fetch["SourceFetcher::fetch()"]
         dedupe["dedupe_by_id()<br/>logs: merge_log_patterns()<br/>with the stored counts"]
-        sink["IncrementalSink::index()<br/>chunk + content_hash -> retrieve stored state<br/>skip unchanged; embed_batch(header + chunk) -> upsert<br/>(bounded concurrency)<br/>delete surplus chunks; full sync: delete unseen"]
+        sink["IncrementalSink::index()<br/>chunk + content_hash -> retrieve stored state<br/>skip unchanged; embed_batch(header + chunk)<br/>+ sparse vector of the same text -> upsert<br/>(bounded concurrency)<br/>delete surplus chunks; full sync: delete unseen"]
         ckSave["Checkpoints::save()<br/>atomic, only after all writes succeed"]
     end
 
@@ -58,7 +58,7 @@ flowchart TB
 
     subgraph ext ["External services"]
         openai[["OpenAI<br/>/v1/embeddings<br/>/v1/chat/completions"]]
-        qdrant[("Qdrant<br/>POST /collections/{c}/points/search<br/>PUT /collections/{c}/points<br/>POST /collections/{c}/points (retrieve)<br/>POST .../points/payload, /delete, /count")]
+        qdrant[("Qdrant<br/>POST /collections/{c}/points/query<br/>GET, PUT /collections/{c}<br/>PUT /collections/{c}/points<br/>POST /collections/{c}/points (retrieve)<br/>POST .../points/payload, /delete, /count")]
         datadog[["Datadog API<br/>/api/v1/monitor, /dashboard, /slo, /metrics<br/>/api/v1/query (live time series)<br/>/api/v2/incidents/search<br/>/api/v2/logs/events/search"]]
     end
 
@@ -71,8 +71,8 @@ flowchart TB
     routePlan --> validate --> planner
     routeAsk --> validate
     planner --> scope --> topk --> rna
-    rna -- "1. embed query" --> oaClient
-    rna -- "2. filtered search" --> qdClient
+    rna -- "1. embed question + rewrite" --> oaClient
+    rna -- "2. hybrid search, filtered" --> qdClient
     rna -- "hits + scope" --> live
     live --> liveCore
     liveCore -- "live queries, window + baseline" --> ddClient
@@ -119,7 +119,9 @@ What each part does:
     is treated as untrusted, and relative times like "yesterday" are resolved in code;
   - merges the plan with explicit request fields into a `RetrievalScope`, which becomes
     the Qdrant filter;
-  - retrieves: embeds the query and searches Qdrant with that filter;
+  - retrieves: embeds the question (and the planner's rewrite, when it differs) and runs
+    one hybrid Qdrant query with that filter: dense and keyword search per text, fused
+    (see [Retrieval and ranking](#retrieval-and-ranking));
   - for diagnostic questions with a time window, collects live evidence: queries Datadog
     for the discovered services' metrics and error logs over the window and a baseline,
     and returns a `timeline` (see [Live evidence](#live-evidence-timeline));
@@ -129,19 +131,23 @@ What each part does:
     `502`/`503`/`504` errors, never an answer; live-evidence failures are reported in the
     timeline instead.
 - **rag-core**: the shared library.
-  - The OpenAI client (single and batched embeddings, chat), the Qdrant client (search,
-    upsert, and the retrieve/set-payload/count/delete calls of incremental indexing), and
-    the Datadog adapters.
+  - The OpenAI client (single and batched embeddings, chat), the Qdrant client (hybrid
+    search, upsert, collection setup, and the retrieve/set-payload/count/delete calls of
+    incremental indexing), and the Datadog adapters.
   - The planner, the retrieval scope and the reranker.
   - `live_evidence`: discovery, deterministic time-series and log analysis, and the
     timeline.
   - The chunker (stable chunk IDs, so re-indexing overwrites instead of duplicating) and
     `embedding_input()`, the context header embedded with every chunk.
+  - `sparse`: the keyword tokenizer and BM25-style sparse vectors of chunks and
+    questions.
   - `log_patterns`: groups error/warning logs by message pattern and UTC day for
     indexing, and counts a pattern's logs in a question's window.
   - `resilience`: per-stage timeouts, the overall request deadline, and bounded retries
     for 429 and 5xx responses.
-- **rag-indexer**: for each Datadog source, computes a window from that source's
+- **rag-indexer**: creates the Qdrant collection on the first run (see
+  [Qdrant storage](#qdrant-storage)). Then, for each Datadog source, it computes a window
+  from that source's
   checkpoint (with overlap for late data). It then fetches, deduplicates (for logs, merges
   each message pattern's day with its stored counts) and chunks,
   skips documents whose stored content hash is unchanged, embeds the rest in batches and
@@ -152,13 +158,13 @@ What each part does:
   - **Datadog**: the source of monitors, dashboards, SLOs, metric names, incidents and
     logs for indexing, and of live time series and logs for diagnostic questions.
   - **OpenAI**: embeddings, planning, and answers.
-  - **Qdrant**: the vector store the API searches.
+  - **Qdrant**: the vector store the API searches (dense and sparse vectors).
 
 ## Crates
 
 | Crate | Description |
 |-------|--------------|
-| `rag-core` | Domain models, OpenAI (chat, single and batched embeddings), Qdrant (search, upsert, and the incremental-indexing retrieve/set-payload/count/delete calls), Datadog client (monitors, incidents, logs, dashboards, metrics, SLOs), chunker, planner, reranker, RAG service. |
+| `rag-core` | Domain models, OpenAI (chat, single and batched embeddings), Qdrant (hybrid search, upsert, collection setup, and the incremental-indexing retrieve/set-payload/count/delete calls), keyword (sparse) vectors, Datadog client (monitors, incidents, logs, dashboards, metrics, SLOs), chunker, planner, reranker, RAG service. |
 | `rag-api` | Axum REST API — `/ask/plan` (intent + inferred filters) and `/ask` (server-side planning + filtered retrieval + live Datadog evidence for diagnostic questions + answer). |
 | `rag-cli` | CLI that calls the API. The server plans (service/env/time) and decides top-K. |
 | `rag-indexer` | One-shot, resumable indexer for Datadog → Qdrant with per-source checkpoints. Perfect for Kubernetes CronJob. |
@@ -179,7 +185,9 @@ is how the server interprets a request:
     inferred one entirely (a missing bound is open-ended).
   - Source kinds: `kinds`, then `kind:` entries in `filters`, then planner `kind:` filters.
     Valid kinds: `logs`, `metrics`, `monitor`, `incident`, `dashboard`, `slo`, `git`.
-  - `rewritten_query`, then the planner's rewrite, then `question` is embedded.
+  - The rewrite is `rewritten_query`, else the planner's `rewrittenQuery`. The `question`
+    is always searched; the rewrite too when it differs from it (ignoring case and
+    whitespace), so a detail the rewrite dropped is still found.
 - **`timezone`** is an IANA name (default `UTC`). The planner is given "now" in that zone.
   `today`, `yesterday`, `the day before yesterday`, `since yesterday`, and
   `last|past N minutes|hours|days|weeks` (also `last 24h`, `last week`) are resolved in
@@ -333,8 +341,25 @@ with `--json`) on stderr and exits with status 1.
 
 ## Retrieval and ranking
 
-- **Candidates:** Qdrant returns up to `RAG_SEARCH_CANDIDATES` (default 64) hits for the
-  embedded query, restricted by the scope filter.
+- **Candidates:** one hybrid query (`POST /collections/{c}/points/query`) returns up to
+  `RAG_SEARCH_CANDIDATES` (default 64) hits. It has a prefetch per search, each restricted
+  by the scope filter and returning up to that many points:
+  - dense: the question's embedding against the chunks' embeddings (cosine);
+  - keyword: the question's [sparse vector](#keyword-vectors) against the chunks'
+    (skipped when the question has no tokens);
+  - both again for the planner's rewrite, when there is one that differs (one more
+    embedding, in the same request).
+
+  Qdrant fuses the lists with reciprocal rank fusion: a point at 0-based rank `r` of a
+  list scores `1 / (2 + r)`, summed over the lists (`k` = 2, sent explicitly). Dense
+  search finds paraphrases; keyword search finds the exact error code, exception, metric
+  name or host a question quotes, which a dense vector blurs with similar ones.
+- **Scores:** a hit's score is its fused score divided by the best possible one (first in
+  every list), so it is in (0, 1]: 1 is first everywhere, 0.5 first in half of the lists
+  or second in all. Only ranks count, not raw similarities, so the scale is the same for
+  every question; the reranker's kind priors, recency decay and relevance/diversity
+  balance apply to it as they did to cosine similarities. The answer prompt shows the
+  reranked score.
 - **Top-K:** `choose_topk()` picks how many hits the answer uses. It starts at
   `RAG_TOPK_DEFAULT` (16), adds 6 for root-cause questions ("why", "root cause", "rca"),
   2 for explicit time ranges and 2 for incident questions, capped at `RAG_TOPK_MAX` (32).
@@ -468,6 +493,31 @@ changes: the stored `Text` and the answer prompt are the chunk text as before.
 
 Everything in the header is a document field, so the content hash covers it.
 
+### Keyword vectors
+
+Each chunk is also stored with a sparse keyword vector of the same embedding input
+(`rag_core::sparse`), so keyword search sees the header too:
+
+- **Tokens:** runs of letters and digits (Unicode-aware; combining marks stay with their
+  letter), lowercased. Identifiers joined by `_`, `-` or `.` are kept whole and split
+  into their parts, and camelCase words are split too: `ERR_CONN_RESET` gives
+  `err_conn_reset`, `err`, `conn`, `reset`; `java.net.SocketTimeoutException` gives the
+  whole name, `java`, `net`, `sockettimeoutexception`, `socket`, `timeout`, `exception`.
+  `:` and `/` join larger units (`service:checkout`, `api/v1/login`), which are kept
+  whole with each segment tokenized as above, so the metric name in
+  `avg:trace.http.request.errors{service:checkout}` is a token.
+- **Indices:** the 32-bit FNV-1a hash of the token (stable across runs and platforms).
+- **Values:** stored chunks carry BM25 term-frequency weights
+  (`tf·(k1+1) / (tf + k1·(1 − b + b·len/256))`, k1 = 1.2, b = 0.75); questions 1 per
+  distinct token.
+- **IDF:** the collection's sparse vector has Qdrant's `idf` modifier, so Qdrant weights
+  each query token by `ln(1 + (N − n + 0.5) / (n + 0.5))` over the whole collection (N
+  points with a sparse vector, n containing the token). A code that appears in one log
+  outweighs `error` or `checkout`.
+
+The tokenizer and weights are versioned (`SPARSE_ENCODER_VERSION`, part of the content
+hash), so changing them re-indexes every document once.
+
 ### Log patterns
 
 Error and warning logs are not indexed one document per log. During an incident Datadog
@@ -528,6 +578,21 @@ per run for the current day, not once per log.
 
 ## Qdrant storage
 
+Every point has two named vectors: `dense`, the embedding (cosine), and `sparse`, the
+[keyword vector](#keyword-vectors) (IDF computed by Qdrant). The indexer creates the
+collection on its first run (`GET /collections/{c}`, then `PUT` if missing, sized by one
+probe embedding) with:
+
+```json
+{"vectors": {"dense": {"size": 1536, "distance": "Cosine"}},
+ "sparse_vectors": {"sparse": {"modifier": "idf"}}}
+```
+
+An existing collection without this layout, such as one with the earlier single unnamed
+vector, is refused at startup: it cannot be converted in place. Index into a new
+collection (a new `QDRANT_COLLECTION`, or delete the old one) and start with an empty
+checkpoint file, so that logs and incidents are fetched for the full lookback again.
+
 Ingestion and retrieval share a typed payload in `rag-core::qdrant`. Stored keys
 are `Title`, `Text`, `SourceUri`, `Kind`, `Timestamp`, `Service`, `Environment`,
 `Metadata`, and lowercase `id`. The payload `id` remains the logical chunk ID
@@ -548,9 +613,9 @@ They are not part of the returned documents, so the answer model never sees them
 Shrink cleanup filters on `Kind`, `Metadata.chunk_of` and `Metadata.chunk_index`; stale
 cleanup on `Kind` and `SyncId`.
 
-Time filtering uses Qdrant's datetime `range` on the existing RFC 3339 `Timestamp`
-string, so existing collections need no re-indexing. Filters work without payload
-indexes; for large collections, add them for faster filtering:
+Time filtering uses Qdrant's datetime `range` on the RFC 3339 `Timestamp`
+string. Filters work without payload indexes; for large collections, add them for
+faster filtering:
 
 ```bash
 curl -X PUT "$QDRANT_ENDPOINT/collections/$QDRANT_COLLECTION/index" -H 'Content-Type: application/json' -d '{"field_name": "Timestamp", "field_schema": "datetime"}'

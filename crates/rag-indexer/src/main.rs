@@ -270,6 +270,18 @@ fn index_params_from_env() -> IndexParams {
     }
 }
 
+/// Creates the Qdrant collection on the first run, sized by one probe embedding, and
+/// refuses an existing collection without the hybrid (named dense + sparse) layout.
+async fn ensure_collection(oa: &OpenAiClient, qd: &Qdrant) -> Result<()> {
+    if qd.check_collection().await? {
+        return Ok(());
+    }
+    let dim = oa.embed("collection dimension probe").await?.len();
+    qd.create_collection(dim).await?;
+    tracing::info!(collection = %qd.collection, dim, "created Qdrant collection");
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
@@ -287,6 +299,7 @@ async fn main() -> Result<()> {
         store: Qdrant::new_from_env()?,
         params: index_params_from_env(),
     };
+    ensure_collection(&sink.embedder, &sink.store).await?;
 
     let checkpoint_path = Path::new(&checkpoint_path);
     let mut checkpoints = Checkpoints::load(checkpoint_path, &Source::names()).await?;
@@ -1112,5 +1125,52 @@ mod tests {
         let saved = Checkpoints::load(&path, &Source::names()).await.unwrap();
         assert_eq!(saved.get("dashboards"), Some(first));
         assert_eq!(saved.get("monitors"), Some(second));
+    }
+
+    #[tokio::test]
+    async fn test_ensure_collection_creates_a_missing_collection_once() {
+        use wiremock::matchers::{body_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let info = ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "result": {"config": {"params": rag_core::qdrant::collection_config(3)}}
+        }));
+        Mock::given(method("GET"))
+            .and(path("/collections/existing"))
+            .respond_with(info)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/collections/new"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"data": [{"embedding": [0.1, 0.2, 0.3]}]})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/collections/new"))
+            .and(body_json(rag_core::qdrant::collection_config(3)))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"result": true})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let oa = OpenAiClient::new("k".into(), server.uri(), "e".into(), "c".into());
+        let qd = |c: &str| {
+            let mut q = Qdrant::new(server.uri(), c.into());
+            q.retry = rag_core::resilience::RetryPolicy::none();
+            q
+        };
+        ensure_collection(&oa, &qd("existing")).await.unwrap();
+        ensure_collection(&oa, &qd("new")).await.unwrap();
     }
 }

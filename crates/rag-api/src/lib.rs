@@ -19,7 +19,9 @@ use rag_core::{
     openai::OpenAiClient,
     planner::{self, Clock, PlanContext, QueryPlan, SystemClock, Window},
     qdrant::Qdrant,
-    rag_service::{AskWindow, StageTimeouts, answer_candidates, logged_in_window, retrieve},
+    rag_service::{
+        AskWindow, StageTimeouts, answer_candidates, logged_in_window, retrieve, search_queries,
+    },
     resilience::{HttpConfig, RetryPolicy, env_duration_ms, run_stage},
     retrieval::{ExplicitScope, RetrievalScope, normalize_filters},
 };
@@ -444,10 +446,11 @@ async fn ask(
         let scope = RetrievalScope::resolve(&explicit, &plan);
         tracing::info!(?scope, "retrieval scope");
 
-        // Embed rewritten or original question
-        let query = non_empty(&req.rewritten_query)
-            .or_else(|| plan.rewritten_query.clone())
-            .unwrap_or_else(|| req.question.clone());
+        // Search with the question and, when it differs, the rewrite (explicit, then
+        // the planner's), so a detail the rewrite dropped is still found.
+        let rewrite = non_empty(&req.rewritten_query).or_else(|| plan.rewritten_query.clone());
+        let queries = search_queries(&req.question, rewrite.as_deref());
+        tracing::info!(searches = queries.len(), "search queries");
 
         // Retrieve generously; cut by server-side topK after rerank
         let search_limit = std::env::var("RAG_SEARCH_CANDIDATES")
@@ -460,7 +463,7 @@ async fn ask(
         let hits = retrieve(
             &st.oa,
             &st.qd,
-            &query,
+            &queries,
             scope.to_qdrant_filter(),
             search_limit,
             &st.limits.stages,
@@ -673,10 +676,7 @@ mod tests {
                 .await;
             Mock::given(method("POST"))
                 .and(path("/v1/embeddings"))
-                .respond_with(
-                    ResponseTemplate::new(200)
-                        .set_body_json(json!({"data": [{"embedding": [0.1, 0.2]}]})),
-                )
+                .respond_with(EmbedEach)
                 .mount(&openai)
                 .await;
 
@@ -697,8 +697,10 @@ mod tests {
             })];
             hits.extend(extra_hits);
             Mock::given(method("POST"))
-                .and(path("/collections/test/points/search"))
-                .respond_with(ResponseTemplate::new(200).set_body_json(json!({"result": hits})))
+                .and(path("/collections/test/points/query"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(json!({"result": {"points": hits}})),
+                )
                 .mount(&qdrant)
                 .await;
 
@@ -734,6 +736,31 @@ mod tests {
 
         fn body(r: &Request) -> Value {
             serde_json::from_slice(&r.body).unwrap()
+        }
+
+        /// One embedding per input, for a single string or a batch.
+        struct EmbedEach;
+
+        impl wiremock::Respond for EmbedEach {
+            fn respond(&self, r: &Request) -> ResponseTemplate {
+                let n = body(r)["input"].as_array().map_or(1, Vec::len);
+                let data: Vec<Value> = (0..n)
+                    .map(|i| json!({"index": i, "embedding": [0.5, 1.0 + i as f32]}))
+                    .collect();
+                ResponseTemplate::new(200).set_body_json(json!({ "data": data }))
+            }
+        }
+
+        /// The scope filter of a hybrid query, which every prefetch must carry.
+        fn search_filter(r: &Request) -> Value {
+            let b = body(r);
+            let prefetch = b["prefetch"].as_array().unwrap();
+            assert!(!prefetch.is_empty());
+            for p in prefetch {
+                assert_eq!(p["filter"], prefetch[0]["filter"], "{b}");
+            }
+            assert!(b.get("filter").is_none());
+            prefetch[0]["filter"].clone()
         }
 
         async fn post(base: &str, route: &str, req: Value) -> (StatusCode, Value) {
@@ -787,7 +814,7 @@ mod tests {
             let searches = h.qdrant.received_requests().await.unwrap();
             assert_eq!(searches.len(), 1);
             assert_eq!(
-                body(&searches[0])["filter"],
+                search_filter(&searches[0]),
                 json!({"must": [
                     {"key": "Service", "match": {"value": "auth-api"}},
                     {"key": "Environment", "match": {"value": "prod"}},
@@ -820,12 +847,26 @@ mod tests {
                 .to_string();
             assert!(system.contains("2026-09-24T10:00:00+02:00"));
             assert!(system.contains("Europe/Stockholm"));
-            // The rewritten query was embedded.
-            let embed = reqs
+            // The question and the rewritten query were embedded in one request, and
+            // each is searched densely and by keywords.
+            let embeds: Vec<&Request> = reqs
                 .iter()
-                .find(|r| r.url.path() == "/v1/embeddings")
-                .unwrap();
-            assert_eq!(body(embed)["input"], "auth-api prod errors");
+                .filter(|r| r.url.path() == "/v1/embeddings")
+                .collect();
+            assert_eq!(embeds.len(), 1);
+            assert_eq!(
+                body(embeds[0])["input"],
+                json!(["why did auth-api fail yesterday?", "auth-api prod errors"])
+            );
+            let prefetch = body(&searches[0])["prefetch"].clone();
+            let using: Vec<&str> = prefetch
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|p| p["using"].as_str().unwrap())
+                .collect();
+            assert_eq!(using, ["dense", "sparse", "dense", "sparse"]);
+            assert_eq!(prefetch[2]["query"], json!([0.5, 2.0]));
         }
 
         #[tokio::test]
@@ -850,7 +891,7 @@ mod tests {
             assert_eq!(status, StatusCode::OK);
             assert_eq!(planner_calls(&h).await, 1);
             let searches = h.qdrant.received_requests().await.unwrap();
-            let must = body(&searches[0])["filter"]["must"].clone();
+            let must = search_filter(&searches[0])["must"].clone();
             assert_eq!(
                 must[0],
                 // Explicit values are trimmed and lowercased like stored payload values.
@@ -889,7 +930,7 @@ mod tests {
             assert_eq!(resp["scope"]["environment"], Value::Null);
             let searches = h.qdrant.received_requests().await.unwrap();
             assert_eq!(
-                body(&searches[0])["filter"],
+                search_filter(&searches[0]),
                 json!({"must": [{"key": "Service", "match": {"value": "checkout"}}]})
             );
         }
@@ -1347,7 +1388,7 @@ mod http_tests {
 
     const EMBED: &str = "/v1/embeddings";
     const CHAT: &str = "/v1/chat/completions";
-    const SEARCH: &str = "/collections/test/points/search";
+    const SEARCH: &str = "/collections/test/points/query";
 
     fn fast_retry(max_attempts: u32) -> RetryPolicy {
         RetryPolicy {
@@ -1422,7 +1463,7 @@ mod http_tests {
     }
 
     fn one_hit() -> ResponseTemplate {
-        ResponseTemplate::new(200).set_body_json(json!({"result": [{
+        ResponseTemplate::new(200).set_body_json(json!({"result": {"points": [{
             "id": 1,
             "score": 0.9,
             "payload": {
@@ -1435,7 +1476,7 @@ mod http_tests {
                 "Service": "auth-api",
                 "Environment": "prod"
             }
-        }]}))
+        }]}}))
     }
 
     fn chat_ok(text: &str) -> ResponseTemplate {
@@ -1522,7 +1563,7 @@ mod http_tests {
     async fn zero_hits_is_200_with_no_evidence_marker_and_no_llm_call() {
         let up = MockServer::start().await;
         mount(&up, EMBED, embedding_ok(), 1).await;
-        let empty = ResponseTemplate::new(200).set_body_json(json!({"result": []}));
+        let empty = ResponseTemplate::new(200).set_body_json(json!({"result": {"points": []}}));
         mount(&up, SEARCH, empty, 1).await;
         mount(&up, CHAT, chat_ok("made up"), 0).await;
         let base = spawn_api(&up, fast_retry(3), limits(Duration::from_secs(5))).await;

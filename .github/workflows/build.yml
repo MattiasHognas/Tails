@@ -63,7 +63,8 @@ jobs:
     - name: Test against real Qdrant
       run: cargo llvm-cov --package rag-core --test qdrant_roundtrip --all-features --locked --no-report -- --ignored
 
-    # Indexer writer -> Qdrant -> /ask reader, including the incident question set.
+    # Indexer writer -> Qdrant -> /ask reader, including the incident question set, and
+    # the fake Qdrant's hybrid query scores checked against the real one.
     # Each test is named exactly; the opt-in OpenAI variant is never selected.
     - name: Test the pipeline against real Qdrant
       run: >-
@@ -72,6 +73,7 @@ jobs:
         pipeline_tests::contract::pipeline_contract_real_qdrant
         pipeline_tests::unicode::unicode_round_trip_real_qdrant
         pipeline_tests::quality::incident_questions_real_qdrant
+        pipeline_tests::support::qdrant::tests::query_api_matches_real_qdrant
 
     - name: Generate code coverage
       run: cargo llvm-cov report --lcov --output-path lcov.info

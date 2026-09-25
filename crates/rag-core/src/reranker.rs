@@ -9,6 +9,10 @@ use itertools::Itertools;
 /// Each group is collapsed to its best hit after the kind prior and recency decay
 /// (ties broken by ID), also when there are fewer candidates than `take`, so a
 /// document or pattern is never listed (and numbered as a `[DOC #n]`) twice.
+///
+/// Scores come from [`crate::qdrant::Qdrant::hybrid_search`]: normalized fused ranks in
+/// (0, 1], on the same scale for every question, like the cosine similarities the
+/// priors, decay and MMR weights were chosen for.
 pub fn rerank_mmr_signals(candidates: &[Hit], take: usize) -> Vec<Hit> {
     // Adjust score by priors + simple recency decay (if timestamp present)
     fn prior(kind: &SourceKind) -> f32 {

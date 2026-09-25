@@ -114,7 +114,8 @@ pub fn embedding_input(doc: &RagDocument) -> String {
 /// Stable hash (64 hex chars) of everything that determines a document's stored points:
 /// every field of `doc` (text, title, URI, kind, timestamp, service, environment and
 /// metadata, which includes everything [`embedding_input`] adds), the chunking
-/// parameters and the embedding model. Object keys are sorted before hashing, so
+/// parameters, the embedding model and the sparse encoder version
+/// ([`crate::sparse::SPARSE_ENCODER_VERSION`]). Object keys are sorted before hashing, so
 /// metadata key order does not matter.
 pub fn content_hash(
     doc: &RagDocument,
@@ -126,6 +127,7 @@ pub fn content_hash(
         "version": CONTENT_HASH_VERSION,
         "chunk": {"max_chars": max_chars, "overlap": overlap},
         "embedding_model": embedding_model,
+        "sparse_encoder": crate::sparse::SPARSE_ENCODER_VERSION,
         "doc": doc,
     });
     let bytes = serde_json::to_vec(&canonical(input)).expect("JSON values serialize");

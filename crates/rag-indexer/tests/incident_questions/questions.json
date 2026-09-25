@@ -336,6 +336,39 @@
         "evidence": [{"document": "log_co-inv-fri-0", "contains": ["Occurrences in the question's window: 165 (Fri 2026-02-06: 120 · Mon 2026-02-09: 45; days in Europe/Helsinki"]}]
       },
       "answer": {"citeDocuments": ["log_co-inv-fri-0"]}
+    },
+    {
+      "id": "q30-exact-error-code",
+      "question": "Why does edge-gateway log ERR_CONN_RESET when calling payments upstream?",
+      "note": "Six edge-gateway error patterns share the question's words. A timeout while calling payments upstream shares more of them than the ERR_CONN_RESET log, so dense search alone ranks it first; the keyword search matches the exact code, which only eg-reset contains.",
+      "plan": {"intent": "semanticLogSearch", "service": "edge-gateway", "environment": "prod", "filters": ["kind:logs"]},
+      "expect": {
+        "scope": {"service": "edge-gateway", "environment": "prod", "fromUtc": null, "toUtc": null, "kinds": ["logs"]},
+        "mustRetrieve": ["log_eg-reset"]
+      },
+      "answer": {"citeDocuments": ["log_eg-reset"]}
+    },
+    {
+      "id": "q31-exact-metric-name",
+      "question": "Which storefront monitor uses trace.http.request.errors?",
+      "note": "Four storefront monitors query trace.http.request.* metrics. The traffic monitor on trace.http.request.hits repeats 'storefront' and 'monitor', so dense search alone ranks it above the 5xx monitor; only monitor 1101 queries the exact metric name, which the keyword search matches as one token.",
+      "plan": {"intent": "monitorExplanation", "service": "storefront", "environment": "prod", "filters": ["kind:monitor"]},
+      "expect": {
+        "scope": {"service": "storefront", "environment": "prod", "fromUtc": null, "toUtc": null, "kinds": ["monitor"]},
+        "mustRetrieve": ["monitor_1101"]
+      },
+      "answer": {"citeDocuments": ["monitor_1101"]}
+    },
+    {
+      "id": "q32-rewrite-drops-exception",
+      "question": "Why does checkout-api throw PaymentDeclinedException on card retries?",
+      "note": "The planner's rewrite drops the exception name, and a generic retry failure log matches the rewrite best. Searching with the original question as well keeps the PaymentDeclinedException log first.",
+      "plan": {"intent": "rootCauseWindow", "service": "checkout-api", "environment": "prod", "rewrittenQuery": "checkout-api card payment retry failures"},
+      "expect": {
+        "scope": {"service": "checkout-api", "environment": "prod", "fromUtc": null, "toUtc": null, "kinds": []},
+        "mustRetrieve": ["log_ca-declined"]
+      },
+      "answer": {"citeDocuments": ["log_ca-declined"]}
     }
   ]
 }

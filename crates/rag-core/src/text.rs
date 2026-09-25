@@ -13,7 +13,7 @@ pub const TRUNCATION_MARKER: &str = " …[truncated]";
 /// Characters that attach to the preceding character: combining marks,
 /// variation selectors, zero-width joiner and emoji skin-tone modifiers.
 /// Cutting right before one of them would separate it from its base.
-fn is_extender(c: char) -> bool {
+pub(crate) fn is_extender(c: char) -> bool {
     matches!(c,
         '\u{0300}'..='\u{036F}'     // combining diacritical marks
         | '\u{1AB0}'..='\u{1AFF}'   // combining diacritical marks extended
