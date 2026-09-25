@@ -12,7 +12,11 @@
 //!   events just before the window and at its (exclusive) end are not;
 //! - `Service`/`Environment` casing vs the lowercased planner and explicit values
 //!   (`Auth-API` from Datadog, `AUTH-API` from the planner, `Checkout` from a caller);
-//! - `Metadata.chunk_of` vs the reranker's grouping: a three-chunk log is one source;
+//! - `Metadata.chunk_of` vs the reranker's grouping: a multi-chunk log pattern is one
+//!   source;
+//! - log patterns: logs are stored grouped by pattern; `Metadata.first_seen` is RFC 3339
+//!   and a pattern whose span overlaps the window is retrieved although its `Timestamp`
+//!   (last log) is after it;
 //! - point IDs: every point ID is the UUIDv5 of its logical chunk ID;
 //! - bookkeeping keys (`ContentHash`, `ChunkCount`, `SyncId`) are written but never
 //!   reach `RagDocument` or `sources`; a second run leaves unchanged documents alone;
@@ -31,11 +35,15 @@ use std::collections::{BTreeMap, BTreeSet};
 const NOW: &str = "2026-03-12T09:00:00Z";
 const TZ: &str = "Europe/Stockholm";
 
-/// Long enough for three chunks (1800 chars, 200 overlap), with multibyte text at
-/// every position.
-fn long_message() -> String {
+/// A long message with multibyte text at every position. Variants share their first
+/// 160 chars, so they are one pattern with `variant` in each sample.
+fn long_message(variant: &str) -> String {
     let unit = "Återförsök mot bankgatewayen misslyckades 💳 決済エラー; e\u{0301}tat inconnu. ";
-    unit.repeat(4000 / unit.chars().count() + 1)
+    format!(
+        "{}{variant} {}",
+        unit.repeat(3),
+        unit.repeat(4000 / unit.chars().count() + 1)
+    )
 }
 
 fn crafted() -> Corpus {
@@ -71,11 +79,17 @@ fn crafted() -> Corpus {
         ],
         "logs": [
             log("auth-1", "Auth-API", "prod", "2026-03-11T14:02:00.000Z", "login failed för åsa.öberg"),
-            log("co-in", "checkout", "prod", "2026-03-11T10:15:30.123Z", "db connection pool exhausted"),
-            log("co-before", "checkout", "prod", "2026-03-10T22:59:59.000Z", "db connection pool exhausted"),
-            log("co-at-end", "checkout", "prod", "2026-03-11T23:00:00.000Z", "db connection pool exhausted"),
-            log("co-staging", "checkout", "staging", "2026-03-11T10:20:00.000Z", "db connection pool exhausted"),
-            log("long", "payments", "prod", "2026-03-11T12:00:00.000Z", &long_message()),
+            // One pattern: numbers are masked.
+            log("co-in", "checkout", "prod", "2026-03-11T10:15:30.123Z", "db connection pool exhausted: 50/50 in use"),
+            log("co-in-2", "checkout", "prod", "2026-03-11T10:16:00.000Z", "db connection pool exhausted: 48/50 in use"),
+            log("co-before", "checkout", "prod", "2026-03-10T22:59:59.000Z", "payment callback rejected"),
+            log("co-at-end", "checkout", "prod", "2026-03-11T23:00:00.000Z", "cart cache flush failed"),
+            // First seen before the window, last seen after it.
+            log("co-span-1", "checkout", "prod", "2026-03-10T20:00:00.000Z", "inventory lookup slow"),
+            log("co-span-2", "checkout", "prod", "2026-03-12T08:00:00.000Z", "inventory lookup slow"),
+            log("co-staging", "checkout", "staging", "2026-03-11T10:20:00.000Z", "db connection pool exhausted: 10/10 in use"),
+            log("long", "payments", "prod", "2026-03-11T12:00:00.000Z", &long_message("första")),
+            log("long-2", "payments", "prod", "2026-03-11T12:05:00.000Z", &long_message("andra")),
         ]
     }))
 }
@@ -166,6 +180,21 @@ async fn check_stored_points(store: &Store, expected: &BTreeMap<String, RagDocum
             ts.is_null() || ts.as_str().and_then(rag_core::planner::parse_utc).is_some(),
             "{id}: Timestamp {ts}"
         );
+        // Logs are pattern documents: the filter reads `Metadata.first_seen`, and the
+        // last log is the `Timestamp`.
+        if want.kind == SourceKind::Logs {
+            assert!(
+                id.starts_with(rag_core::log_patterns::DOC_ID_PREFIX),
+                "{id}"
+            );
+            let md = &s.raw["Metadata"];
+            let first = md["first_seen"]
+                .as_str()
+                .and_then(rag_core::planner::parse_utc);
+            let last = ts.as_str().and_then(rag_core::planner::parse_utc);
+            assert!(first.is_some() && first <= last, "{id}: {md}");
+            assert_eq!(md["last_seen"], *ts, "{id}");
+        }
         // Service/Environment are stored in the form the scope matches.
         for key in ["Service", "Environment"] {
             let v = s.raw[key].as_str().unwrap();
@@ -248,12 +277,18 @@ fn cases() -> Vec<Case> {
             must_not: &[],
             each: |s| s["service"] == "auth-api" && s["environment"] == "prod",
         },
-        // Half-open window on RFC 3339 timestamps; timeless kinds still pass.
+        // Half-open window on RFC 3339 timestamps; timeless kinds still pass; a pattern
+        // spanning the window is found by its first and last log.
         Case {
             question: "checkout errors yesterday",
             plan: json!({"intent": "semanticLogSearch", "service": "checkout", "environment": "prod"}),
             request: json!({}),
-            must: &["log_co-in", "monitor_7001", "slo_slo-checkout"],
+            must: &[
+                "log_co-in",
+                "log_co-span-1",
+                "monitor_7001",
+                "slo_slo-checkout",
+            ],
             must_not: &[
                 "log_co-before",
                 "log_co-at-end",
@@ -289,7 +324,7 @@ fn cases() -> Vec<Case> {
             must_not: &[],
             each: |s| s["kind"] == "metrics",
         },
-        // Three chunks of one log are one source.
+        // A pattern spanning several chunks is one source.
         Case {
             question: "payments bank gateway errors",
             plan: json!({"service": "payments", "environment": "prod"}),
@@ -310,14 +345,38 @@ async fn run_contract(store: Store) {
 
     support::index(&corpus, oa.clone(), &store, now).await;
     let expected = support::expected_chunks(&corpus, now).await;
-    assert_eq!(
+    let id = |raw: &str| corpus.resolve(raw);
+    assert!(
         expected
             .values()
-            .filter(|d| d.parent_id() == "log_long")
-            .count(),
-        3,
-        "the long log must span three chunks"
+            .filter(|d| d.parent_id() == id("log_long"))
+            .count()
+            >= 3,
+        "the long log pattern must span at least three chunks"
     );
+    // Logs of one pattern are one document with their count; different messages,
+    // environments and services are not.
+    assert_eq!(id("log_co-in"), id("log_co-in-2"));
+    assert_eq!(id("log_co-span-1"), id("log_co-span-2"));
+    assert_eq!(id("log_long"), id("log_long-2"));
+    let grouped = &expected[&format!("{}#c0", id("log_co-in"))];
+    assert_eq!(grouped.metadata["count"], 2);
+    assert_eq!(
+        grouped.metadata["sample_log_ids"],
+        json!(["co-in", "co-in-2"])
+    );
+    let spanning = &expected[&format!("{}#c0", id("log_co-span-1"))];
+    assert_eq!(spanning.metadata["first_seen"], "2026-03-10T20:00:00.000Z");
+    assert_eq!(
+        spanning.timestamp.as_deref(),
+        Some("2026-03-12T08:00:00.000Z")
+    );
+    for (a, b) in [
+        ("log_co-in", "log_co-staging"),
+        ("log_co-in", "log_co-before"),
+    ] {
+        assert_ne!(id(a), id(b));
+    }
     check_stored_points(&store, &expected).await;
     let stored = support::stored_chunks(&store).await;
 
@@ -330,7 +389,7 @@ async fn run_contract(store: Store) {
             script.answers.insert(
                 case.question.into(),
                 support::openai::AnswerScript {
-                    cite_uris: case.must.iter().map(|id| uri_of(&stored, id)).collect(),
+                    cite_uris: case.must.iter().map(|m| uri_of(&stored, &id(m))).collect(),
                     cite_observations: vec![],
                     extra: "Also [DOC #42] and [obs-1].".into(),
                 },
@@ -344,13 +403,14 @@ async fn run_contract(store: Store) {
         let ids = support::source_ids(&resp);
         let ctx = format!("{}: sources {ids:?}", case.question);
 
-        for id in case.must {
-            assert!(ids.iter().any(|s| s == id), "{ctx}: missing {id}");
+        let must: Vec<String> = case.must.iter().map(|m| id(m)).collect();
+        for (m, raw) in must.iter().zip(case.must) {
+            assert!(ids.contains(m), "{ctx}: missing {raw} ({m})");
         }
-        for id in case.must_not {
+        for raw in case.must_not {
             assert!(
-                !ids.iter().any(|s| s == id),
-                "{ctx}: {id} leaked through the filter"
+                !ids.contains(&id(raw)),
+                "{ctx}: {raw} leaked through the filter"
             );
         }
         for s in resp["sources"].as_array().unwrap() {
@@ -368,9 +428,9 @@ async fn run_contract(store: Store) {
             .iter()
             .map(|n| ids[n - 1].as_str())
             .collect();
-        assert_eq!(cited.len(), case.must.len(), "{ctx}: {answer}");
+        assert_eq!(cited.len(), must.len(), "{ctx}: {answer}");
         assert!(
-            case.must.iter().all(|id| cited.contains(id)),
+            must.iter().all(|m| cited.contains(&m.as_str())),
             "{ctx}: cited {cited:?}"
         );
         assert_eq!(

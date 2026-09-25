@@ -176,9 +176,26 @@ fn load() -> (Dataset, Corpus) {
         serde_json::from_str(&std::fs::read_to_string(&path).unwrap())
             .unwrap_or_else(|e| panic!("{path:?}: {e}"))
     };
-    let dataset: Dataset = serde_json::from_value(read("questions.json")).expect("questions.json");
+    let mut dataset: Dataset =
+        serde_json::from_value(read("questions.json")).expect("questions.json");
     let mut corpus = Corpus::from_json(&read("corpus.json"));
     corpus.extend(Corpus::fixtures());
+    // Logs are indexed as pattern documents: `log_<id>` names the one holding log <id>.
+    let resolve = |ids: &mut Vec<String>| {
+        let mut out: Vec<String> = vec![];
+        for id in ids.iter().map(|id| corpus.resolve(id)) {
+            if !out.contains(&id) {
+                out.push(id);
+            }
+        }
+        *ids = out;
+    };
+    for q in &mut dataset.questions {
+        resolve(&mut q.expect.must_retrieve);
+        resolve(&mut q.expect.may_retrieve);
+        resolve(&mut q.expect.must_not_retrieve);
+        resolve(&mut q.answer.cite_documents);
+    }
     (dataset, corpus)
 }
 

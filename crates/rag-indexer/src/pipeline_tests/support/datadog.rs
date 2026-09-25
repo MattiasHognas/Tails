@@ -63,9 +63,13 @@ impl Corpus {
         }
     }
 
-    /// A corpus file with the same top-level keys (see `tests/eval/corpus.json`).
+    /// A corpus file with the same top-level keys (see
+    /// `tests/incident_questions/corpus.json`), plus `logBursts`: runs of near-identical
+    /// logs, expanded by [`expand_burst`] and appended to `logs`.
     pub fn from_json(v: &Value) -> Self {
         let array = |k: &str| v[k].as_array().cloned().unwrap_or_default();
+        let mut logs = array("logs");
+        logs.extend(array("logBursts").iter().flat_map(expand_burst));
         Self {
             monitors: array("monitors"),
             dashboards: array("dashboards"),
@@ -75,8 +79,24 @@ impl Corpus {
                 .filter_map(|m| m.as_str().map(str::to_string))
                 .collect(),
             incidents: array("incidents"),
-            logs: array("logs"),
+            logs,
         }
+    }
+
+    /// The ID of the log pattern document that holds Datadog log `raw_id` of this corpus,
+    /// computed with the adapter's own parsing and grouping.
+    pub fn log_doc_id(&self, raw_id: &str) -> Option<String> {
+        let log = self.logs.iter().find(|l| l["id"] == raw_id)?;
+        let event = rag_core::datadog::log_event(log)?;
+        Some(rag_core::log_patterns::group(&[event])[0].doc_id())
+    }
+
+    /// `id` with a `log_<raw id>` reference to a corpus log replaced by the ID of the
+    /// pattern document that holds it; anything else is returned unchanged.
+    pub fn resolve(&self, id: &str) -> String {
+        id.strip_prefix("log_")
+            .and_then(|raw| self.log_doc_id(raw))
+            .unwrap_or_else(|| id.to_string())
     }
 
     pub fn extend(&mut self, other: Corpus) {
@@ -87,6 +107,40 @@ impl Corpus {
         self.incidents.extend(other.incidents);
         self.logs.extend(other.logs);
     }
+}
+
+/// `count` logs `<idPrefix><i>`, one every `everySeconds` from `start`, with `service`,
+/// `env` and `status`. In `message`, `{ms}` becomes a varying duration and `{uuid}` a
+/// UUID unique to the log, the way real bursts differ only in numbers and IDs.
+pub fn expand_burst(spec: &Value) -> Vec<Value> {
+    let s = |k: &str| {
+        spec[k]
+            .as_str()
+            .unwrap_or_else(|| panic!("logBursts: missing {k}"))
+            .to_string()
+    };
+    let n = |k: &str| {
+        spec[k]
+            .as_u64()
+            .unwrap_or_else(|| panic!("logBursts: missing {k}"))
+    };
+    let start = ts(&spec["start"]).expect("logBursts: start");
+    (0..n("count"))
+        .map(|i| {
+            let at = start + Duration::seconds((i * n("everySeconds")) as i64);
+            let message = s("message")
+                .replace("{ms}", &(900 + (i * 37) % 2100).to_string())
+                .replace(
+                    "{uuid}",
+                    &format!("{:08x}-7425-40de-944b-{:012x}", i * 7919, i),
+                );
+            json!({"id": format!("{}{i}", s("idPrefix")), "type": "log", "attributes": {
+                "service": s("service"), "status": s("status"), "message": message,
+                "timestamp": at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                "tags": [format!("env:{}", s("env"))]
+            }})
+        })
+        .collect()
 }
 
 fn param(req: &Request, name: &str) -> Option<usize> {

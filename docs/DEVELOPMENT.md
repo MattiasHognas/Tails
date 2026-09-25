@@ -273,7 +273,7 @@ variant, ignored by default, that uses a fresh collection on `QDRANT_TEST_ENDPOI
 
 | Test | Checks |
 |------|--------|
-| `pipeline_tests::contract` | Every stored point decodes (reader's `QdrantPayload`) to the chunk the adapters produced, under the UUIDv5 of its ID; `Kind` equals the filter's value; `Timestamp` is RFC 3339; `Service`/`Environment` are lowercase; `ContentHash`/`ChunkCount`/`SyncId` never reach `sources`. `/ask` returns the right documents for service (`Auth-API` from Datadog vs `AUTH-API` from the planner), environment, kind and time filters (half-open window, timeless kinds); a three-chunk log is one source; `sources` are stored documents numbered like the prompt; unknown citations appear in `citationWarnings`; a second run rewrites nothing. |
+| `pipeline_tests::contract` | Every stored point decodes (reader's `QdrantPayload`) to the chunk the adapters produced, under the UUIDv5 of its ID; `Kind` equals the filter's value; `Timestamp` is RFC 3339; `Service`/`Environment` are lowercase; `ContentHash`/`ChunkCount`/`SyncId` never reach `sources`. `/ask` returns the right documents for service (`Auth-API` from Datadog vs `AUTH-API` from the planner), environment, kind and time filters (half-open window, timeless kinds, a log pattern spanning the window); logs are grouped by pattern with their count; a multi-chunk log pattern is one source; `sources` are stored documents numbered like the prompt; unknown citations appear in `citationWarnings`; a second run rewrites nothing. |
 | `pipeline_tests::unicode` | See [Unicode policy](#unicode-policy). |
 | `pipeline_tests::quality` | The [incident question set](#incident-question-set). |
 
@@ -301,9 +301,11 @@ no code may cut text at a byte offset that is not a char boundary:
   at or below the limit, never separating a character from a following combining mark,
   variation selector, skin-tone modifier or zero-width-joiner sequence) or
   `truncate_with_marker`. Prompt excerpts (`EXCERPT_MAX_BYTES`, 1500 bytes, then
-  ` …[truncated]`) and logged upstream error bodies (512 bytes) use them.
+  ` …[truncated]`), log pattern sample messages (4000 bytes), embedding header values
+  (300 bytes for the title, 100 for other fields) and logged upstream error bodies (512
+  bytes) use them.
 - Character-limited cuts use `chars()`: the chunker (1800 chars, 200 overlap), log
-  message grouping in live evidence (160 chars) and CLI snippets.
+  message patterns (160 chars, shared by indexing and live evidence) and CLI snippets.
 - Never `String::truncate(n)`, `&s[..n]` or `split_at(n)` with `n` computed from a
   length, unless `n` comes from `find`/`char_indices` on the same string or only ASCII
   was skipped.
@@ -311,15 +313,17 @@ no code may cut text at a byte offset that is not a char boundary:
 The tests put multibyte characters exactly at 1500 bytes (±5) and at chunk size ±3,
 sweep every limit on mixed samples (`text.rs`), and check through the whole pipeline
 (`pipeline_tests::unicode`) that nothing panics, excerpts are valid prefixes, chunks
-reassemble to the original text and every payload survives the write/read round trip
-unchanged.
+reassemble to the stored text (for logs, a pattern document holding the original message)
+and every payload survives the write/read round trip unchanged.
 
 ### Incident question set
 
 `crates/rag-indexer/tests/incident_questions/` holds a versioned, human-readable
-evaluation set: `questions.json` (16 incident questions) and `corpus.json` (monitors,
+evaluation set: `questions.json` (19 incident questions) and `corpus.json` (monitors,
 incidents, SLOs, logs, dashboards and metrics in Datadog response shape, with
-distractors: a similarly named service, another environment, events outside the window).
+distractors: a similarly named service, another environment, events outside the window,
+a burst of 300 near-identical logs). `logBursts` in the corpus are expanded by the
+harness into individual logs (`support/datadog.rs`, `expand_burst`).
 The recorded fixtures are indexed alongside. Each question has a fixed `now` and
 timezone, the canned planner reply (`plan`), optional explicit request fields, the
 expected `scope`, `mustRetrieve`/`mayRetrieve`/`mustNotRetrieve` document IDs, expected
@@ -335,7 +339,7 @@ cargo test -p rag-indexer incident_questions_in_memory -- --nocapture
 question                     recall prec@R exclude scope   cites  intent   obs srcs  notes
 q01-checkout-slow-yesterday    1.00   1.00     8/8    ok     5/5     5/5   2/2    5
 ...
-aggregate over 15 questions (known gaps excluded):
+aggregate over 18 questions (known gaps excluded):
   recall@k                   1.000 (threshold 0.95)
 ```
 
@@ -356,9 +360,12 @@ documents numbered like the prompt and that `citationWarnings` equals
 `thresholds` in `questions.json`.
 
 **Adding a question:** add documents to `corpus.json` if needed (IDs become
-`monitor_<id>`, `incident_<id>`, `log_<id>`, `slo_<id>`, `dashboard_<id>`,
-`metric_<name with dots as underscores>`), then an entry to `questions`. Unknown IDs fail
-the run. For live evidence add `live` (hourly series with `spikes`, log `bursts`); the
+`monitor_<id>`, `incident_<id>`, `slo_<id>`, `dashboard_<id>`,
+`metric_<name with dots as underscores>`; logs are indexed as
+[pattern documents](ARCHITECTURE.md#log-patterns), and `log_<id>` in a question names the
+pattern document holding log `<id>`), then an entry to `questions`. Unknown IDs fail the
+run. The fake embeddings are a hashed bag of words, so a question tests ranking only when
+the words it shares with the relevant and the distracting documents decide the order. For live evidence add `live` (hourly series with `spikes`, log `bursts`); the
 observation IDs are assigned chronologically, so run once and read the collected
 observations in `notes` before writing `expect.timeline`. A question documenting a
 known limitation gets `"knownGap": "<why>"`: it is reported but not counted, and the

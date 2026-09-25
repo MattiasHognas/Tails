@@ -790,7 +790,12 @@ mod tests {
                             "lt": "2026-09-23T22:00:00Z"
                         }},
                         {"is_empty": {"key": "Timestamp"}},
-                        {"key": "Kind", "match": {"any": ["metrics", "monitor", "dashboard", "sLO"]}}
+                        {"key": "Kind", "match": {"any": ["metrics", "monitor", "dashboard", "sLO"]}},
+                        {"must": [
+                            {"key": "Kind", "match": {"value": "logs"}},
+                            {"key": "Timestamp", "range": {"gte": "2026-09-22T22:00:00Z"}},
+                            {"key": "Metadata.first_seen", "range": {"lt": "2026-09-23T22:00:00Z"}}
+                        ]}
                     ]}
                 ]})
             );

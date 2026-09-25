@@ -271,32 +271,11 @@ pub struct LogAnalysis {
     pub bucket: Duration,
     pub peak_bucket: Option<(DateTime<Utc>, usize)>,
     pub bursts: Vec<LogBurst>,
-    /// Most frequent messages (digits normalized), with counts.
+    /// Most frequent message patterns ([`normalize_message`]), with counts.
     pub top_messages: Vec<(String, usize)>,
 }
 
-/// Groups similar messages: digit runs become `#`, whitespace is collapsed and
-/// the result is truncated.
-pub fn normalize_message(msg: &str) -> String {
-    let mut out = String::new();
-    let mut prev_digit = false;
-    for c in msg.split_whitespace().collect::<Vec<_>>().join(" ").chars() {
-        if c.is_ascii_digit() {
-            if !prev_digit {
-                out.push('#');
-            }
-            prev_digit = true;
-        } else {
-            out.push(c);
-            prev_digit = false;
-        }
-        if out.chars().count() >= 160 {
-            out.push('…');
-            break;
-        }
-    }
-    out
-}
+pub use crate::log_patterns::normalize_message;
 
 /// Analyse error/warning log events `(timestamp, status, message)` in `[from, to)`.
 pub fn analyse_logs(
@@ -546,23 +525,10 @@ mod tests {
         assert_eq!(a.bucket, Duration::minutes(3));
     }
 
-    /// Log messages are grouped by a digit-masked, length-capped form; multibyte
-    /// text (and non-ASCII digits, which are not masked) must survive the cap.
+    /// Log messages are grouped by their pattern (see `log_patterns` for the masking
+    /// and multibyte tests); IDs are masked too, so one pattern is one top message.
     #[test]
-    fn message_grouping_is_char_safe_for_multibyte_text() {
-        assert_eq!(
-            normalize_message("Återförsök 3 av 5 misslyckades  för   åsa 🚀 決済 ２"),
-            "Återförsök # av # misslyckades för åsa 🚀 決済 ２"
-        );
-        for pad in 150..=165 {
-            let msg = format!("{}決済エラー 42 e\u{0301} 👩\u{200D}💻", "å".repeat(pad));
-            let out = normalize_message(&msg);
-            assert!(out.chars().count() <= 161, "{pad}: {out}");
-            assert!(!out.chars().any(|c| c.is_ascii_digit()), "{pad}: {out}");
-            if pad >= 160 {
-                assert_eq!(out, format!("{}…", "å".repeat(160)));
-            }
-        }
+    fn message_grouping_uses_the_shared_patterns() {
         let t = |m: &str| {
             (
                 ts("2026-03-11T10:00:00Z"),
@@ -574,12 +540,16 @@ mod tests {
             t("決済 timeout 1200ms"),
             t("決済 timeout 900ms"),
             t("åäö 1"),
+            t("order 550e8400-e29b-41d4-a716-446655440000 rejected"),
+            t("order 16fd2706-8baf-433b-82eb-8c7fada847da rejected"),
+            t("order 7c9e6679-7425-40de-944b-e07fc1f90ae7 rejected"),
         ];
         let a = analyse_logs(
             &events,
             ts("2026-03-11T00:00:00Z"),
             ts("2026-03-12T00:00:00Z"),
         );
-        assert_eq!(a.top_messages[0], ("決済 timeout #ms".to_string(), 2));
+        assert_eq!(a.top_messages[0], ("order <uuid> rejected".to_string(), 3));
+        assert_eq!(a.top_messages[1], ("決済 timeout #ms".to_string(), 2));
     }
 }
