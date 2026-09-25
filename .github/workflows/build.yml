@@ -84,3 +84,69 @@ jobs:
         files: lcov.info
         fail_ci_if_error: false
         token: ${{ secrets.CODECOV_TOKEN }}
+
+  # The built binaries as separate processes: rag-indexer, rag-api and rag-cli against a
+  # real Qdrant and real embeddings (text-embeddings-inference on CPU), with Datadog and
+  # the chat model faked by tails-fakes. See docs/DEVELOPMENT.md#end-to-end-tests.
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    services:
+      qdrant:
+        image: qdrant/qdrant:v1.19.1
+        ports:
+          - 6333:6333
+
+    env:
+      TEI_IMAGE: ghcr.io/huggingface/text-embeddings-inference:cpu-1.9.4
+      TEI_MODEL: BAAI/bge-small-en-v1.5
+      TEI_DATA: ${{ github.workspace }}/.tei-data
+
+    steps:
+    - uses: actions/checkout@v7
+
+    # Restored before TEI starts, so a cached model is not downloaded again. (A service
+    # container would start before this step, which is why TEI runs with docker run.)
+    - name: Cache the embedding model
+      uses: actions/cache@v6
+      with:
+        path: .tei-data
+        key: tei-cpu-1.9.4-bge-small-en-v1.5-v1
+
+    # Started early: the image pull and model load overlap the build.
+    - name: Start text-embeddings-inference
+      run: >-
+        docker run -d --name tei -p 8080:80 -v "$TEI_DATA:/data"
+        -e MODEL_ID="$TEI_MODEL" "$TEI_IMAGE"
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        toolchain: 1.90
+
+    - name: Cache cargo dependencies
+      uses: Swatinem/rust-cache@v2
+      with:
+        shared-key: e2e
+
+    - name: Build release binaries
+      run: cargo build --workspace --release --locked
+
+    - name: End-to-end run
+      env:
+        E2E_SKIP_BUILD: 1
+        QDRANT_ENDPOINT: http://localhost:6333
+        TEI_URL: http://localhost:8080
+      run: scripts/e2e.sh
+
+    - name: text-embeddings-inference logs
+      if: failure()
+      run: docker logs --tail 100 tei
+
+    # The container writes the model as root; the cache is saved by this job's user.
+    - name: Stop text-embeddings-inference
+      if: always()
+      run: |
+        docker rm -f tei || true
+        sudo chown -R "$(id -u):$(id -g)" "$TEI_DATA" || true

@@ -158,7 +158,9 @@ What each part does:
   - **Datadog**: the source of monitors, dashboards, SLOs, metric names, incidents, logs,
     service definitions (Software Catalog) and change events (deploys, configuration
     changes) for indexing, and of live time series and logs for diagnostic questions.
-  - **OpenAI**: embeddings, planning, and answers.
+  - **OpenAI**: embeddings, planning, and answers. Embeddings can come from another
+    OpenAI-compatible server (`OPENAI_EMBEDDING_BASE_URL`, for example a self-hosted
+    text-embeddings-inference); the collection is sized by the model it serves.
   - **Qdrant**: the vector store the API searches (dense and sparse vectors).
 
 ## Crates
@@ -169,6 +171,7 @@ What each part does:
 | `rag-api` | Axum REST API — `/ask/plan` (intent + inferred filters) and `/ask` (server-side planning + filtered retrieval + live Datadog evidence for diagnostic questions + answer). |
 | `rag-cli` | CLI that calls the API. The server plans (service/env/time) and decides top-K. |
 | `rag-indexer` | One-shot, resumable indexer for Datadog → Qdrant with per-source checkpoints. Perfect for Kubernetes CronJob. |
+| `tails-fakes` | Test support, not shipped (`publish = false`): the fake Datadog API and fake OpenAI chat used by the pipeline tests, the incident question set model and scoring, and the `tails-fakes` (standalone fake server) and `tails-e2e` (question set checker) binaries of the [end-to-end run](DEVELOPMENT.md#end-to-end-tests). |
 
 ## Question pipeline
 

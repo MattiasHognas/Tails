@@ -17,6 +17,14 @@ together, see [ARCHITECTURE.md](ARCHITECTURE.md).
 OPENAI_API_KEY=...
 OPENAI_EMBEDDING_MODEL=text-embedding-3-small
 OPENAI_CHAT_MODEL=o4-mini
+OPENAI_BASE_URL=https://api.openai.com   # any OpenAI-compatible server
+# Embeddings from another OpenAI-compatible server, e.g. self-hosted
+# text-embeddings-inference (POST /v1/embeddings). Unset or blank: OPENAI_BASE_URL and
+# OPENAI_API_KEY. Indexer and API must use the same model; the collection is created
+# with its dimension. TEI accepts at most 32 inputs per request by default
+# (--max-client-batch-size), so keep INDEXER_EMBED_BATCH_SIZE at or below it.
+OPENAI_EMBEDDING_BASE_URL=
+OPENAI_EMBEDDING_API_KEY=
 
 # Qdrant (the indexer creates the collection: named dense + sparse vectors)
 QDRANT_ENDPOINT=http://qdrant:6333
@@ -26,6 +34,8 @@ QDRANT_COLLECTION=datadog_rag
 DD_API_KEY=...
 DD_APP_KEY=...
 DD_SITE=datadoghq.eu    # or datadoghq.com
+DD_API_BASE_URL=        # optional: API base instead of https://api.$DD_SITE (a proxy, or
+                        # the fake Datadog of the end-to-end tests); links still use DD_SITE
 # The application key needs read access to what is indexed. The service catalog needs
 # `apm_service_catalog_read` and change events `events_read`; disable those sources
 # below if the key lacks them.
@@ -69,6 +79,10 @@ RAG_LIVE_MAX_SERVICES=3              # services queried per question (logs + met
 RAG_LIVE_MAX_METRICS=5               # metric queries per question
 RAG_LIVE_MAX_LOG_EVENTS=1000         # error/warn logs fetched per service
 RAG_LIVE_MAX_WINDOW_HOURS=168        # longer windows are not queried live
+
+# Test-only (API): fixes "now" at this RFC 3339 time, so the end-to-end tests can ask
+# "yesterday" questions about a recorded corpus. Never set it in a deployment.
+RAG_TEST_FIXED_NOW=
 ```
 
 For live evidence the API's Datadog application key needs the `timeseries_query`
@@ -315,6 +329,10 @@ QDRANT_TEST_ENDPOINT=http://localhost:6333 cargo test -p rag-indexer --bin rag-i
 The tests live in the indexer's binary crate (a `#[cfg(test)]` module), because that is
 where the writer is; `rag-api` is a dev-dependency there, exposed as a library
 (`AppState`, `app`, `serve`) with `main.rs` only reading the environment and serving.
+The fake Datadog API, the fake OpenAI server and the question set's model and scoring
+are in the `tails-fakes` crate (also a dev-dependency), which the
+[end-to-end tests](#end-to-end-tests) run as a standalone server; the fake Qdrant stays
+in `pipeline_tests::support`.
 
 ### Unicode policy
 
@@ -353,7 +371,7 @@ distractors: a similarly named service, another environment, events outside the 
 a burst of 300 near-identical logs, patterns logged on other days of the week, error
 codes and metric names that differ from the asked one in a single word, and events of
 different ages next to timeless monitors and dashboards). `logBursts` in the corpus are expanded by the
-harness into individual logs (`support/datadog.rs`, `expand_burst`).
+harness into individual logs (`crates/tails-fakes/src/datadog.rs`, `expand_burst`).
 The recorded fixtures are indexed alongside. Each question has a fixed `now` and
 timezone, the canned planner reply (`plan`), optional explicit request fields, the
 expected `scope`, `mustRetrieve`/`mayRetrieve`/`mustNotRetrieve` document IDs, expected
@@ -423,6 +441,81 @@ canned answer model.
 ```bash
 OPENAI_API_KEY=... cargo test -p rag-indexer incident_questions_openai -- --ignored --nocapture
 ```
+
+### End-to-end tests
+
+The pipeline tests call the indexer and the API in-process. The end-to-end run
+(`scripts/e2e.sh`, the `e2e` job of the `Build` workflow) runs the **built release
+binaries as separate processes** instead, configured only through their environment,
+and asks the incident question set through `rag-cli`:
+
+| Component | In the e2e run |
+|-----------|----------------|
+| `rag-indexer`, `rag-api`, `rag-cli` | Real release binaries |
+| Qdrant | Real (`qdrant/qdrant:v1.19.1`), a fresh collection per run |
+| Embeddings | Real: [text-embeddings-inference](https://github.com/huggingface/text-embeddings-inference) (`cpu-1.9.4`) serving `BAAI/bge-small-en-v1.5` (384 dimensions) on its OpenAI-compatible `POST /v1/embeddings`, reached through `OPENAI_EMBEDDING_BASE_URL` |
+| Datadog API | Fake: `tails-fakes serve`, the question set's corpus plus the recorded fixtures, and each question's live data |
+| Chat model | Fake: `tails-fakes serve`, the canned plan, hypotheses and answer of each question |
+
+What it covers beyond the pipeline tests: the binaries' environment handling
+(`OPENAI_*`, `QDRANT_*`, `DD_*`, `INDEXER_*`), the indexer creating the collection from a
+probe embedding, a real embedding model's batching and dimension, `rag-cli`'s request and
+`--json` output, and retrieval quality with real embeddings.
+
+`tails-fakes serve` matches each chat request to its question by the question text: the
+planner's user message is the question, and the hypotheses and answer prompts start with
+it. The planner request also selects which question's live data answers the following
+live Datadog queries, so questions are asked one at a time. The answer model cites the
+documents in `answer.citeDocuments` by the source URIs the adapters give them (computed
+at startup from the same corpus and `--site`, which must equal the indexer's `DD_SITE`).
+It does not serve embeddings unless started with `--embeddings`.
+
+The script builds the binaries, starts `tails-fakes`, runs `rag-indexer` once (a first run
+over the whole corpus, with change events and the service catalog on) and requires exit 0
+and a watermark file. `tails-e2e` then probes the embedding endpoint for its dimension,
+requires the collection to exist with that dimension, reads every stored point back, and
+for each distinct `now` in the question set starts `rag-api` with the clock fixed at it
+(`RAG_TEST_FIXED_NOW`, which only the tests set: most questions say "yesterday" about a
+recorded corpus) and asks that `now`'s questions with
+`rag-cli ask <question> --tz <timezone> [--service/--env/--kind] --json`. Processes,
+the collection and the work directory are removed at the end.
+
+Checks, with the harness's own scoring (`tails_fakes::questions`):
+
+- **Hard (must pass):** the indexer exits 0; the collection's dimension equals the
+  model's; every `rag-cli ask --json` exits 0 with a well-formed response; `sources` are
+  stored documents, numbered like the prompt, none listed twice; `citationWarnings` equals
+  `validate_citations` on the answer; negative controls are flagged; the scope (service,
+  environment, window, kinds) equals the expected one.
+- **Quality (thresholded):** the aggregates of the [incident question set](#incident-question-set)
+  against `tests/incident_questions/e2e_thresholds.json`, separate from the fake-embedding
+  thresholds in `questions.json`. They were measured with `BAAI/bge-small-en-v1.5` and set
+  slightly below the measured values; questions that miss with real embeddings are listed
+  in the report's notes, and the fake-embedding expectations are not changed for them.
+  Change the e2e thresholds like the others: raise them when retrieval improves for good,
+  lower them only with the change that justifies it. Changing the model means measuring
+  again.
+
+Run it locally (needs Docker, or Qdrant and TEI already running):
+
+```bash
+# Start Qdrant and TEI in docker (the model is cached in ~/.cache/tails-e2e/tei)
+E2E_DOCKER=qdrant,tei scripts/e2e.sh
+
+# Against running services
+QDRANT_ENDPOINT=http://localhost:6333 TEI_URL=http://localhost:8080 scripts/e2e.sh
+
+# No embedding model: tails-fakes' hashed bag-of-words embeddings. Checks the processes
+# and the plumbing; the scores then match the in-process harness.
+E2E_EMBEDDINGS=fake QDRANT_ENDPOINT=http://localhost:6333 scripts/e2e.sh
+```
+
+Other variables: `TEI_IMAGE`, `TEI_MODEL`, `TEI_DATA` (model cache), `FAKES_ADDR`
+(default `127.0.0.1:8900`), `E2E_SKIP_BUILD=1`, `E2E_KEEP=1` (keep the collection and the
+logs). `rag-api` listens on port 5191, which must be free. In CI, the job starts TEI with
+`docker run` after restoring the model cache (a service container would start before the
+cache is restored); indexing runs one embedding batch of at most 32 texts at a time, so
+TEI on CPU embeds the same inputs the same way on every run.
 
 ### Mutation Testing
 

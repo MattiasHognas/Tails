@@ -67,12 +67,24 @@ impl Datadog {
         }
     }
 
+    /// `DD_API_KEY`, `DD_APP_KEY` (both required) and `DD_SITE` (default
+    /// `datadoghq.com`). `DD_API_BASE_URL`, when set, replaces `https://api.{DD_SITE}`
+    /// as the base of API requests (a proxy, or the fake Datadog of the end-to-end
+    /// tests); links to Datadog pages still use `DD_SITE`.
     pub fn new_from_env() -> Result<Self> {
-        Ok(Self::new(
+        let mut dd = Self::new(
             std::env::var("DD_API_KEY")?,
             std::env::var("DD_APP_KEY")?,
             std::env::var("DD_SITE").unwrap_or_else(|_| "datadoghq.com".into()),
-        ))
+        );
+        if let Some(base) = std::env::var("DD_API_BASE_URL")
+            .ok()
+            .map(|v| v.trim().trim_end_matches('/').to_string())
+            .filter(|v| !v.is_empty())
+        {
+            dd.api_base = base;
+        }
+        Ok(dd)
     }
 
     /// Fetches all monitors with `GET /api/v1/monitor`, following `page`/`page_size`
@@ -782,6 +794,36 @@ mod tests {
         assert_eq!(dd.site, "datadoghq.eu");
         assert_eq!(dd.api_key, "test_api");
         assert_eq!(dd.app_key, "test_app");
+    }
+
+    #[test]
+    fn new_from_env_reads_an_api_base_override() {
+        use crate::test_support::{EnvVarGuard, lock_env};
+        let _env_lock = lock_env();
+        let _guards =
+            ["DD_API_KEY", "DD_APP_KEY", "DD_SITE", "DD_API_BASE_URL"].map(EnvVarGuard::preserve);
+        unsafe {
+            std::env::set_var("DD_API_KEY", "k");
+            std::env::set_var("DD_APP_KEY", "a");
+            std::env::set_var("DD_SITE", "datadoghq.eu");
+            std::env::remove_var("DD_API_BASE_URL");
+        }
+        let dd = Datadog::new_from_env().unwrap();
+        assert_eq!(dd.api_base, "https://api.datadoghq.eu");
+
+        for blank in ["", "  "] {
+            unsafe { std::env::set_var("DD_API_BASE_URL", blank) };
+            assert_eq!(
+                Datadog::new_from_env().unwrap().api_base,
+                "https://api.datadoghq.eu"
+            );
+        }
+
+        unsafe { std::env::set_var("DD_API_BASE_URL", "http://127.0.0.1:8900/") };
+        let dd = Datadog::new_from_env().unwrap();
+        assert_eq!(dd.api_base, "http://127.0.0.1:8900");
+        // Links still point at the site.
+        assert_eq!(dd.site, "datadoghq.eu");
     }
 
     #[test]

@@ -3,10 +3,19 @@ use crate::resilience::{HttpConfig, RetryPolicy, send_with_retry};
 use anyhow::Result;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
+const EMBEDDINGS_PATH: &str = "/v1/embeddings";
+
+/// An OpenAI-compatible API: chat completions at `base_url`, embeddings at
+/// `embedding_base_url` (the same server unless configured otherwise, e.g. a
+/// self-hosted embedding server such as text-embeddings-inference).
 #[derive(Debug, Clone)]
 pub struct OpenAiClient {
     pub api_key: String,
     pub base_url: String,
+    /// Where `/v1/embeddings` is sent (`OPENAI_EMBEDDING_BASE_URL`).
+    pub embedding_base_url: String,
+    /// Bearer key for the embeddings endpoint (`OPENAI_EMBEDDING_API_KEY`).
+    pub embedding_api_key: String,
     pub embedding_model: String,
     pub chat_model: String,
     pub http: reqwest::Client,
@@ -40,6 +49,8 @@ impl OpenAiClient {
         chat_model: String,
     ) -> Self {
         Self {
+            embedding_api_key: api_key.clone(),
+            embedding_base_url: base_url.clone(),
             api_key,
             base_url,
             embedding_model,
@@ -49,7 +60,17 @@ impl OpenAiClient {
         }
     }
 
+    /// `OPENAI_API_KEY` (required), `OPENAI_BASE_URL`, `OPENAI_EMBEDDING_MODEL`,
+    /// `OPENAI_CHAT_MODEL`, and for embeddings served elsewhere
+    /// `OPENAI_EMBEDDING_BASE_URL` and `OPENAI_EMBEDDING_API_KEY`, which fall back to
+    /// `OPENAI_BASE_URL` and `OPENAI_API_KEY` when unset or blank.
     pub fn new_from_env() -> Result<Self> {
+        let set = |name: &str| {
+            std::env::var(name)
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        };
         let mut client = Self::new(
             std::env::var("OPENAI_API_KEY")?,
             std::env::var("OPENAI_BASE_URL").unwrap_or_else(|_| "https://api.openai.com".into()),
@@ -57,6 +78,12 @@ impl OpenAiClient {
                 .unwrap_or_else(|_| "text-embedding-3-small".into()),
             std::env::var("OPENAI_CHAT_MODEL").unwrap_or_else(|_| "o4-mini".into()),
         );
+        if let Some(url) = set("OPENAI_EMBEDDING_BASE_URL") {
+            client.embedding_base_url = url;
+        }
+        if let Some(key) = set("OPENAI_EMBEDDING_API_KEY") {
+            client.embedding_api_key = key;
+        }
         client.http = HttpConfig::from_env().build_client();
         client.retry = RetryPolicy::from_env();
         Ok(client)
@@ -70,10 +97,15 @@ impl OpenAiClient {
         path: &str,
         body: &B,
     ) -> Result<T, RagError> {
-        let url = format!("{}{}", self.base_url, path);
+        let (base, key) = if path == EMBEDDINGS_PATH {
+            (&self.embedding_base_url, &self.embedding_api_key)
+        } else {
+            (&self.base_url, &self.api_key)
+        };
+        let url = format!("{base}{path}");
         let what = format!("openai {path}");
         let r = send_with_retry(&self.retry, &what, || {
-            self.http.post(&url).bearer_auth(&self.api_key).json(body)
+            self.http.post(&url).bearer_auth(key).json(body)
         })
         .await
         .map_err(|f| RagError::upstream(stage, f))?;
@@ -112,7 +144,7 @@ impl OpenAiClient {
         let v: Resp = self
             .post_json(
                 Stage::Embedding,
-                "/v1/embeddings",
+                EMBEDDINGS_PATH,
                 &Req {
                     input: text,
                     model: &self.embedding_model,
@@ -154,7 +186,7 @@ impl OpenAiClient {
         let v: Resp = self
             .post_json(
                 Stage::Embedding,
-                "/v1/embeddings",
+                EMBEDDINGS_PATH,
                 &Req {
                     input: texts,
                     model: &self.embedding_model,
@@ -289,6 +321,8 @@ mod tests {
     fn mock_client(base_url: String, retry: RetryPolicy) -> OpenAiClient {
         OpenAiClient {
             api_key: "test_key".to_string(),
+            embedding_api_key: "test_key".to_string(),
+            embedding_base_url: base_url.clone(),
             base_url,
             embedding_model: "test-model".to_string(),
             chat_model: "test-chat".to_string(),
@@ -455,6 +489,8 @@ mod tests {
             std::env::remove_var("OPENAI_BASE_URL");
             std::env::remove_var("OPENAI_EMBEDDING_MODEL");
             std::env::remove_var("OPENAI_CHAT_MODEL");
+            std::env::remove_var("OPENAI_EMBEDDING_BASE_URL");
+            std::env::remove_var("OPENAI_EMBEDDING_API_KEY");
             std::env::set_var("OPENAI_API_KEY", "test_key");
         }
 
@@ -463,6 +499,9 @@ mod tests {
         assert_eq!(client.base_url, "https://api.openai.com");
         assert_eq!(client.embedding_model, "text-embedding-3-small");
         assert_eq!(client.chat_model, "o4-mini");
+        // Embeddings use the same endpoint and key unless configured separately.
+        assert_eq!(client.embedding_base_url, "https://api.openai.com");
+        assert_eq!(client.embedding_api_key, "test_key");
 
         unsafe {
             std::env::remove_var("OPENAI_API_KEY");
@@ -485,6 +524,8 @@ mod tests {
         assert_eq!(client.base_url, "https://custom.openai.com");
         assert_eq!(client.embedding_model, "custom-embedding-model");
         assert_eq!(client.chat_model, "custom-chat-model");
+        assert_eq!(client.embedding_base_url, "https://custom.openai.com");
+        assert_eq!(client.embedding_api_key, "custom_key");
 
         // Cleanup
         unsafe {
@@ -493,6 +534,46 @@ mod tests {
             std::env::remove_var("OPENAI_EMBEDDING_MODEL");
             std::env::remove_var("OPENAI_CHAT_MODEL");
         }
+    }
+
+    #[test]
+    fn new_from_env_reads_a_separate_embedding_endpoint_and_key() {
+        let _env_lock = lock_env();
+        let _guards = [
+            "OPENAI_API_KEY",
+            "OPENAI_BASE_URL",
+            "OPENAI_EMBEDDING_BASE_URL",
+            "OPENAI_EMBEDDING_API_KEY",
+        ]
+        .map(EnvVarGuard::preserve);
+
+        unsafe {
+            std::env::set_var("OPENAI_API_KEY", "chat_key");
+            std::env::set_var("OPENAI_BASE_URL", "https://chat.example");
+            std::env::set_var("OPENAI_EMBEDDING_BASE_URL", " http://tei:8080 ");
+            std::env::set_var("OPENAI_EMBEDDING_API_KEY", "embed_key");
+        }
+        let client = OpenAiClient::new_from_env().unwrap();
+        assert_eq!(client.base_url, "https://chat.example");
+        assert_eq!(client.api_key, "chat_key");
+        assert_eq!(client.embedding_base_url, "http://tei:8080");
+        assert_eq!(client.embedding_api_key, "embed_key");
+
+        // Blank values fall back like unset ones; the URL and key are independent.
+        unsafe {
+            std::env::set_var("OPENAI_EMBEDDING_BASE_URL", "http://tei:8080");
+            std::env::set_var("OPENAI_EMBEDDING_API_KEY", "  ");
+        }
+        let client = OpenAiClient::new_from_env().unwrap();
+        assert_eq!(client.embedding_base_url, "http://tei:8080");
+        assert_eq!(client.embedding_api_key, "chat_key");
+        unsafe {
+            std::env::set_var("OPENAI_EMBEDDING_BASE_URL", "");
+            std::env::set_var("OPENAI_EMBEDDING_API_KEY", "embed_key");
+        }
+        let client = OpenAiClient::new_from_env().unwrap();
+        assert_eq!(client.embedding_base_url, "https://chat.example");
+        assert_eq!(client.embedding_api_key, "embed_key");
     }
 
     #[test]
@@ -509,14 +590,38 @@ mod tests {
     }
 
     fn client(server: &MockServer) -> OpenAiClient {
-        OpenAiClient {
-            api_key: "test_key".to_string(),
-            base_url: server.uri(),
-            embedding_model: "test-model".to_string(),
-            chat_model: "test-chat".to_string(),
-            http: reqwest::Client::new(),
-            retry: RetryPolicy::none(),
-        }
+        mock_client(server.uri(), RetryPolicy::none())
+    }
+
+    #[tokio::test]
+    async fn embeddings_go_to_the_embedding_endpoint_with_its_key() {
+        let chat = MockServer::start().await;
+        let embeddings = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .and(header("authorization", "Bearer embed_key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"data": [{"index": 0, "embedding": [0.5, 0.25]}]}),
+            ))
+            .expect(2)
+            .mount(&embeddings)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(header("authorization", "Bearer test_key"))
+            .respond_with(chat_reply(serde_json::json!("hi")))
+            .expect(1)
+            .mount(&chat)
+            .await;
+        let mut c = client(&chat);
+        c.embedding_base_url = embeddings.uri();
+        c.embedding_api_key = "embed_key".into();
+        assert_eq!(c.embed("a").await.unwrap(), [0.5, 0.25]);
+        assert_eq!(
+            c.embed_batch(&texts(&["a"])).await.unwrap(),
+            [vec![0.5, 0.25]]
+        );
+        assert_eq!(c.chat_complete("s", "u").await.unwrap(), "hi");
     }
 
     fn chat_reply(content: serde_json::Value) -> ResponseTemplate {
