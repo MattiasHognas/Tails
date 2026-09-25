@@ -18,7 +18,7 @@ OPENAI_API_KEY=...
 OPENAI_EMBEDDING_MODEL=text-embedding-3-small
 OPENAI_CHAT_MODEL=o4-mini
 
-# Qdrant
+# Qdrant (the indexer creates the collection: named dense + sparse vectors)
 QDRANT_ENDPOINT=http://qdrant:6333
 QDRANT_COLLECTION=datadog_rag
 
@@ -55,7 +55,7 @@ RAG_HTTP_REQUEST_TIMEOUT_MS=60000    # per HTTP attempt
 RAG_ASK_DEADLINE_MS=90000            # overall deadline for one /ask request
 RAG_PLAN_TIMEOUT_MS=30000            # /ask/plan planning stage
 RAG_EMBED_TIMEOUT_MS=15000           # embedding stage (incl. retries)
-RAG_SEARCH_TIMEOUT_MS=15000          # Qdrant search stage (incl. retries)
+RAG_SEARCH_TIMEOUT_MS=15000          # Qdrant hybrid search stage (incl. retries)
 RAG_GENERATE_TIMEOUT_MS=60000        # answer generation stage (incl. retries)
 RAG_RETRY_MAX_ATTEMPTS=3             # total attempts per upstream call (1 = no retries)
 RAG_RETRY_BASE_DELAY_MS=200          # first backoff; doubles per retry, with jitter
@@ -113,6 +113,12 @@ Installers and prebuilt binaries are described in the [README](../README.md#inst
 cd crates/rag-indexer
 INDEXER_WATERMARK=./watermark.json DD_API_KEY=... DD_APP_KEY=... DD_SITE=datadoghq.eu OPENAI_API_KEY=... QDRANT_ENDPOINT=http://localhost:6333 QDRANT_COLLECTION=datadog_rag cargo run
 ```
+
+The first run creates the collection (`QDRANT_COLLECTION`) with a `dense` and a `sparse`
+vector per point ([Qdrant storage](ARCHITECTURE.md#qdrant-storage)). A collection
+written before hybrid search (one unnamed vector) is refused: point `QDRANT_COLLECTION`
+at a new name, or delete the old collection, and start with a new checkpoint file
+(`INDEXER_WATERMARK`) so that the first run fetches the full lookback.
 
 How the indexer windows, checkpoints and deduplicates is described in
 [ARCHITECTURE.md](ARCHITECTURE.md#how-the-indexer-resumes). Unchanged documents are not
@@ -239,17 +245,21 @@ cargo test -- --nocapture
 
 The `Build` CI workflow starts a real Qdrant (v1.19.1) as a service container and,
 after the regular test run, runs the ignored `qdrant_roundtrip` upsert/search test
-against it. Both runs are instrumented, so the coverage report includes the Qdrant
+and the real-Qdrant pipeline tests against it. Both runs are instrumented, so the coverage report includes the Qdrant
 client paths. To run it locally, start an isolated Qdrant instance, then run:
 
 ```bash
 QDRANT_TEST_ENDPOINT=http://localhost:6333 cargo test --locked -p rag-core --test qdrant_roundtrip -- --ignored
 ```
 
-The test creates and deletes its own uniquely named collection and checks chunk
-identity, full payload recovery, filtering (including the time window), idempotent
-upserts, and the incremental-indexing calls: retrieving bookkeeping by point ID,
-`set_payload`, and counting and deleting by the shrink and stale-document filters.
+The test creates its own uniquely named collection with `create_collection` (after
+`check_collection` reports it missing, and checks that a collection with the old unnamed
+vector is refused), deletes it afterwards, and checks chunk identity, full payload
+recovery, filtering (including the time window), idempotent upserts, hybrid search (an
+exact identifier found by keywords although its dense vector ranks second, both
+questions fused in one query, normalized scores), and the incremental-indexing calls:
+retrieving bookkeeping by point ID, `set_payload`, and counting and deleting by the
+shrink and stale-document filters.
 
 Recommended payload indexes for large collections are listed under
 [Qdrant storage](ARCHITECTURE.md#qdrant-storage).
@@ -261,7 +271,8 @@ indexer's writer and the API's reader drift apart. The pipeline tests in
 `crates/rag-indexer/src/pipeline_tests/` run both for real on one store:
 
 1. a fake Datadog API serves the recorded fixtures (`crates/rag-core/tests/fixtures/datadog`)
-   and a crafted corpus, with the pagination the adapters follow;
+   and a crafted corpus, with the pagination the adapters follow, plus the per-object
+   endpoints (dashboard definitions, incident timelines and attachments, notebooks);
 2. the indexer's own `index_sources` + `IncrementalSink` (chunking, content hashes,
    batched embeddings, upserts, cleanup) writes to the store;
 3. the API's router (`rag_api::app`, served with a fixed clock) answers `/ask`: planner
@@ -272,13 +283,20 @@ bag-of-words vector per text (1024 dimensions, so texts sharing words are close)
 canned planner reply per question, and an answer model that cites the documents it is
 told to by reading its prompt. The store is an in-memory fake Qdrant that stores what
 the writer sent and evaluates the filter subset Tails uses (`must`/`should`/`must_not`,
-`match` value/any/except, numeric and datetime `range`, `is_empty`, `is_null`, `has_id`);
-anything else it rejects and the test fails. Each test also has a `*_real_qdrant`
+`match` value/any/except, numeric and datetime `range`, `is_empty`, `is_null`, `has_id`)
+and the hybrid query: a collection of named cosine dense and IDF sparse vectors, and
+`POST /points/query` with filtered dense and sparse prefetches fused by reciprocal rank
+fusion, scored the way Qdrant 1.19 scores them (sparse: `Σ query value · idf · stored
+value` over shared indices, `idf = ln(1 + (N − n + 0.5)/(n + 0.5))` over the collection;
+fusion: `Σ 1/(k + rank)`; equal scores, which Qdrant orders arbitrarily, by point ID).
+`support::qdrant::tests` checks these scores against hand-computed values, on the fake
+and (ignored by default) on a real Qdrant. Anything else, such as the old unnamed
+vector, a plain `points/search` or another fusion, it rejects and the test fails. Each test also has a `*_real_qdrant`
 variant, ignored by default, that uses a fresh collection on `QDRANT_TEST_ENDPOINT`.
 
 | Test | Checks |
 |------|--------|
-| `pipeline_tests::contract` | Every stored point decodes (reader's `QdrantPayload`) to the chunk the adapters produced, under the UUIDv5 of its ID; `Kind` equals the filter's value; `Timestamp` is RFC 3339; `Service`/`Environment` are lowercase; `ContentHash`/`ChunkCount`/`SyncId` never reach `sources`. `/ask` returns the right documents for service (`Auth-API` from Datadog vs `AUTH-API` from the planner), environment, kind and time filters (half-open window, timeless kinds, a log pattern day whose first and last log lie outside a short window it logged in, a day that logged only around the window left out); logs are grouped by pattern and UTC day with their count; service catalog entries (kind `catalog`) are stored undated with no environment and pass any window, change events (kind `change`) are filtered by event time, service and environment from their tags; a multi-chunk log pattern and the days of one pattern are one source, counted per day in the asker's timezone in the prompt; `sources` are stored documents numbered like the prompt; unknown citations appear in `citationWarnings`; a second run rewrites nothing. |
+| `pipeline_tests::contract` | Every stored point decodes (reader's `QdrantPayload`) to the chunk the adapters produced, under the UUIDv5 of its ID, and has exactly the `dense` and `sparse` vectors the reader queries, the sparse one built from the chunk's embedding input; the collection passes the indexer's layout check; `Kind` equals the filter's value; `Timestamp` is RFC 3339; `Service`/`Environment` are lowercase; `ContentHash`/`ChunkCount`/`SyncId` never reach `sources`. `/ask` returns the right documents for service (`Auth-API` from Datadog vs `AUTH-API` from the planner), environment, kind and time filters (half-open window, timeless kinds, a log pattern day whose first and last log lie outside a short window it logged in, a day that logged only around the window left out); logs are grouped by pattern and UTC day with their count; service catalog entries (kind `catalog`) are stored undated with no environment and pass any window, change events (kind `change`) are filtered by event time, service and environment from their tags; a multi-chunk log pattern and the days of one pattern are one source, counted per day in the asker's timezone in the prompt; `sources` are stored documents numbered like the prompt; unknown citations appear in `citationWarnings`; a second run rewrites nothing. |
 | `pipeline_tests::unicode` | See [Unicode policy](#unicode-policy). |
 | `pipeline_tests::quality` | The [incident question set](#incident-question-set). |
 
@@ -290,7 +308,8 @@ cargo test -p rag-indexer pipeline_tests
 QDRANT_TEST_ENDPOINT=http://localhost:6333 cargo test -p rag-indexer --bin rag-indexer -- \
   --ignored --exact pipeline_tests::contract::pipeline_contract_real_qdrant \
   pipeline_tests::unicode::unicode_round_trip_real_qdrant \
-  pipeline_tests::quality::incident_questions_real_qdrant
+  pipeline_tests::quality::incident_questions_real_qdrant \
+  pipeline_tests::support::qdrant::tests::query_api_matches_real_qdrant
 ```
 
 The tests live in the indexer's binary crate (a `#[cfg(test)]` module), because that is
@@ -326,11 +345,14 @@ and every payload survives the write/read round trip unchanged.
 ### Incident question set
 
 `crates/rag-indexer/tests/incident_questions/` holds a versioned, human-readable
-evaluation set: `questions.json` (26 incident questions) and `corpus.json` (monitors,
-incidents, SLOs, logs, dashboards, metrics, service definitions (`serviceDefinitions`)
-and change events (`events`) in Datadog response shape, with
+evaluation set: `questions.json` (36 incident questions) and `corpus.json` (monitors,
+incidents with their timelines and postmortem notebooks, SLOs, logs, dashboards with
+their definitions, metrics, service definitions (`serviceDefinitions`) and change events
+(`events`) in Datadog response shape, with
 distractors: a similarly named service, another environment, events outside the window,
-a burst of 300 near-identical logs, patterns logged on other days of the week). `logBursts` in the corpus are expanded by the
+a burst of 300 near-identical logs, patterns logged on other days of the week, error
+codes and metric names that differ from the asked one in a single word, and events of
+different ages next to timeless monitors and dashboards). `logBursts` in the corpus are expanded by the
 harness into individual logs (`support/datadog.rs`, `expand_burst`).
 The recorded fixtures are indexed alongside. Each question has a fixed `now` and
 timezone, the canned planner reply (`plan`), optional explicit request fields, the
@@ -348,7 +370,7 @@ cargo test -p rag-indexer incident_questions_in_memory -- --nocapture
 question                     recall prec@R exclude scope   cites  intent   obs  evid srcs  notes
 q01-checkout-slow-yesterday    1.00   1.00     8/8    ok     5/5     5/5   2/2   0/0    5
 ...
-aggregate over 22 questions (known gaps excluded):
+aggregate over 36 questions (known gaps excluded):
   recall@k                   1.000 (threshold 0.95)
 ```
 

@@ -55,8 +55,14 @@ pub fn openai_client(uri: &str) -> OpenAiClient {
 /// The production write path: fetch every source from the (fake) Datadog API, dedupe,
 /// then `IncrementalSink` (chunk, hash, batch-embed, upsert, clean up) into `store`,
 /// exactly as `main` wires it, with small embedding batches to exercise batching.
-pub async fn index(corpus: &Corpus, oa: OpenAiClient, store: &Store, now: DateTime<Utc>) {
-    let (_server, dd) = datadog::serve(corpus.clone()).await;
+/// Returns the paths of the Datadog requests the run made.
+pub async fn index(
+    corpus: &Corpus,
+    oa: OpenAiClient,
+    store: &Store,
+    now: DateTime<Utc>,
+) -> Vec<String> {
+    let (server, dd) = datadog::serve(corpus.clone()).await;
     let sink = IncrementalSink {
         embedder: oa,
         store: store.qdrant(),
@@ -82,6 +88,13 @@ pub async fn index(corpus: &Corpus, oa: OpenAiClient, store: &Store, now: DateTi
         .map(|(s, e)| format!("{}: {e:#}", s.name()))
         .collect();
     assert!(failures.is_empty(), "indexing failed: {failures:?}");
+    server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .map(|r| r.url.path().to_string())
+        .collect()
 }
 
 /// The chunks the indexer should have written for `corpus`: the adapters' documents

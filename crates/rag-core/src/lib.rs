@@ -2,6 +2,8 @@ pub mod change_events;
 pub mod chunk;
 pub mod citations;
 pub mod datadog;
+pub mod datadog_dashboards;
+pub mod datadog_incidents;
 pub mod domain;
 pub mod error;
 pub mod live_evidence;
@@ -14,6 +16,7 @@ pub mod reranker;
 pub mod resilience;
 pub mod retrieval;
 pub mod service_catalog;
+pub mod sparse;
 pub mod text;
 
 #[cfg(test)]

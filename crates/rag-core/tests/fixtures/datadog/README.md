@@ -15,6 +15,11 @@ recorded Datadog API response from the official client's test cassettes
 | `logs_search_page1.json` | `POST /api/v2/logs/events/search` | `v2/logs/Search-logs-returns-OK-response-with-pagination` (1st page) |
 | `logs_search_page2.json` | `POST /api/v2/logs/events/search` | same cassette (2nd page, requested with the 1st page's `meta.page.after` cursor) |
 | `logs_search_page3.json` | `POST /api/v2/logs/events/search` | same cassette (3rd page: empty, no `meta.page.after`) |
+| `dashboard_get.json` | `GET /api/v1/dashboard/{dashboard_id}` | `v1/dashboards/Get-a-dashboard-returns-OK-response` |
+| `dashboard_template_variables.json` | `POST /api/v1/dashboard` (same `Dashboard` schema as the GET) | `v1/dashboards/Create-a-new-dashboard-with-template-variable-defaults-returns-OK-response` |
+| `incident_attachments.json` | `GET /api/v2/incidents/{incident_id}/attachments` | `v2/incidents/List-incident-attachments-returns-OK-response` |
+| `notebook_get.json` | `GET /api/v1/notebooks/{notebook_id}` | `v1/notebooks/Get-a-notebook-returns-OK-response` |
+| `incident_timeline.json` | `GET /api/v2/incidents/{incident_id}/timeline` | **none; crafted.** The read endpoint is not in the API reference or the OpenAPI spec. The cells use the documented timeline cell *create* shape (`incident_timeline_cells`, `attributes.cell_type`, `attributes.content.content`, `important`), plus `created`/`display_time`, an alternate `content.message` and an empty cell. Replace it with a recording once one exists. |
 | `metrics.json` | `GET /api/v1/metrics` | no cassette; documented response example from the v1 OpenAPI spec |
 | `metrics_query.json` | `GET /api/v1/query` | `v1/metrics/Query-timeseries-points-returns-OK-response` (`from=1641343852&to=1641430252&query=system.cpu.idle{*}`) |
 | `service_definitions_page1.json` | `GET /api/v2/services/definitions` | `v2/service_definition/Get-all-service-definitions-returns-OK-response-with-pagination` (1st page, `page[size]=2`: a v2.1 and a v2 definition) |

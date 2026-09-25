@@ -29,7 +29,7 @@ flowchart TB
         planner["run_planner()<br/>planner::plan_query()<br/>sanitize_plan(): untrusted LLM output,<br/>'yesterday' resolved in code"]
         scope["RetrievalScope::resolve()<br/>explicit fields win over inferred<br/>to_qdrant_filter()"]
         topk["choose_topk()"]
-        rna["rag_service::retrieve()<br/>embed + filtered search"]
+        rna["rag_service::retrieve()<br/>embed question (+ rewrite)<br/>hybrid dense + keyword search"]
         live["live_timeline()<br/>diagnostic intent + window?<br/>live_evidence::collect_timeline()"]
         answer["answer_candidates()<br/>rerank_mmr_signals() + prompt<br/>with timeline"]
         noev["no hits and no observations:<br/>fixed no-evidence answer (LLM not called)"]
@@ -39,9 +39,9 @@ flowchart TB
     subgraph core ["rag-core (shared library)"]
         resil["resilience: run_stage() timeouts,<br/>send_with_retry() backoff for 429/5xx"]
         oaClient["OpenAiClient<br/>embed() / embed_batch()<br/>chat_json() / chat_complete()"]
-        qdClient["Qdrant<br/>search() / upsert()<br/>retrieve_states() / set_payload()<br/>count() / delete_by_filter()"]
+        qdClient["Qdrant<br/>hybrid_search() / upsert()<br/>check_collection() / create_collection()<br/>retrieve_states() / set_payload()<br/>count() / delete_by_filter()"]
         ddClient["Datadog adapters<br/>indexing: get_monitors() list_dashboards() list_slos()<br/>list_metrics() get_incidents() search_logs() (grouped by pattern and day)<br/>list_service_definitions() search_change_events()<br/>live: query_metrics() search_log_events()"]
-        chunker["chunk() + stable_id()<br/>content_hash() embedding_input()<br/>log_patterns: group / merge"]
+        chunker["chunk() + stable_id()<br/>content_hash() embedding_input()<br/>sparse: keyword vectors<br/>log_patterns: group / merge"]
         liveCore["live_evidence<br/>discover(): services + metrics from hits<br/>analysis: spikes, drops, gaps, log bursts vs baseline<br/>timeline: observations / hypotheses / missing"]
     end
 
@@ -50,7 +50,7 @@ flowchart TB
         idx["index_sources()<br/>per source: window() with overlap"]
         fetch["SourceFetcher::fetch()"]
         dedupe["dedupe_by_id()<br/>logs: merge_log_patterns()<br/>with the stored counts"]
-        sink["IncrementalSink::index()<br/>chunk + content_hash -> retrieve stored state<br/>skip unchanged; embed_batch(header + chunk) -> upsert<br/>(bounded concurrency)<br/>delete surplus chunks; full sync: delete unseen"]
+        sink["IncrementalSink::index()<br/>chunk + content_hash -> retrieve stored state<br/>skip unchanged; embed_batch(header + chunk)<br/>+ sparse vector of the same text -> upsert<br/>(bounded concurrency)<br/>delete surplus chunks; full sync: delete unseen"]
         ckSave["Checkpoints::save()<br/>atomic, only after all writes succeed"]
     end
 
@@ -58,8 +58,8 @@ flowchart TB
 
     subgraph ext ["External services"]
         openai[["OpenAI<br/>/v1/embeddings<br/>/v1/chat/completions"]]
-        qdrant[("Qdrant<br/>POST /collections/{c}/points/search<br/>PUT /collections/{c}/points<br/>POST /collections/{c}/points (retrieve)<br/>POST .../points/payload, /delete, /count")]
-        datadog[["Datadog API<br/>/api/v1/monitor, /dashboard, /slo, /metrics<br/>/api/v1/query (live time series)<br/>/api/v2/incidents/search<br/>/api/v2/logs/events/search<br/>/api/v2/services/definitions<br/>/api/v2/events/search"]]
+        qdrant[("Qdrant<br/>POST /collections/{c}/points/query<br/>GET, PUT /collections/{c}<br/>PUT /collections/{c}/points<br/>POST /collections/{c}/points (retrieve)<br/>POST .../points/payload, /delete, /count")]
+        datadog[["Datadog API<br/>/api/v1/monitor, /dashboard, /dashboard/{id}, /slo, /metrics<br/>/api/v1/notebooks/{id} (postmortems)<br/>/api/v1/query (live time series)<br/>/api/v2/incidents/search, /incidents/{id}/timeline, /incidents/{id}/attachments<br/>/api/v2/logs/events/search<br/>/api/v2/services/definitions<br/>/api/v2/events/search"]]
     end
 
     %% Question flow
@@ -71,8 +71,8 @@ flowchart TB
     routePlan --> validate --> planner
     routeAsk --> validate
     planner --> scope --> topk --> rna
-    rna -- "1. embed query" --> oaClient
-    rna -- "2. filtered search" --> qdClient
+    rna -- "1. embed question + rewrite" --> oaClient
+    rna -- "2. hybrid search, filtered" --> qdClient
     rna -- "hits + scope" --> live
     live --> liveCore
     liveCore -- "live queries, window + baseline" --> ddClient
@@ -119,7 +119,9 @@ What each part does:
     is treated as untrusted, and relative times like "yesterday" are resolved in code;
   - merges the plan with explicit request fields into a `RetrievalScope`, which becomes
     the Qdrant filter;
-  - retrieves: embeds the query and searches Qdrant with that filter;
+  - retrieves: embeds the question (and the planner's rewrite, when it differs) and runs
+    one hybrid Qdrant query with that filter: dense and keyword search per text, fused
+    (see [Retrieval and ranking](#retrieval-and-ranking));
   - for diagnostic questions with a time window, collects live evidence: queries Datadog
     for the discovered services' metrics and error logs over the window and a baseline,
     and returns a `timeline` (see [Live evidence](#live-evidence-timeline));
@@ -129,19 +131,23 @@ What each part does:
     `502`/`503`/`504` errors, never an answer; live-evidence failures are reported in the
     timeline instead.
 - **rag-core**: the shared library.
-  - The OpenAI client (single and batched embeddings, chat), the Qdrant client (search,
-    upsert, and the retrieve/set-payload/count/delete calls of incremental indexing), and
-    the Datadog adapters.
+  - The OpenAI client (single and batched embeddings, chat), the Qdrant client (hybrid
+    search, upsert, collection setup, and the retrieve/set-payload/count/delete calls of
+    incremental indexing), and the Datadog adapters.
   - The planner, the retrieval scope and the reranker.
   - `live_evidence`: discovery, deterministic time-series and log analysis, and the
     timeline.
   - The chunker (stable chunk IDs, so re-indexing overwrites instead of duplicating) and
     `embedding_input()`, the context header embedded with every chunk.
+  - `sparse`: the keyword tokenizer and BM25-style sparse vectors of chunks and
+    questions.
   - `log_patterns`: groups error/warning logs by message pattern and UTC day for
     indexing, and counts a pattern's logs in a question's window.
   - `resilience`: per-stage timeouts, the overall request deadline, and bounded retries
     for 429 and 5xx responses.
-- **rag-indexer**: for each Datadog source, computes a window from that source's
+- **rag-indexer**: creates the Qdrant collection on the first run (see
+  [Qdrant storage](#qdrant-storage)). Then, for each Datadog source, it computes a window
+  from that source's
   checkpoint (with overlap for late data). It then fetches, deduplicates (for logs, merges
   each message pattern's day with its stored counts) and chunks,
   skips documents whose stored content hash is unchanged, embeds the rest in batches and
@@ -153,13 +159,13 @@ What each part does:
     service definitions (Software Catalog) and change events (deploys, configuration
     changes) for indexing, and of live time series and logs for diagnostic questions.
   - **OpenAI**: embeddings, planning, and answers.
-  - **Qdrant**: the vector store the API searches.
+  - **Qdrant**: the vector store the API searches (dense and sparse vectors).
 
 ## Crates
 
 | Crate | Description |
 |-------|--------------|
-| `rag-core` | Domain models, OpenAI (chat, single and batched embeddings), Qdrant (search, upsert, and the incremental-indexing retrieve/set-payload/count/delete calls), Datadog client (monitors, incidents, logs, dashboards, metrics, SLOs, service catalog, change events), chunker, planner, reranker, RAG service. |
+| `rag-core` | Domain models, OpenAI (chat, single and batched embeddings), Qdrant (hybrid search, upsert, collection setup, and the incremental-indexing retrieve/set-payload/count/delete calls), keyword (sparse) vectors, Datadog client (monitors, incidents, logs, dashboards, metrics, SLOs, service catalog, change events), chunker, planner, reranker, RAG service. |
 | `rag-api` | Axum REST API — `/ask/plan` (intent + inferred filters) and `/ask` (server-side planning + filtered retrieval + live Datadog evidence for diagnostic questions + answer). |
 | `rag-cli` | CLI that calls the API. The server plans (service/env/time) and decides top-K. |
 | `rag-indexer` | One-shot, resumable indexer for Datadog → Qdrant with per-source checkpoints. Perfect for Kubernetes CronJob. |
@@ -182,7 +188,9 @@ is how the server interprets a request:
     Valid kinds: `logs`, `metrics`, `monitor`, `incident`, `dashboard`, `slo`, `git`,
     `catalog` (service catalog entries; also `service_catalog`) and `change` (deploys and
     configuration changes; also `deploy`, `deployment`).
-  - `rewritten_query`, then the planner's rewrite, then `question` is embedded.
+  - The rewrite is `rewritten_query`, else the planner's `rewrittenQuery`. The `question`
+    is always searched; the rewrite too when it differs from it (ignoring case and
+    whitespace), so a detail the rewrite dropped is still found.
 - **`timezone`** is an IANA name (default `UTC`). The planner is given "now" in that zone.
   `today`, `yesterday`, `the day before yesterday`, `since yesterday`, and
   `last|past N minutes|hours|days|weeks` (also `last 24h`, `last week`) are resolved in
@@ -213,10 +221,12 @@ is how the server interprets a request:
   if any, is a creation date) and metric catalog entries (stamped with the indexing run's
   time), always pass the time condition, so "yesterday" still surfaces the relevant
   monitor, SLO or metric. Service catalog entries are undated and pass it too. Incidents
-  are filtered by creation time and change events by event time. Dashboards and metric
-  entries carry no service or environment, so a service or environment scope excludes
-  them; service catalog entries carry a service but no environment, so an environment
-  scope excludes them.
+  are filtered by creation time and change events by event time. Dashboards take their
+  service and environment from their definition (see
+  [Incidents and dashboards](#incidents-and-dashboards)); a dashboard without one, and
+  metric catalog entries, are excluded by a service or environment scope. Service
+  catalog entries carry a service but no environment, so an environment scope excludes
+  them.
 
 ## Live evidence (`timeline`)
 
@@ -338,8 +348,25 @@ with `--json`) on stderr and exits with status 1.
 
 ## Retrieval and ranking
 
-- **Candidates:** Qdrant returns up to `RAG_SEARCH_CANDIDATES` (default 64) hits for the
-  embedded query, restricted by the scope filter.
+- **Candidates:** one hybrid query (`POST /collections/{c}/points/query`) returns up to
+  `RAG_SEARCH_CANDIDATES` (default 64) hits. It has a prefetch per search, each restricted
+  by the scope filter and returning up to that many points:
+  - dense: the question's embedding against the chunks' embeddings (cosine);
+  - keyword: the question's [sparse vector](#keyword-vectors) against the chunks'
+    (skipped when the question has no tokens);
+  - both again for the planner's rewrite, when there is one that differs (one more
+    embedding, in the same request).
+
+  Qdrant fuses the lists with reciprocal rank fusion: a point at 0-based rank `r` of a
+  list scores `1 / (2 + r)`, summed over the lists (`k` = 2, sent explicitly). Dense
+  search finds paraphrases; keyword search finds the exact error code, exception, metric
+  name or host a question quotes, which a dense vector blurs with similar ones.
+- **Scores:** a hit's score is its fused score divided by the best possible one (first in
+  every list), so it is in (0, 1]: 1 is first everywhere, 0.667 second in all, 0.5 first
+  in half of the lists or third in all. Only ranks count, not raw similarities, so the scale is the same for
+  every question; the reranker's kind priors, recency weight and relevance/diversity
+  balance apply to it as they did to cosine similarities. The answer prompt shows the
+  reranked score.
 - **Top-K:** `choose_topk()` picks how many hits the answer uses. It starts at
   `RAG_TOPK_DEFAULT` (16), adds 6 for root-cause questions ("why", "root cause", "rca"),
   2 for explicit time ranges and 2 for incident questions, capped at `RAG_TOPK_MAX` (32).
@@ -351,15 +378,47 @@ with `--json`) on stderr and exits with status 1.
 - **Reranking:** `rerank_mmr_signals()`:
   - weights scores by source kind (incident 1.10, monitor 1.05, SLO 1.03, change 1.02,
     service catalog, dashboard and metrics 1.00, logs 0.98). A deploy or config change is a
-    frequent root-cause lead but does not state the problem itself; catalog entries are
-    undated, so they are never decayed, and a higher weight would put a service's catalog
-    entry on top of every question about that service;
-  - applies a 24-hour recency half-life, never cutting a score below half;
+    frequent root-cause lead but does not state the problem itself; a higher weight for
+    catalog entries would put a service's entry on top of every question about it;
+  - weights scores by recency (see below), given the question's window and `now` (the
+    API's clock) explicitly, so the ranking never depends on the wall clock;
   - keeps the best hit per source, also when there are fewer candidates than K, so a
     source is never numbered twice. A source is a document (its chunks share
     `Metadata.chunk_of`) or a log pattern (its days share `Metadata.pattern_id`); ties go
     to the lower ID;
   - selects the top-K with maximal marginal relevance, so near-duplicate text is skipped.
+- **Recency weight** (`recency_weight()`): a factor from a baseline `B` up to 1. Only
+  events (logs, incidents, change events) can earn more than `B`, because only their
+  `Timestamp` says when something happened:
+
+  | Document | With a window (`B` = 0.5) | Without a window (`B` = 0.75) |
+  |---|---|---|
+  | Monitor, dashboard, SLO, metric (`TIMELESS_KINDS`), any timestamp | `B` | `B` |
+  | Undated event, or unparsable timestamp | `B` | `B` |
+  | Event in the window (a log pattern day from its first to its last log) | 1, however long ago | – |
+  | Other event | `B + (1 − B)·2^(−d / 24 h)`, `d` = distance to the window | `B + (1 − B)·2^(−age / 24 h)`, age from `now` |
+
+  - The timestamp of a timeless document is a creation or last-seen date, not relevance,
+    so it is ignored. An old event and a timeless document therefore compare on retrieval
+    score and kind prior alone: recency is a bonus for fresh or in-window events, never a
+    penalty below what a timeless document gets. (Before, dated documents were halved a
+    day after their timestamp and undated ones never were, so with rank fusion a
+    week-old incident ranked first by every search lost to a monitor ranked second:
+    1.0 × 1.10 × 0.5 = 0.55 against 0.667 × 1.05 = 0.70.)
+  - With a window the user named the time, so being in it is strong evidence: up to 2×,
+    about two ranks of the fused score (1st in every list 1.0, 3rd 0.5). An event in
+    the window beats a timeless document that merely shares more words, such as the
+    service's overview dashboard for "what happened on 2 March". Events outside the
+    window rarely reach the reranker: the retrieval filter drops dated events outside
+    it, and log pattern days that logged nothing in it are dropped before reranking.
+  - Without a window, "recent" is only a preference: at most 1.33×, less than the gap
+    between 1st and 2nd in every list (1.5×). It orders comparable matches (the error
+    from 20 minutes ago before an equally matching one from five days ago) but never
+    lifts a fresh event over one that clearly matches better. A day old weighs 0.875,
+    five days 0.758, a week or more ≈ 0.75.
+  - Age is measured from `now`, not from the newest candidate: relative to the newest
+    candidate, a stale index would give its newest event the full bonus, and a
+    document's weight would change with which other documents were retrieved.
 - **Answering:** `answer_candidates()` sends the selected documents (title, kind, time,
   service, environment, source link and key metadata) and, when collected, the rendered
   live-evidence timeline to the chat model. A log pattern is shown as its representative
@@ -403,12 +462,14 @@ file at `INDEXER_WATERMARK`:
   `INDEXER_OVERLAP_MINUTES` (default 10) until now, so records that reach Datadog late
   are picked up by the next run. A source without a checkpoint starts
   `INDEXER_LOOKBACK_MINUTES` (default 90) back. After an outage, the whole gap since the
-  checkpoint is fetched. Monitors, dashboards, SLOs and service definitions are re-synced
-  in full each run.
-- **Optional sources:** the service catalog and change events can be switched off with
-  `INDEXER_SERVICE_CATALOG_ENABLED=false` and `INDEXER_CHANGE_EVENTS_ENABLED=false`
-  (for example when the application key lacks their permission). A disabled source is not
-  fetched; its checkpoint and stored points are left as they are.
+  checkpoint is fetched. Monitors, dashboards, SLOs and service definitions are re-synced in full each run
+  (a dashboard's definition only when its `modified_at` changed; see
+  [Incidents and dashboards](#incidents-and-dashboards)).
+- **Optional sources:** the service catalog is on by default and change events are off
+  by default (`INDEXER_SERVICE_CATALOG_ENABLED`, `INDEXER_CHANGE_EVENTS_ENABLED`; `true`/`1`/`on`
+  or `false`/`0`/`off`). A disabled source is not fetched; its checkpoint and stored points
+  are left as they are. When the application key lacks a source's permission (HTTP 403),
+  the source is skipped with a warning naming the permission, and the run does not fail.
 - **No duplicates:** documents are deduplicated by ID within a run, and Qdrant point IDs
   are derived from document IDs, so re-indexing overlapping records overwrites them. An
   overlapping record that hasn't changed is not embedded again (see
@@ -485,6 +546,95 @@ and a log's vector names its service even when the message does not. Only the ve
 changes: the stored `Text` and the answer prompt are the chunk text as before.
 
 Everything in the header is a document field, so the content hash covers it.
+
+### Keyword vectors
+
+Each chunk is also stored with a sparse keyword vector of the same embedding input
+(`rag_core::sparse`), so keyword search sees the header too:
+
+- **Tokens:** runs of letters and digits (Unicode-aware; combining marks stay with their
+  letter), lowercased. Identifiers joined by `_`, `-` or `.` are kept whole and split
+  into their parts, and camelCase words are split too: `ERR_CONN_RESET` gives
+  `err_conn_reset`, `err`, `conn`, `reset`; `java.net.SocketTimeoutException` gives the
+  whole name, `java`, `net`, `sockettimeoutexception`, `socket`, `timeout`, `exception`.
+  `:` and `/` join larger units (`service:checkout`, `api/v1/login`), which are kept
+  whole with each segment tokenized as above, so the metric name in
+  `avg:trace.http.request.errors{service:checkout}` is a token.
+- **Indices:** the 32-bit FNV-1a hash of the token (stable across runs and platforms).
+- **Values:** stored chunks carry BM25 term-frequency weights
+  (`tf·(k1+1) / (tf + k1·(1 − b + b·len/256))`, k1 = 1.2, b = 0.75); questions 1 per
+  distinct token.
+- **IDF:** the collection's sparse vector has Qdrant's `idf` modifier, so Qdrant weights
+  each query token by `ln(1 + (N − n + 0.5) / (n + 0.5))` over the whole collection (N
+  points with a sparse vector, n containing the token). A code that appears in one log
+  outweighs `error` or `checkout`.
+
+The tokenizer and weights are versioned (`SPARSE_ENCODER_VERSION`, part of the content
+hash), so changing them re-indexes every document once.
+
+### Incidents and dashboards
+
+Incidents and dashboards need one extra request per object for what they actually say
+(`rag_core::datadog_incidents`, `rag_core::datadog_dashboards`).
+
+**Incidents.** The search result already holds most of an incident: title, severity,
+state, commander, services, teams, detection method, created/detected/resolved times,
+customer impact and the free-text fields (`summary`, `root_cause`, `resolution`, and any
+other `textbox` field an organization defined). Datadog puts most of them in
+`attributes.fields.<name>.value` and a few directly in `attributes`; both places are read
+for every field. For each incident in the window (at most 100 per run, 4 at a time) the
+indexer also fetches:
+
+- the **timeline** (`GET /api/v2/incidents/{id}/timeline`): notes and status changes,
+  oldest first, at most 50 entries of 1000 bytes and 8000 bytes in all. This read
+  endpoint is **not in Datadog's API reference**; the shape read is the documented
+  timeline cell create shape (`attributes.cell_type`, `attributes.content.content`). A
+  client error (4xx other than 429) stops timeline requests for the rest of the run;
+- the **postmortem**: the incident's attachments (`GET /api/v2/incidents/{id}/attachments`,
+  skipped when the search result lists none), the first `postmortem` attachment, and the
+  markdown cells of the notebook it links to (`GET /api/v1/notebooks/{id}`, at most
+  12,000 bytes). A notebook that cannot be read leaves the attachment title.
+
+The document text puts the facts first, then summary, root cause and resolution, customer
+impact, other text fields, the postmortem and the timeline, so the first chunk and the
+prompt excerpt carry what answers "what was the root cause". Long documents are chunked
+like any other, and every chunk carries the incident's [header](#embedding-input). Each
+per-incident request is retried on 429, 5xx and transport errors (`Datadog.retry`, the default
+bounded policy in the indexer); if it still fails the
+incident is indexed without that part and a warning is logged. The run does not fail.
+
+Incidents are fetched by creation time, so an incident is indexed from the runs whose
+window contains its creation; a postmortem written days later is not picked up by later
+runs (a known limitation).
+
+**Dashboards.** Each dashboard's definition (`GET /api/v1/dashboard/{id}`) adds its
+template variables and one line per widget (title, or a note's text, and up to five
+queries: `q`, `queries[].query`, `search.query`, group widgets included), at most 100
+widgets and 8000 bytes. The definition also gives the dashboard a `Service` and
+`Environment`, from the `service`/`env` template variables and the `service:`/`env:`
+filters in widget queries (`$variables`, wildcards and negations ignored), normalized
+like every stored value:
+
+1. a template variable with exactly one concrete default wins;
+2. otherwise the only value in widget queries;
+3. otherwise the value found in strictly the most widget queries;
+4. otherwise (a tie) none: the dashboard stays unscoped.
+
+Every candidate is listed in the text and in `Metadata.services`/`Metadata.environments`;
+the payload keeps one `Service` string, so the retrieval filter is unchanged.
+
+The definition is stored in the document's metadata (`Metadata.definition`) with the
+list's `Metadata.modified_at`. The next run reads the stored metadata of every listed
+dashboard and reuses the stored definition when `modified_at` is unchanged, so an
+unchanged dashboard costs no request and produces the identical document (nothing is
+re-embedded). At most 200 definitions are fetched per run, 4 at a time; dashboards over
+that budget, and dashboards whose fetch failed, keep their stored definition with its old
+`modified_at` (so a later run fetches them) or, with nothing stored, are indexed from their
+list entry.
+
+**API calls per run:** incidents cost up to 3 extra requests each (timeline, attachments,
+notebook; attachments only when listed), at most 100 incidents; dashboards one request per
+new or changed dashboard, at most 200.
 
 ### Service catalog and change events
 
@@ -585,6 +735,21 @@ per run for the current day, not once per log.
 
 ## Qdrant storage
 
+Every point has two named vectors: `dense`, the embedding (cosine), and `sparse`, the
+[keyword vector](#keyword-vectors) (IDF computed by Qdrant). The indexer creates the
+collection on its first run (`GET /collections/{c}`, then `PUT` if missing, sized by one
+probe embedding) with:
+
+```json
+{"vectors": {"dense": {"size": 1536, "distance": "Cosine"}},
+ "sparse_vectors": {"sparse": {"modifier": "idf"}}}
+```
+
+An existing collection without this layout, such as one with the earlier single unnamed
+vector, is refused at startup: it cannot be converted in place. Index into a new
+collection (a new `QDRANT_COLLECTION`, or delete the old one) and start with an empty
+checkpoint file, so that logs and incidents are fetched for the full lookback again.
+
 Ingestion and retrieval share a typed payload in `rag-core::qdrant`. Stored keys
 are `Title`, `Text`, `SourceUri`, `Kind`, `Timestamp`, `Service`, `Environment`,
 `Metadata`, and lowercase `id`. The payload `id` remains the logical chunk ID
@@ -605,9 +770,9 @@ They are not part of the returned documents, so the answer model never sees them
 Shrink cleanup filters on `Kind`, `Metadata.chunk_of` and `Metadata.chunk_index`; stale
 cleanup on `Kind` and `SyncId`.
 
-Time filtering uses Qdrant's datetime `range` on the existing RFC 3339 `Timestamp`
-string, so existing collections need no re-indexing. Filters work without payload
-indexes; for large collections, add them for faster filtering:
+Time filtering uses Qdrant's datetime `range` on the RFC 3339 `Timestamp`
+string. Filters work without payload indexes; for large collections, add them for
+faster filtering:
 
 ```bash
 curl -X PUT "$QDRANT_ENDPOINT/collections/$QDRANT_COLLECTION/index" -H 'Content-Type: application/json' -d '{"field_name": "Timestamp", "field_schema": "datetime"}'

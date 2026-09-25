@@ -18,8 +18,10 @@ const FIRST_SEEN_KEY: &str = "Metadata.first_seen";
 /// Kinds that describe configuration or state rather than events. Their `Timestamp`,
 /// when set at all, is a creation date (monitors, dashboards, SLOs) or the time the
 /// indexer last saw the metric active (metric catalog entries), so a time window never
-/// excludes them. Service catalog entries (owners, runbooks, dependencies) describe a
-/// service, not an event, and are undated. Change events are events: a window applies.
+/// excludes them and the reranker never rewards their timestamp as recent
+/// ([`crate::reranker::recency_weight`]). Service catalog entries (owners, runbooks,
+/// dependencies) describe a service, not an event, and are undated. Change events are
+/// events: a window applies.
 pub const TIMELESS_KINDS: [SourceKind; 5] = [
     SourceKind::Metrics,
     SourceKind::Monitor,

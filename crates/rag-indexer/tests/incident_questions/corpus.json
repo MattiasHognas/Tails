@@ -1,6 +1,6 @@
 {
-  "version": 3,
-  "description": "Crafted Datadog corpus for the incident question set (questions.json). Objects have the shape of Datadog API responses so the real adapters parse them. Services: checkout, checkout-worker (similar name), payments, auth-api, sökmotor, inventory, orders, recommendations, ledger, orders-db; environments prod and staging. 'serviceDefinitions' are Software Catalog entries (GET /api/v2/services/definitions) and 'events' are change events (POST /api/v2/events/search, the deploys on 2026-03-05 for q50-q52). 'logBursts' are runs of near-identical logs that the harness expands into individual logs (support/datadog.rs, expand_burst). The questions are asked at 2026-03-12T09:00:00Z in Europe/Stockholm, so 'yesterday' is 2026-03-10T23:00:00Z..2026-03-11T23:00:00Z. The recorded fixtures' monitors, dashboards, SLOs and metrics are indexed alongside as unrelated distractors. Checkout logs in January and February belong to q20-q23, which set their own 'now'.",
+  "version": 4,
+  "description": "Crafted Datadog corpus for the incident question set (questions.json). Objects have the shape of Datadog API responses so the real adapters parse them. Services: checkout, checkout-worker (similar name), payments, auth-api, sökmotor, inventory, orders, recommendations, ledger, orders-db, fulfillment, notifications, billing, edge-gateway, checkout-api, storefront; environments prod and staging. 'serviceDefinitions' are Software Catalog entries (GET /api/v2/services/definitions) and 'events' are change events (POST /api/v2/events/search, the deploys on 2026-03-05 for q50-q52). 'logBursts' are runs of near-identical logs that the harness expands into individual logs (support/datadog.rs, expand_burst). Dashboards are full dashboard definitions (the fake list endpoint returns only the summary keys; GET /api/v1/dashboard/{id} returns the rest). 'incidentTimelines' and 'incidentAttachments' (per incident ID) and 'notebooks' are served by the per-incident timeline, attachments and notebook endpoints. The questions are asked at 2026-03-12T09:00:00Z in Europe/Stockholm, so 'yesterday' is 2026-03-10T23:00:00Z..2026-03-11T23:00:00Z. The recorded fixtures' monitors, dashboards, SLOs and metrics are indexed alongside as unrelated distractors. Checkout logs in January and February belong to q20-q23, which set their own 'now'.",
   "monitors": [
     {
       "id": 1001,
@@ -52,7 +52,13 @@
     },
     {"id": 2001, "type": "query alert", "name": "Recommendations API p99 latency above 2s", "query": "avg(last_5m):p99:trace.http.request.duration{service:recommendations,env:prod} > 2", "message": "Recommendation requests are slow. Check the feature store and the ranking model before scaling the API.", "tags": ["service:recommendations", "env:prod", "team:discovery"]},
     {"id": 3001, "type": "query alert", "name": "Ledger reconciliation drift", "query": "sum(last_1h):sum:accounting.balance.mismatch{service:ledger,env:prod} > 100", "message": "Runbook RB-LED-3. This alert fires when the nightly balance comparison between the accounting database and the payment provider settlement files disagrees by more than 100 entries. First, open the Finance Operations dashboard and confirm which settlement batch is affected; the batch identifier is printed in the alert context. Second, check whether the settlement file for that batch arrived on time: files are delivered to the sftp inbox between 01:00 and 02:30 UTC, and a late file is the most common cause of a transient mismatch that resolves itself on the next comparison. Third, look at the export job history in the scheduler; a failed or partially completed export leaves the comparison with missing rows, which shows up as a sudden jump in the mismatch counter rather than a slow increase. If the export failed, rerun it from the scheduler with the same batch identifier and wait for the comparison to finish before paging anyone else. Fourth, if the settlement file and the export are both complete, compare the currency breakdown: a mismatch concentrated in one currency usually means a rate table was not refreshed, and the treasury team owns that table. Fifth, confirm that no manual adjustments were booked during the comparison window; manual bookings are listed in the adjustments report and must be approved by two people from the finance team. Do not delete or edit booked entries to make the numbers match: every correction is a new compensating entry with a reference to the incident. Keep the incident channel updated every thirty minutes with the current mismatch count, the suspected cause and the next action, and hand over explicitly at the end of your shift. Escalate to the accounting platform on-call engineer when the mismatch keeps growing for more than one hour or when more than one settlement batch is affected at the same time. Replica lag: the comparison reads from the postgres read replica, so replica lag makes recent bookings invisible and inflates the mismatch. Check the replica lag panel; if it is above five minutes, pause the comparison, wait until the replica has caught up and rerun it instead of correcting entries.", "tags": ["service:ledger", "env:prod", "team:finance-platform"]},
-    {"id": 3002, "type": "query alert", "name": "Orders database replica lag high", "query": "avg(last_5m):avg:postgresql.replication_delay{service:orders-db,env:prod} > 30", "message": "Replica lag on the orders database is above 30 s. Check replication slots and long-running queries on the primary.", "tags": ["service:orders-db", "env:prod", "team:shop"]}
+    {"id": 3002, "type": "query alert", "name": "Orders database replica lag high", "query": "avg(last_5m):avg:postgresql.replication_delay{service:orders-db,env:prod} > 30", "message": "Replica lag on the orders database is above 30 s. Check replication slots and long-running queries on the primary.", "tags": ["service:orders-db", "env:prod", "team:shop"]},
+    {"id": 1101, "type": "query alert", "name": "Storefront 5xx responses", "query": "sum(last_5m):sum:trace.http.request.errors{service:storefront,env:prod}.as_count() > 50", "message": "Storefront returns 5xx responses. Check recent deploys.", "tags": ["service:storefront", "env:prod", "team:web"]},
+    {"id": 1102, "type": "query alert", "name": "Storefront traffic monitor", "query": "sum(last_10m):sum:trace.http.request.hits{service:storefront,env:prod}.as_count() < 100", "message": "This monitor pages storefront when storefront traffic drops.", "tags": ["service:storefront", "env:prod", "team:web"]},
+    {"id": 1103, "type": "query alert", "name": "Storefront latency above 3s", "query": "avg(last_5m):avg:trace.http.request.duration{service:storefront,env:prod} > 3", "message": "Page load is slow; timeouts turn into errors for shoppers at the payment step.", "tags": ["service:storefront", "env:prod", "team:web"]},
+    {"id": 1104, "type": "query alert", "name": "Storefront Apdex", "query": "avg(last_15m):avg:trace.http.request.apdex{service:storefront,env:prod} < 0.8", "message": "User satisfaction dropped.", "tags": ["service:storefront", "env:prod", "team:web"]},
+    {"id": 4001, "type": "query alert", "name": "Fulfillment shipping label printer errors", "query": "sum(last_5m):sum:fulfillment.label.print.errors{service:fulfillment,env:prod}.as_count() > 20", "message": "The fulfillment label printer fails to print shipping labels. Check the printer queue and the carrier API.", "tags": ["service:fulfillment", "env:prod", "team:logistics"]},
+    {"id": 4101, "type": "query alert", "name": "Billing invoice generation errors", "query": "sum(last_15m):sum:billing.invoice.errors{service:billing,env:prod}.as_count() > 10", "message": "Billing fails to generate invoices: what went wrong is usually the tax rate service. Check it before rerunning the invoice batch.", "tags": ["service:billing", "env:prod", "team:finance-platform"]}
   ],
   "slos": [
     {
@@ -94,14 +100,66 @@
       "title": "Checkout overview",
       "description": "Checkout latency, error rate and payment dependency panels.",
       "created_at": "2025-06-01T10:00:00.000000+00:00",
-      "author_handle": "shop@example.com"
+      "modified_at": "2026-01-15T09:00:00.000000+00:00",
+      "author_handle": "shop@example.com",
+      "layout_type": "ordered",
+      "template_variables": [{"name": "env", "prefix": "env", "available_values": ["prod", "staging"], "defaults": ["prod"]}],
+      "widgets": [
+        {"id": 1, "definition": {"type": "timeseries", "title": "Checkout p95 latency", "requests": [{"q": "p95:trace.http.request.duration{service:checkout,$env}", "display_type": "line"}]}},
+        {"id": 2, "definition": {"type": "query_value", "title": "Checkout error rate", "requests": [{"queries": [{"data_source": "metrics", "name": "query1", "query": "sum:trace.http.request.errors{service:checkout,$env}.as_count()"}], "formulas": [{"formula": "query1"}]}]}},
+        {"id": 3, "definition": {"type": "timeseries", "title": "Checkout requests by status", "requests": [{"q": "sum:trace.http.request.hits{service:checkout,$env} by {http.status_code}.as_count()"}]}},
+        {"id": 4, "definition": {"type": "timeseries", "title": "Payment dependency latency", "requests": [{"q": "avg:trace.http.request.duration{service:payments,$env}"}]}}
+      ]
     },
     {
       "id": "dash-payments",
       "title": "Betalningar – översikt 📊",
       "description": "Payments: kortbetalningar, bank gateway latency och återförsök.",
       "created_at": "2025-07-01T10:00:00.000000+00:00",
-      "author_handle": "payments@example.com"
+      "modified_at": "2026-02-01T09:00:00.000000+00:00",
+      "author_handle": "payments@example.com",
+      "layout_type": "ordered",
+      "template_variables": [
+        {"name": "service", "prefix": "service", "available_values": null, "defaults": ["payments"]},
+        {"name": "env", "prefix": "env", "default": "prod"}
+      ],
+      "widgets": [
+        {"id": 11, "definition": {"type": "timeseries", "title": "Kortbetalningar per minut", "requests": [{"q": "sum:payments.card.authorisations{$service,$env}.as_count()"}]}},
+        {"id": 12, "definition": {"type": "timeseries", "title": "Bank gateway latency p95", "requests": [{"q": "p95:payments.gateway.latency{$service,$env}"}]}},
+        {"id": 13, "definition": {"type": "group", "title": "Återförsök", "layout_type": "ordered", "widgets": [
+          {"id": 14, "definition": {"type": "log_stream", "title": "Retried authorisations", "query": "service:payments status:warn retry", "columns": ["host", "service"]}}
+        ]}}
+      ]
+    },
+    {
+      "id": "dash-orders-db",
+      "title": "Orders database replication",
+      "description": null,
+      "created_at": "2025-09-01T10:00:00.000000+00:00",
+      "modified_at": "2026-02-10T09:00:00.000000+00:00",
+      "author_handle": "dba@example.com",
+      "layout_type": "ordered",
+      "template_variables": null,
+      "widgets": [
+        {"id": 21, "definition": {"type": "note", "content": "Replication health of the orders database cluster."}},
+        {"id": 22, "definition": {"type": "timeseries", "title": "Replica lag (seconds)", "requests": [{"q": "avg:postgresql.replication_delay{service:orders-db,env:prod} by {replica}"}]}},
+        {"id": 23, "definition": {"type": "timeseries", "title": "Primary connections", "requests": [{"q": "avg:postgresql.connections{service:orders-db,env:prod}"}]}}
+      ]
+    },
+    {
+      "id": "dash-golden-signals",
+      "title": "Platform golden signals",
+      "description": "Request rate per service; spans several services equally, so it stays unscoped.",
+      "created_at": "2025-10-01T10:00:00.000000+00:00",
+      "modified_at": "2026-02-12T09:00:00.000000+00:00",
+      "author_handle": "sre@example.com",
+      "layout_type": "ordered",
+      "template_variables": [{"name": "service", "prefix": "service", "defaults": ["*"]}],
+      "widgets": [
+        {"id": 31, "definition": {"type": "timeseries", "title": "Checkout requests", "requests": [{"q": "sum:trace.http.request.hits{service:checkout,env:prod}.as_count()"}]}},
+        {"id": 32, "definition": {"type": "timeseries", "title": "Inventory requests", "requests": [{"q": "sum:trace.http.request.hits{service:inventory,env:prod}.as_count()"}]}},
+        {"id": 33, "definition": {"type": "timeseries", "title": "Selected service", "requests": [{"q": "sum:trace.http.request.hits{$service}.as_count()"}]}}
+      ]
     }
   ],
   "metrics": [
@@ -207,6 +265,129 @@
           "env": {"type": "dropdown", "value": "prod"}
         }
       }
+    },
+    {
+      "id": "inc-checkout-outage",
+      "type": "incidents",
+      "attributes": {
+        "public_id": 40,
+        "title": "Orders stuck at the payment step",
+        "created": "2026-02-20T13:05:00+00:00",
+        "detected": "2026-02-20T13:07:00+00:00",
+        "resolved": "2026-02-20T13:55:00+00:00",
+        "state": "resolved",
+        "customer_impact_scope": "Customers could not place orders for 50 minutes.",
+        "commander": {"data": {"type": "users", "id": "u-kim", "attributes": {"name": "Kim Svensson", "handle": "kim@example.com"}}},
+        "fields": {
+          "severity": {"type": "dropdown", "value": "SEV-1"},
+          "services": {"type": "autocomplete", "value": ["checkout"]},
+          "teams": {"type": "autocomplete", "value": ["shop"]},
+          "env": {"type": "dropdown", "value": "prod"},
+          "detection_method": {"type": "dropdown", "value": "monitor"},
+          "summary": {"type": "textbox", "value": "Checkout requests hung waiting for a database connection until the pods were restarted."},
+          "root_cause": {"type": "textbox", "value": "Root cause of the checkout outage: a connection leak in the promo-code lookup (released on 20 February) never returned connections, so the checkout database pool ran dry."},
+          "resolution": {"type": "textbox", "value": "Disabled the promo-code lookup with a feature flag and restarted the checkout pods."}
+        }
+      },
+      "relationships": {"attachments": {"data": []}}
+    },
+    {
+      "id": "inc-gateway-cert",
+      "type": "incidents",
+      "attributes": {
+        "public_id": 48,
+        "title": "TLS handshake errors to the acquirer",
+        "created": "2026-02-24T08:30:00+00:00",
+        "state": "resolved",
+        "customer_impact_scope": "Some cards were declined for 25 minutes.",
+        "fields": {
+          "severity": {"type": "dropdown", "value": "SEV-2"},
+          "services": {"type": "autocomplete", "value": ["payments"]},
+          "env": {"type": "dropdown", "value": "prod"}
+        }
+      },
+      "relationships": {"attachments": {"data": [{"type": "incident_attachments", "id": "att-gateway-pm"}]}}
+    },
+    {
+      "id": "inc-orders-db-failover",
+      "type": "incidents",
+      "attributes": {
+        "public_id": 49,
+        "title": "Orders database failover",
+        "created": "2026-03-05T02:10:00+00:00",
+        "state": "resolved",
+        "customer_impact_scope": "Order history was read-only for 20 minutes.",
+        "fields": {
+          "severity": {"type": "dropdown", "value": "SEV-2"},
+          "services": {"type": "autocomplete", "value": ["orders-db"]},
+          "env": {"type": "dropdown", "value": "prod"}
+        }
+      },
+      "relationships": {"attachments": {"data": []}}
+    },
+    {
+      "id": "inc-fulfillment-labels",
+      "type": "incidents",
+      "attributes": {
+        "public_id": 50,
+        "title": "Every shipping label printed twice",
+        "created": "2026-03-04T15:00:00+00:00",
+        "state": "resolved",
+        "customer_impact_scope": "Fulfillment printed every shipping label twice and parcels were shipped twice: the label printer retried each print job after a carrier API timeout.",
+        "fields": {
+          "severity": {
+            "type": "dropdown",
+            "value": "SEV-3"
+          },
+          "services": {
+            "type": "autocomplete",
+            "value": [
+              "fulfillment"
+            ]
+          },
+          "env": {
+            "type": "dropdown",
+            "value": "prod"
+          }
+        }
+      },
+      "relationships": {
+        "attachments": {
+          "data": []
+        }
+      }
+    },
+    {
+      "id": "inc-billing-vat",
+      "type": "incidents",
+      "attributes": {
+        "public_id": 51,
+        "title": "Invoices sent at the previous VAT rate",
+        "created": "2026-03-10T09:30:00+00:00",
+        "state": "resolved",
+        "customer_impact_scope": "Billing sent 1,200 invoices at the previous VAT rate: the tax rate cache was not refreshed.",
+        "fields": {
+          "severity": {
+            "type": "dropdown",
+            "value": "SEV-3"
+          },
+          "services": {
+            "type": "autocomplete",
+            "value": [
+              "billing"
+            ]
+          },
+          "env": {
+            "type": "dropdown",
+            "value": "prod"
+          }
+        }
+      },
+      "relationships": {
+        "attachments": {
+          "data": []
+        }
+      }
     }
   ],
   "logs": [
@@ -222,7 +403,20 @@
     {"id": "inv-1", "type": "log", "attributes": {"service": "inventory", "status": "error", "timestamp": "2026-03-11T09:40:00.000Z", "message": "stock reservation failed: lock wait timeout exceeded on table reservations (order 88412)", "tags": ["env:prod"]}},
     {"id": "ord-inv-1", "type": "log", "attributes": {"service": "orders", "status": "error", "timestamp": "2026-03-11T09:41:00.000Z", "message": "inventory client error: POST /reservations returned 503, order 88412 kept pending", "tags": ["env:prod"]}},
     {"id": "rec-fs-1", "type": "log", "attributes": {"service": "recommendations", "status": "error", "timestamp": "2026-03-12T06:20:00.000Z", "message": "feature store connection refused (ranker); serving popular items instead of personalised results", "tags": ["env:prod"]}},
-    {"id": "co-pay-wed", "type": "log", "attributes": {"service": "checkout", "status": "error", "timestamp": "2026-02-18T14:05:00.000Z", "message": "payment authorization timed out after 5000ms waiting for payments-gateway", "tags": ["env:prod"]}}
+    {"id": "co-pay-wed", "type": "log", "attributes": {"service": "checkout", "status": "error", "timestamp": "2026-02-18T14:05:00.000Z", "message": "payment authorization timed out after 5000ms waiting for payments-gateway", "tags": ["env:prod"]}},
+    {"id": "eg-reset", "type": "log", "attributes": {"service": "edge-gateway", "status": "error", "timestamp": "2026-03-11T12:04:00.000Z", "message": "ERR_CONN_RESET reading response body from payments", "tags": ["env:prod"]}},
+    {"id": "eg-timeout", "type": "log", "attributes": {"service": "edge-gateway", "status": "error", "timestamp": "2026-03-11T12:03:00.000Z", "message": "upstream timeout calling payments: ERR_UPSTREAM_TIMEOUT after 3000ms", "tags": ["env:prod"]}},
+    {"id": "eg-502", "type": "log", "attributes": {"service": "edge-gateway", "status": "error", "timestamp": "2026-03-11T12:02:00.000Z", "message": "calling payments upstream returned 502: ERR_BAD_GATEWAY", "tags": ["env:prod"]}},
+    {"id": "eg-refused", "type": "log", "attributes": {"service": "edge-gateway", "status": "error", "timestamp": "2026-03-11T12:01:00.000Z", "message": "ERR_CONN_REFUSED connecting to fraud-scoring sidecar", "tags": ["env:prod"]}},
+    {"id": "eg-tls", "type": "log", "attributes": {"service": "edge-gateway", "status": "error", "timestamp": "2026-03-11T12:00:00.000Z", "message": "ERR_TLS_HANDSHAKE_FAILED with payments upstream: certificate expired", "tags": ["env:prod"]}},
+    {"id": "eg-pool", "type": "log", "attributes": {"service": "edge-gateway", "status": "error", "timestamp": "2026-03-11T11:59:00.000Z", "message": "conn pool reset after ERR_POOL_EXHAUSTED; reconnecting upstream sockets", "tags": ["env:prod"]}},
+    {"id": "ca-declined", "type": "log", "attributes": {"service": "checkout-api", "status": "error", "timestamp": "2026-03-11T15:04:00.000Z", "message": "PaymentDeclinedException: issuer declined card on retry 3 of 3", "tags": ["env:prod"]}},
+    {"id": "ca-retry", "type": "log", "attributes": {"service": "checkout-api", "status": "error", "timestamp": "2026-03-11T15:03:00.000Z", "message": "card payment retry failures: gateway timeout after 2 attempts", "tags": ["env:prod"]}},
+    {"id": "ca-exhausted", "type": "log", "attributes": {"service": "checkout-api", "status": "error", "timestamp": "2026-03-11T15:02:00.000Z", "message": "retries exhausted: card vault did not respond within 5s", "tags": ["env:prod"]}},
+    {"id": "ca-3ds", "type": "log", "attributes": {"service": "checkout-api", "status": "error", "timestamp": "2026-03-11T15:01:00.000Z", "message": "3-D Secure challenge failed for card, retries disabled for this merchant", "tags": ["env:prod"]}},
+    {"id": "ca-cart", "type": "log", "attributes": {"service": "checkout-api", "status": "error", "timestamp": "2026-03-11T15:00:00.000Z", "message": "throw away stale cart session after checkout timeout", "tags": ["env:prod"]}},
+    {"id": "ntf-push", "type": "log", "attributes": {"service": "notifications", "status": "error", "timestamp": "2026-03-07T10:00:00.000Z", "message": "notifications failing now: push delivery rejected by APNs, key expired", "tags": ["env:prod"]}},
+    {"id": "ntf-email", "type": "log", "attributes": {"service": "notifications", "status": "error", "timestamp": "2026-03-12T08:40:00.000Z", "message": "notifications failing: email delivery rejected by the SMTP relay", "tags": ["env:prod"]}}
   ],
   "logBursts": [
     {"idPrefix": "rec-burst-", "count": 300, "start": "2026-03-12T06:00:00.000Z", "everySeconds": 10, "service": "recommendations", "env": "prod", "status": "error", "message": "recommendations cache timeout: redis GET took {ms}ms for key user:{uuid}"},
@@ -246,6 +440,26 @@
     {"idPrefix": "co-inv-fri-", "count": 100, "start": "2026-02-06T09:00:00.000Z", "everySeconds": 30, "service": "checkout", "env": "prod", "status": "error", "message": "checkout inventory sync failed: warehouse-api returned 502 after {ms}ms"},
     {"idPrefix": "co-inv-mon-", "count": 45, "start": "2026-02-09T07:00:00.000Z", "everySeconds": 60, "service": "checkout", "env": "prod", "status": "error", "message": "checkout inventory sync failed: warehouse-api returned 502 after {ms}ms"},
     {"idPrefix": "co-npe-", "count": 40, "start": "2026-03-05T13:02:00.000Z", "everySeconds": 15, "service": "checkout", "env": "prod", "status": "error", "message": "payment session creation failed: NullPointerException in CartSerializer after {ms}ms for order {uuid}"}
+  ],
+  "incidentTimelines": {
+    "inc-orders-db-failover": [
+      {"id": "cell-3", "type": "incident_timeline_cells", "attributes": {"cell_type": "incident_status_change", "content": {"message": "Status changed from active to stable"}, "created": "2026-03-05T02:40:00+00:00"}},
+      {"id": "cell-1", "type": "incident_timeline_cells", "attributes": {"cell_type": "markdown", "content": {"content": "Promoted replica orders-db-2 to primary."}, "important": false, "created": "2026-03-05T02:14:00+00:00"}},
+      {"id": "cell-2", "type": "incident_timeline_cells", "attributes": {"cell_type": "markdown", "content": {"content": "Paused the nightly export job: it saturated replica I/O and kept replication behind."}, "important": true, "created": "2026-03-05T02:21:00+00:00"}}
+    ]
+  },
+  "incidentAttachments": {
+    "inc-gateway-cert": [
+      {"id": "att-gateway-pm", "type": "incident_attachments", "attributes": {"attachment": {"documentUrl": "https://app.datadoghq.eu/notebook/7001/Postmortem-IR-48", "title": "Postmortem IR-48"}, "attachment_type": "postmortem", "modified": "2026-02-26T10:00:00+00:00"}},
+      {"id": "att-gateway-link", "type": "incident_attachments", "attributes": {"attachment": {"documentUrl": "https://status.example.com/ir-48", "title": "Status page"}, "attachment_type": "link", "modified": "2026-02-24T09:00:00+00:00"}}
+    ]
+  },
+  "notebooks": [
+    {"type": "notebooks", "id": 7001, "attributes": {"name": "Postmortem IR-48", "status": "published", "cells": [
+      {"id": "c1", "type": "notebook_cells", "attributes": {"definition": {"type": "markdown", "text": "# What happened\nThe intermediate certificate presented by the bank gateway expired at 08:14 UTC, so every TLS handshake from payments failed and card payments were declined."}}},
+      {"id": "c2", "type": "notebook_cells", "attributes": {"definition": {"type": "timeseries", "requests": [{"q": "sum:payments.gateway.errors{env:prod}"}]}}},
+      {"id": "c3", "type": "notebook_cells", "attributes": {"definition": {"type": "markdown", "text": "# Action items\n- Automate renewal of the expired certificate bundle.\n- Alert 30 days before any certificate in the trust store expires.\n- Add a synthetic test that exercises the full TLS chain."}}}
+    ]}}
   ],
   "serviceDefinitions": [
     {"id": "sd-checkout", "type": "service-definition", "attributes": {
