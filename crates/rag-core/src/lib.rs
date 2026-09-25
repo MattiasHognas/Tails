@@ -4,6 +4,7 @@ pub mod datadog;
 pub mod domain;
 pub mod error;
 pub mod live_evidence;
+pub mod log_patterns;
 pub mod openai;
 pub mod planner;
 pub mod qdrant;

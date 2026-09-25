@@ -4,42 +4,104 @@
 //! Texts are placed so those characters straddle the chunk boundary (1800 chars,
 //! ±3) and the 1500-byte prompt excerpt limit (±5 bytes), in titles, messages and
 //! service names. The pipeline must not panic, every stored payload must equal what the
-//! adapters produced (no lossy re-encoding), chunks must reassemble to the original
-//! text, and prompt excerpts must be valid prefixes of the stored text.
+//! adapters produced (no lossy re-encoding), chunks must reassemble to the stored text,
+//! which holds the original message, and prompt excerpts must be valid prefixes of the
+//! stored text.
+//!
+//! Logs are stored as pattern documents whose text starts with a summary before the
+//! sample message; every log here renders a summary of the same length, so the message
+//! is placed relative to its measured offset ([`message_offset`]).
 
 use super::support::{self, Corpus, FakeOpenAi, Store, at, openai::DIM};
 use crate::{CHUNK_OVERLAP, CHUNK_SIZE};
+use rag_core::log_patterns::{LogEvent, group};
 use rag_core::rag_service::EXCERPT_MAX_BYTES;
 use rag_core::text::TRUNCATION_MARKER;
 use serde_json::{Value, json};
 
 const NOW: &str = "2026-03-12T09:00:00Z";
+const LOGGED_AT: &str = "2026-03-11T10:00:00.000Z";
 
 /// Multibyte units: 2-, 3- and 4-byte chars, a combining sequence and a ZWJ emoji.
 const UNITS: [&str; 5] = ["åäö", "決済", "🚀", "e\u{0301}", "👩\u{200D}💻"];
 
 fn log(id: &str, service: &str, message: &str) -> Value {
     json!({"id": id, "type": "log", "attributes": {
-        "service": service, "status": "error", "timestamp": "2026-03-11T10:00:00.000Z",
+        "service": service, "status": "error", "timestamp": LOGGED_AT,
         "message": message, "tags": ["env:prod"]
     }})
 }
 
+/// A fixed-width, letters-only prefix that gives every log its own pattern (padding
+/// alone would not: patterns keep only the first 160 chars).
+fn code(u: usize, i: usize) -> String {
+    format!(
+        "fall{}{} ",
+        (b'g' + u as u8) as char,
+        (b'g' + i as u8) as char
+    )
+}
+
+/// Char and byte offset of the message in a single-log pattern document's text.
+fn message_offset() -> (usize, usize) {
+    let message = format!("{}{}", code(0, 0), "a".repeat(2000));
+    let event = LogEvent {
+        id: "x".into(),
+        timestamp: at(LOGGED_AT),
+        service: "chunk-svc".into(),
+        environment: "prod".into(),
+        status: "error".into(),
+        message: message.clone(),
+    };
+    let text = group(&[event])[0]
+        .to_document("https://app.datadoghq.eu")
+        .text;
+    let byte = text.find(&message).unwrap();
+    (text[..byte].chars().count(), byte)
+}
+
+/// Message whose first multibyte unit starts at char `CHUNK_SIZE + d` of its document.
+fn chunk_message(u: usize, d: usize) -> String {
+    let pad = CHUNK_SIZE - 3 + d - message_offset().0 - code(u, d).len();
+    format!(
+        "{}{}{}{} slut",
+        code(u, d),
+        "a".repeat(pad),
+        UNITS[u].repeat(3),
+        "ö".repeat(50)
+    )
+}
+
+/// Message whose first multibyte unit starts at byte `EXCERPT_MAX_BYTES - 5 + d`.
+fn excerpt_message(u: usize, d: usize) -> String {
+    let pad = EXCERPT_MAX_BYTES - 5 + d - message_offset().1 - code(u, d).len();
+    format!("{}{}{}", code(u, d), "y".repeat(pad), UNITS[u].repeat(3))
+}
+
+/// The text the adapter renders for the single log `raw_id` of `corpus`.
+fn document_text(corpus: &Corpus, raw_id: &str) -> String {
+    let log = corpus.logs.iter().find(|l| l["id"] == raw_id).unwrap();
+    let event = rag_core::datadog::log_event(log).unwrap();
+    group(&[event])[0].to_document("").text
+}
+
 fn corpus() -> Corpus {
     let mut logs = vec![];
-    for (u, unit) in UNITS.iter().enumerate() {
+    for u in 0..UNITS.len() {
         // Around the chunk boundary, counted in chars like the chunker.
-        for k in CHUNK_SIZE - 3..=CHUNK_SIZE + 3 {
-            let text = format!("{}{}{} slut", "a".repeat(k), unit.repeat(3), "ö".repeat(50));
-            logs.push(log(&format!("chunk-{u}-{k}"), "chunk-svc", &text));
+        for d in 0..=6 {
+            logs.push(log(
+                &format!("chunk-{u}-{d}"),
+                "chunk-svc",
+                &chunk_message(u, d),
+            ));
         }
         // Around the prompt excerpt limit, counted in bytes like the excerpt.
-        for b in EXCERPT_MAX_BYTES - 5..=EXCERPT_MAX_BYTES + 1 {
-            let text = format!("{}{}", "y".repeat(b), unit.repeat(3));
+        for d in 0..=6 {
             logs.push(log(
-                &format!("excerpt-{u}-{b}"),
+                &format!("excerpt-{u}-{d}"),
                 &format!("excerpt-{u}"),
-                &text,
+                &excerpt_message(u, d),
             ));
         }
     }
@@ -78,18 +140,20 @@ async fn run_unicode(store: Store) {
             "{id} changed in the round trip"
         );
     }
-    assert_eq!(stored["log_svc-1#c0"].doc.service, "tjänst-å");
+    let svc = corpus.resolve("log_svc-1");
+    assert_eq!(stored[&format!("{svc}#c0")].doc.service, "tjänst-å");
     assert_eq!(stored["monitor_1#c0"].doc.service, "betalning-åäö");
     assert_eq!(
         stored["incident_inc-jp#c0"].doc.title,
         "決済ゲートウェイ タイムアウト 🚨"
     );
 
-    // Chunks respect the size limit and reassemble to the original message.
+    // Chunks respect the size limit and reassemble to the document text, whose sample
+    // is the original message with its multibyte unit on the chunk boundary.
     for (u, unit) in UNITS.iter().enumerate() {
-        for k in CHUNK_SIZE - 3..=CHUNK_SIZE + 3 {
-            let original = format!("{}{}{} slut", "a".repeat(k), unit.repeat(3), "ö".repeat(50));
-            let parent = format!("log_chunk-{u}-{k}");
+        for d in 0..=6 {
+            let original = chunk_message(u, d);
+            let parent = corpus.resolve(&format!("log_chunk-{u}-{d}"));
             let mut rebuilt = String::new();
             for i in 0.. {
                 let Some(c) = stored.get(&format!("{parent}#c{i}")) else {
@@ -99,7 +163,24 @@ async fn run_unicode(store: Store) {
                 let skip = if i == 0 { 0 } else { CHUNK_OVERLAP };
                 rebuilt.extend(c.doc.text.chars().skip(skip));
             }
-            assert_eq!(rebuilt, original, "{parent} does not reassemble");
+            assert_eq!(
+                rebuilt,
+                document_text(&corpus, &format!("chunk-{u}-{d}")),
+                "{parent}"
+            );
+            let at = rebuilt
+                .find(&original)
+                .unwrap_or_else(|| panic!("{parent}: no message"));
+            let unit_at = rebuilt[..at].chars().count() + original.find(unit).unwrap();
+            assert_eq!(unit_at, CHUNK_SIZE - 3 + d, "{parent}");
+        }
+    }
+
+    // Excerpt-boundary documents put their multibyte unit around byte 1500.
+    for (u, unit) in UNITS.iter().enumerate() {
+        for d in 0..=6 {
+            let text = document_text(&corpus, &format!("excerpt-{u}-{d}"));
+            assert_eq!(text.find(unit), Some(EXCERPT_MAX_BYTES - 5 + d));
         }
     }
 
@@ -114,11 +195,20 @@ async fn run_unicode(store: Store) {
         .await;
         assert_eq!(resp["sources"].as_array().unwrap().len(), 7, "{resp}");
         let prompt = fake.script.lock().unwrap().prompts[&question].clone();
+        // An excerpt ends before the next document or, for the last one, the
+        // instructions (pattern texts contain blank lines themselves).
         let excerpts: Vec<&str> = prompt
             .split("Excerpt:\n")
             .skip(1)
-            .map(|rest| rest.split("\n\n").next().unwrap())
+            .map(|rest| {
+                let end = rest
+                    .find("\n\n[DOC #")
+                    .or_else(|| rest.find("\n\n\n"))
+                    .unwrap();
+                &rest[..end]
+            })
             .collect();
+        assert_eq!(excerpts.len(), 7);
         for (source, excerpt) in resp["sources"].as_array().unwrap().iter().zip(&excerpts) {
             let full = &stored[&format!("{}#c0", source["id"].as_str().unwrap())]
                 .doc

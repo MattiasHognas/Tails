@@ -247,6 +247,43 @@ impl Qdrant {
             .collect())
     }
 
+    /// Reads the `Metadata` of the points in `ids` that exist; missing IDs are left out
+    /// of the result. The indexer merges stored log pattern counts with it.
+    pub async fn retrieve_metadata(
+        &self,
+        ids: &[Uuid],
+    ) -> Result<Vec<(Uuid, serde_json::Map<String, serde_json::Value>)>, RagError> {
+        #[derive(Deserialize)]
+        struct Resp {
+            result: Vec<Item>,
+        }
+        #[derive(Deserialize)]
+        struct Item {
+            id: Uuid,
+            #[serde(default)]
+            payload: Option<Payload>,
+        }
+        #[derive(Default, Deserialize)]
+        #[serde(rename_all = "PascalCase")]
+        struct Payload {
+            #[serde(default)]
+            metadata: serde_json::Map<String, serde_json::Value>,
+        }
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let req = serde_json::json!({
+            "ids": ids,
+            "with_payload": ["Metadata"],
+            "with_vector": false,
+        });
+        let v: Resp = self.post_points("qdrant retrieve", "", &req).await?;
+        Ok(v.result
+            .into_iter()
+            .map(|it| (it.id, it.payload.unwrap_or_default().metadata))
+            .collect())
+    }
+
     /// Merges `payload` into the existing points `ids`. Every ID must exist.
     pub async fn set_payload(
         &self,
@@ -749,6 +786,50 @@ mod tests {
         assert!(
             mock_qdrant(server.uri())
                 .retrieve_states(&[])
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn retrieve_metadata_posts_ids_and_reads_metadata() {
+        use wiremock::matchers::{body_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let pattern = point_id("logpattern_1#c0");
+        let bare = point_id("log_2#c0");
+        let missing = point_id("logpattern_3#c0");
+        Mock::given(method("POST"))
+            .and(path("/collections/test/points"))
+            .and(body_json(serde_json::json!({
+                "ids": [pattern, bare, missing],
+                "with_payload": ["Metadata"],
+                "with_vector": false
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [
+                    {"id": pattern, "payload": {"Metadata": {"count": 3, "pattern": "p #"}}},
+                    {"id": bare, "payload": {}}
+                ],
+                "status": "ok"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let found = mock_qdrant(server.uri())
+            .retrieve_metadata(&[pattern, bare, missing])
+            .await
+            .unwrap();
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0].0, pattern);
+        assert_eq!(found[0].1["count"], 3);
+        assert_eq!(found[1], (bare, serde_json::Map::new()));
+        assert!(
+            mock_qdrant(server.uri())
+                .retrieve_metadata(&[])
                 .await
                 .unwrap()
                 .is_empty()

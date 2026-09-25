@@ -123,7 +123,8 @@ async fn check_roundtrip(qdrant: &Qdrant) -> Result<()> {
 }
 
 /// The retrieval scope filter must select events inside the window while keeping
-/// timestamp-less documents and configuration kinds (monitor/dashboard/SLO).
+/// timestamp-less documents and configuration kinds (monitor/dashboard/SLO), and log
+/// patterns whose span overlaps the window.
 async fn check_scope_filter(qdrant: &Qdrant) -> Result<()> {
     let doc = |id: &str, kind: SourceKind, ts: Option<&str>| RagDocument {
         id: id.into(),
@@ -136,7 +137,28 @@ async fn check_scope_filter(qdrant: &Qdrant) -> Result<()> {
         environment: "prod".into(),
         metadata: serde_json::Map::new(),
     };
+    // Log patterns span [Metadata.first_seen, Timestamp].
+    let pattern = |id: &str, first: &str, last: &str| {
+        let mut d = doc(id, SourceKind::Logs, Some(last));
+        d.metadata.insert("first_seen".into(), json!(first));
+        d
+    };
     let docs = [
+        pattern(
+            "pattern_spanning",
+            "2026-09-22T20:00:00.000Z",
+            "2026-09-24T08:00:00.000Z",
+        ),
+        pattern(
+            "pattern_after",
+            "2026-09-23T22:00:00.000Z",
+            "2026-09-24T08:00:00.000Z",
+        ),
+        pattern(
+            "pattern_before",
+            "2026-09-21T10:00:00.000Z",
+            "2026-09-22T21:59:59.999Z",
+        ),
         doc(
             "log_inside",
             SourceKind::Logs,
@@ -189,13 +211,17 @@ async fn check_scope_filter(qdrant: &Qdrant) -> Result<()> {
             "log_untimed",
             "metric_old",
             "monitor",
+            "pattern_spanning",
             "slo"
         ]
     );
 
     scope.kinds = vec![SourceKind::Logs, SourceKind::SLO];
     let hits = qdrant.search(vector, 100, scope.to_qdrant_filter()).await?;
-    assert_eq!(ids(hits), ["log_inside", "log_untimed", "slo"]);
+    assert_eq!(
+        ids(hits),
+        ["log_inside", "log_untimed", "pattern_spanning", "slo"]
+    );
     Ok(())
 }
 
@@ -266,6 +292,12 @@ async fn check_incremental_indexing_calls(qdrant: &Qdrant) -> Result<()> {
             },
         ]
     );
+
+    // Metadata of existing points comes back whole; missing IDs are left out.
+    let metadata = qdrant.retrieve_metadata(&[c0, missing]).await?;
+    assert_eq!(metadata.len(), 1);
+    assert_eq!(metadata[0].0, c0);
+    assert_eq!(metadata[0].1, chunk(10, 0, &long)[0].metadata);
 
     // Shrink: deleting chunks 2.. of one monitor leaves its chunks 0 and 1 and every
     // other document's chunks.

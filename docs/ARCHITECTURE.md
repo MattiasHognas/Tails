@@ -40,8 +40,8 @@ flowchart TB
         resil["resilience: run_stage() timeouts,<br/>send_with_retry() backoff for 429/5xx"]
         oaClient["OpenAiClient<br/>embed() / embed_batch()<br/>chat_json() / chat_complete()"]
         qdClient["Qdrant<br/>search() / upsert()<br/>retrieve_states() / set_payload()<br/>count() / delete_by_filter()"]
-        ddClient["Datadog adapters<br/>indexing: get_monitors() list_dashboards() list_slos()<br/>list_metrics() get_incidents() search_logs()<br/>live: query_metrics() search_log_events()"]
-        chunker["chunk() + stable_id()<br/>content_hash()"]
+        ddClient["Datadog adapters<br/>indexing: get_monitors() list_dashboards() list_slos()<br/>list_metrics() get_incidents() search_logs() (grouped by pattern)<br/>live: query_metrics() search_log_events()"]
+        chunker["chunk() + stable_id()<br/>content_hash() embedding_input()<br/>log_patterns: group / merge"]
         liveCore["live_evidence<br/>discover(): services + metrics from hits<br/>analysis: spikes, drops, gaps, log bursts vs baseline<br/>timeline: observations / hypotheses / missing"]
     end
 
@@ -49,8 +49,8 @@ flowchart TB
         ckLoad["Checkpoints::load()"]
         idx["index_sources()<br/>per source: window() with overlap"]
         fetch["SourceFetcher::fetch()"]
-        dedupe["dedupe_by_id()"]
-        sink["IncrementalSink::index()<br/>chunk + content_hash -> retrieve stored state<br/>skip unchanged; embed_batch -> upsert<br/>(bounded concurrency)<br/>delete surplus chunks; full sync: delete unseen"]
+        dedupe["dedupe_by_id()<br/>logs: merge_log_patterns()<br/>with the stored counts"]
+        sink["IncrementalSink::index()<br/>chunk + content_hash -> retrieve stored state<br/>skip unchanged; embed_batch(header + chunk) -> upsert<br/>(bounded concurrency)<br/>delete surplus chunks; full sync: delete unseen"]
         ckSave["Checkpoints::save()<br/>atomic, only after all writes succeed"]
     end
 
@@ -135,11 +135,14 @@ What each part does:
   - The planner, the retrieval scope and the reranker.
   - `live_evidence`: discovery, deterministic time-series and log analysis, and the
     timeline.
-  - The chunker (stable chunk IDs, so re-indexing overwrites instead of duplicating).
+  - The chunker (stable chunk IDs, so re-indexing overwrites instead of duplicating) and
+    `embedding_input()`, the context header embedded with every chunk.
+  - `log_patterns`: groups error/warning logs by message pattern for indexing.
   - `resilience`: per-stage timeouts, the overall request deadline, and bounded retries
     for 429 and 5xx responses.
 - **rag-indexer**: for each Datadog source, computes a window from that source's
-  checkpoint (with overlap for late data). It then fetches, deduplicates and chunks,
+  checkpoint (with overlap for late data). It then fetches, deduplicates (for logs, merges
+  each message pattern with its stored counts) and chunks,
   skips documents whose stored content hash is unchanged, embeds the rest in batches and
   upserts them, removes obsolete chunks (and, for monitors, dashboards and SLOs, documents
   deleted in Datadog), and advances that source's checkpoint only after success. One
@@ -198,7 +201,10 @@ is how the server interprets a request:
   keyword matches are case-sensitive, so the Datadog adapters store `Service` and
   `Environment` trimmed and lowercased, the form planner and explicit values take. The
   window is a half-open `[from, to)` Qdrant datetime `range` on the RFC 3339 `Timestamp`
-  payload. Documents with no timestamp, and monitors, dashboards, SLOs (whose timestamp,
+  payload. A [log pattern](#log-patterns) spans its first to its last log, so it also
+  matches when `Metadata.first_seen < to` and its `Timestamp` (last log) `>= from`: a
+  pattern that started before "yesterday" and was still logged today is yesterday's
+  evidence too. Documents with no timestamp, and monitors, dashboards, SLOs (whose timestamp,
   if any, is a creation date) and metric catalog entries (stamped with the indexing run's
   time), always pass the time condition, so "yesterday" still surfaces the relevant
   monitor, SLO or metric. Incidents are filtered by creation time. Dashboards and metric
@@ -236,7 +242,8 @@ window and returns what it measured:
   `p5 - max(|p5|/3, 3·stddev)` (`p5 - max(2·|p5|/3, 3·stddev)` for one point). Three or more missing intervals are a *gap*. Fewer than 5 baseline points
   disables spike/drop detection. Logs are counted per ~1/24 of the window (at least one
   minute); a *burst* is a run of buckets with at least `max(5, 3 × median)` events. Top
-  messages are grouped with digits masked.
+  messages are grouped by the same pattern as indexed logs (numbers, UUIDs and IDs
+  masked; see [Log patterns](#log-patterns)).
 - **Hypotheses** are requested from the LLM only when there are observations, and every one
   must cite observation IDs; hypotheses citing none or unknown IDs are dropped. The answer
   prompt receives the timeline and must separate observed facts from hypotheses.
@@ -380,15 +387,16 @@ longer belong to a document are removed. Per source, after the fetch:
 
 1. **Hash.** Each document is chunked and gets a content hash (SHA-256) over all of its
    fields (text, title, URI, kind, timestamp, service, environment, metadata), the chunk
-   size and overlap, and the embedding model (`OPENAI_EMBEDDING_MODEL`). Changing the
-   chunking or the model therefore changes every hash.
+   size and overlap, the embedding model (`OPENAI_EMBEDDING_MODEL`) and a layout version.
+   Changing the chunking, the model or what is embedded therefore changes every hash.
 2. **Look up.** The stored `ContentHash` and `ChunkCount` of chunk points `#c0` to
    `#c{n}` of every document (`n` = its new chunk count) are read in batches of 256 by
    point ID (`POST /collections/{c}/points` with `ids`).
 3. **Skip unchanged.** A document whose chunks `#c0` to `#c{n-1}` all exist with the
    current hash and count is not embedded or rewritten. Points without a hash (written
    before incremental indexing) count as changed.
-4. **Embed and upsert changed documents.** Their chunks are embedded with batched
+4. **Embed and upsert changed documents.** Their chunks, each with its
+   [context header](#embedding-input), are embedded with batched
    requests (array `input`, at most `INDEXER_EMBED_BATCH_SIZE` texts and
    `INDEXER_EMBED_BATCH_MAX_CHARS` characters per request), and each batch is upserted
    with the hash, chunk count and (for full-sync sources) the run's sync ID. At most
@@ -415,6 +423,89 @@ chunk count), how many shrank, and how many stale points were deleted.
 **Upgrading:** points written before incremental indexing have no content hash, so the
 first run after upgrading re-embeds every fetched document once (and deletes monitors,
 dashboards and SLOs that no longer exist in Datadog). Later runs only embed what changed.
+The same happens once whenever the hash layout version changes, as it did when the
+[embedding header](#embedding-input) was added.
+
+### Embedding input
+
+Each chunk is embedded with a short context header in front of its text
+(`rag_core::chunk::embedding_input`):
+
+```text
+[Incident] Checkout latency degradation
+service: checkout · env: prod · severity: SEV-2 · state: resolved
+
+<chunk text>
+```
+
+The header holds the kind, the title, service and environment, and a few fields per kind:
+incident severity and state, log status, monitor type, SLO type and target. Empty fields
+are left out; the title is cut at 300 bytes and other values at 100 (at a char
+boundary), so a header adds at most about 800 chars to an 1800-char chunk, well within the
+per-request `INDEXER_EMBED_BATCH_MAX_CHARS` budget and the model's per-input limit. Every
+chunk of a document gets the header, so chunk 2 of a long runbook still carries its title,
+and a log's vector names its service even when the message does not. Only the vector
+changes: the stored `Text` and the answer prompt are the chunk text as before.
+
+Everything in the header is a document field, so the content hash covers it. The hash
+layout version (`CONTENT_HASH_VERSION`) was bumped when the header was introduced, so the
+first run after upgrading re-embeds every fetched document once.
+
+### Log patterns
+
+Error and warning logs are not indexed one document per log. During an incident Datadog
+returns thousands of near-identical logs, which cost an embedding call each and fill the
+top-K with copies of one message. `search_logs()` groups the logs of a fetch by
+(service, environment, status, message pattern) into one document each
+(`rag_core::log_patterns`):
+
+- **Pattern:** the message with whitespace collapsed, UUIDs as `<uuid>`, hex IDs of 8+
+  chars and alphanumeric IDs of 16+ chars that contain a digit as `<id>`, other ASCII
+  digit runs as `#`, cut at 160 chars. Live evidence groups its top messages the same way.
+- **Document:** ID `logpattern_<stable_id(service, env, status, pattern)>`, so every run
+  updates the same point. The text holds the pattern, the count, first and last time seen,
+  up to 3 distinct sample messages (each cut at 4000 bytes at a char boundary) and the 5
+  most recent log IDs. `Timestamp` is the last log; `Metadata` holds `status`, `pattern`,
+  `count`, `first_seen`, `last_seen`, `samples`, `sample_log_ids` and `minute_counts`. The
+  source link is a Datadog log search for the service, environment and status from the
+  first to the last log.
+- **Time windows:** a pattern matches a question's window when its span
+  `[first_seen, Timestamp]` overlaps it (see [Question pipeline](#question-pipeline)).
+  `Timestamp` alone would drop a pattern that started in the window and was still logged
+  after it, and `first_seen` alone one that started before it.
+
+**Counting across runs.** Log windows overlap by `INDEXER_OVERLAP_MINUTES`, and the fetch
+starts at the whole minute before the window start. Each pattern document keeps the
+per-minute counts of the fetch that wrote it (`minute_counts`). Before indexing, the
+indexer reads the stored `Metadata` of every fetched pattern (`POST
+/collections/{c}/points` with `with_payload: ["Metadata"]`) and combines them:
+
+```text
+count = stored count − stored minutes at or after this fetch's start + this fetch's count
+first seen = min(stored, fetched)    last seen = max(stored, fetched)
+```
+
+So logs in the overlap are counted once, logs that reached Datadog late (within the
+overlap) are added, and re-running a window (for example after a failed checkpoint save)
+changes nothing, so the document is not re-embedded. Samples keep the oldest distinct
+messages, log IDs the most recent. Checkpoints only move forward, so a later fetch never
+starts before the stored minutes. The exception is a checkpoint moved back (a deleted
+checkpoint file or a larger overlap): if the fetch reaches back to the pattern's first log
+it is recounted from scratch, otherwise logs between the fetch start and the stored
+minutes can be counted twice. At most 1440 minutes (a day) are kept per pattern.
+
+A pattern's count changes whenever new logs arrive, so an active pattern is re-embedded
+once per run, not once per log.
+
+**Upgrading:** points written for single logs (`log_<id>`) are not deleted by the indexer
+(logs are windowed, so nothing is deleted there). They age out of relevant time windows;
+to remove them at once:
+
+```bash
+curl -X POST "$QDRANT_ENDPOINT/collections/$QDRANT_COLLECTION/points/delete?wait=true" \
+  -H 'Content-Type: application/json' \
+  -d '{"filter": {"must": [{"key": "Kind", "match": {"value": "logs"}}, {"is_empty": {"key": "Metadata.pattern"}}]}}'
+```
 
 ## Qdrant storage
 
@@ -444,6 +535,7 @@ indexes; for large collections, add them for faster filtering:
 
 ```bash
 curl -X PUT "$QDRANT_ENDPOINT/collections/$QDRANT_COLLECTION/index" -H 'Content-Type: application/json' -d '{"field_name": "Timestamp", "field_schema": "datetime"}'
-# repeat with field_schema "keyword" for Service, Environment, Kind, SyncId and Metadata.chunk_of,
+# repeat with field_schema "datetime" for Metadata.first_seen (log pattern windows),
+# "keyword" for Service, Environment, Kind, SyncId and Metadata.chunk_of,
 # and "integer" for Metadata.chunk_index (used by the indexer's cleanup filters)
 ```

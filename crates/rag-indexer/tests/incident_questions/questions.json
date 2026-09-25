@@ -1,6 +1,6 @@
 {
-  "version": 1,
-  "description": "Incident questions for the /ask quality harness (crates/rag-indexer/src/pipeline_tests/quality.rs). Each question is answered by the real pipeline over corpus.json plus the recorded fixtures, with deterministic embeddings, a canned planner reply ('plan') and a canned answer model that cites 'answer'. See docs/DEVELOPMENT.md#incident-question-set for the metrics and how to add questions or change thresholds.",
+  "version": 2,
+  "description": "Incident questions for the /ask quality harness (crates/rag-indexer/src/pipeline_tests/quality.rs). Each question is answered by the real pipeline over corpus.json plus the recorded fixtures, with deterministic embeddings, a canned planner reply ('plan') and a canned answer model that cites 'answer'. Logs are indexed grouped by message pattern; 'log_<id>' names the pattern document that holds Datadog log <id>. See docs/DEVELOPMENT.md#incident-question-set for the metrics and how to add questions or change thresholds.",
   "defaults": {"now": "2026-03-12T09:00:00Z", "timezone": "Europe/Stockholm"},
   "thresholds": {
     "recallAtK": 0.95,
@@ -243,6 +243,41 @@
         "mustRetrieve": ["dashboard_dash-payments"]
       },
       "answer": {"citeDocuments": ["dashboard_dash-payments"]}
+    },
+    {
+      "id": "q17-inventory-logs-by-service",
+      "question": "Which errors did the inventory service log yesterday?",
+      "note": "The planner leaves the service unset, so only the vector ties logs to 'inventory'. inv-1's message never names its service while an orders log mentions the inventory client; the embedding header carries the service, so inv-1 ranks first.",
+      "plan": {"intent": "semanticLogSearch", "environment": "prod", "filters": ["kind:logs"]},
+      "expect": {
+        "scope": {"service": null, "environment": "prod", "fromUtc": "2026-03-10T23:00:00Z", "toUtc": "2026-03-11T23:00:00Z", "kinds": ["logs"]},
+        "mustRetrieve": ["log_inv-1"]
+      },
+      "answer": {"citeDocuments": ["log_inv-1"]}
+    },
+    {
+      "id": "q18-recommendations-burst",
+      "question": "Why are recommendations timing out this morning?",
+      "note": "300 near-identical cache timeout logs (logBursts rec-burst-) match the rewritten query best. One document per log filled every search candidate and crowded out the monitor and the feature store error; grouped by pattern they are one document.",
+      "plan": {"intent": "rootCauseWindow", "service": "recommendations", "environment": "prod", "rewrittenQuery": "recommendations cache timeout errors",
+               "window": {"fromUtc": "2026-03-12T05:00:00Z", "toUtc": "2026-03-12T09:00:00Z"}},
+      "expect": {
+        "scope": {"service": "recommendations", "environment": "prod", "fromUtc": "2026-03-12T05:00:00Z", "toUtc": "2026-03-12T09:00:00Z", "kinds": []},
+        "mustRetrieve": ["monitor_2001", "log_rec-fs-1"],
+        "mayRetrieve": ["log_rec-burst-0"]
+      },
+      "answer": {"citeDocuments": ["monitor_2001", "log_rec-fs-1"]}
+    },
+    {
+      "id": "q19-runbook-later-chunk",
+      "question": "What does the ledger reconciliation drift runbook say about replica lag?",
+      "note": "The replica lag section is in the second chunk of monitor 3001's runbook, which does not repeat the monitor's name; a short monitor about replica lag on another database competes. With the title embedded in every chunk, the second chunk matches both halves of the question.",
+      "plan": {"intent": "monitorExplanation", "environment": "prod", "filters": ["kind:monitor"]},
+      "expect": {
+        "scope": {"service": null, "environment": "prod", "fromUtc": null, "toUtc": null, "kinds": ["monitor"]},
+        "mustRetrieve": ["monitor_3001"]
+      },
+      "answer": {"citeDocuments": ["monitor_3001"]}
     }
   ]
 }

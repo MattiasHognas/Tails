@@ -12,6 +12,9 @@ use crate::planner::{QueryPlan, Window, format_utc, normalize_filter, parse_utc}
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 
+/// Payload key of a log pattern's first log (RFC 3339).
+const FIRST_SEEN_KEY: &str = "Metadata.first_seen";
+
 /// Kinds that describe configuration or state rather than events. Their `Timestamp`,
 /// when set at all, is a creation date (monitors, dashboards, SLOs) or the time the
 /// indexer last saw the metric active (metric catalog entries), so a time window never
@@ -119,7 +122,10 @@ impl RetrievalScope {
     /// payload (Qdrant's datetime range; no numeric field or payload index is required).
     /// It is wrapped in a `should` so that documents without a timestamp and
     /// [`TIMELESS_KINDS`] still match: a monitor or SLO is relevant evidence for
-    /// "yesterday" even though it is not an event from yesterday.
+    /// "yesterday" even though it is not an event from yesterday. Log pattern documents
+    /// (see [`crate::log_patterns`]) are stamped with their last log and also match when
+    /// their first log (`Metadata.first_seen`) is before the window's end and their last
+    /// is at or after its start.
     pub fn to_qdrant_filter(&self) -> Option<Value> {
         let mut must = vec![];
         if let Some(svc) = &self.service {
@@ -144,10 +150,22 @@ impl RetrievalScope {
                 .iter()
                 .map(SourceKind::payload_value)
                 .collect();
+            // A log pattern spans `[first_seen, Timestamp]` (its last log): it belongs to
+            // the window when that span overlaps it, even if the pattern was still seen
+            // after the window ended.
+            let mut pattern =
+                vec![json!({"key": "Kind", "match": {"value": SourceKind::Logs.payload_value()}})];
+            if let Some(from) = self.from_utc {
+                pattern.push(json!({"key": "Timestamp", "range": {"gte": format_utc(from)}}));
+            }
+            if let Some(to) = self.to_utc {
+                pattern.push(json!({"key": FIRST_SEEN_KEY, "range": {"lt": format_utc(to)}}));
+            }
             must.push(json!({"should": [
                 {"key": "Timestamp", "range": range},
                 {"is_empty": {"key": "Timestamp"}},
                 {"key": "Kind", "match": {"any": timeless}},
+                {"must": pattern},
             ]}));
         }
         (!must.is_empty()).then(|| json!({ "must": must }))
@@ -262,8 +280,30 @@ mod tests {
                         "lt": "2026-09-23T22:00:00Z"
                     }},
                     {"is_empty": {"key": "Timestamp"}},
-                    {"key": "Kind", "match": {"any": ["metrics", "monitor", "dashboard", "sLO"]}}
+                    {"key": "Kind", "match": {"any": ["metrics", "monitor", "dashboard", "sLO"]}},
+                    {"must": [
+                        {"key": "Kind", "match": {"value": "logs"}},
+                        {"key": "Timestamp", "range": {"gte": "2026-09-22T22:00:00Z"}},
+                        {"key": "Metadata.first_seen", "range": {"lt": "2026-09-23T22:00:00Z"}}
+                    ]}
                 ]}
+            ]})
+        );
+    }
+
+    /// A pattern that started before the window's end and was last seen at or after its
+    /// start overlaps it; with an open start only the first log counts.
+    #[test]
+    fn log_patterns_match_when_their_span_overlaps_the_window() {
+        let scope = RetrievalScope {
+            to_utc: Some(ts("2026-09-23T22:00:00Z")),
+            ..Default::default()
+        };
+        assert_eq!(
+            scope.to_qdrant_filter().unwrap()["must"][0]["should"][3],
+            json!({"must": [
+                {"key": "Kind", "match": {"value": "logs"}},
+                {"key": "Metadata.first_seen", "range": {"lt": "2026-09-23T22:00:00Z"}}
             ]})
         );
     }

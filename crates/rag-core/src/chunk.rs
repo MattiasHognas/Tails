@@ -1,5 +1,6 @@
 // crates/rag-core/src/chunk.rs
-use crate::domain::RagDocument;
+use crate::domain::{RagDocument, SourceKind};
+use crate::text::truncate_bytes;
 use sha2::{Digest, Sha256};
 
 /// Stable 16-byte (32 hex chars) ID derived from parts
@@ -15,14 +16,106 @@ pub fn chunk_id(doc_id: &str, index: usize) -> String {
     format!("{doc_id}#c{index}")
 }
 
-/// Version of the [`content_hash`] input layout. Changing it invalidates every stored hash
-/// and so re-embeds everything once.
-const CONTENT_HASH_VERSION: &str = "tails-content-v1";
+/// Version of the [`content_hash`] input layout and of what is embedded for a chunk
+/// ([`embedding_input`]). Changing either invalidates every stored hash and so re-embeds
+/// everything once.
+///
+/// - v1: the chunk text was embedded.
+/// - v2: [`embedding_input`], a context header plus the chunk text, is embedded.
+const CONTENT_HASH_VERSION: &str = "tails-content-v2";
+
+/// Longest title in the embedding header, in bytes (cut at a char boundary).
+const HEADER_TITLE_MAX_BYTES: usize = 300;
+/// Longest field value in the embedding header, in bytes (cut at a char boundary).
+const HEADER_VALUE_MAX_BYTES: usize = 100;
+/// Upper bound of the embedding header's length in chars: the kind label and title, then
+/// at most four fields (service, environment and two metadata values) with their labels.
+pub const EMBEDDING_HEADER_MAX_CHARS: usize =
+    16 + HEADER_TITLE_MAX_BYTES + 4 * (16 + HEADER_VALUE_MAX_BYTES);
+
+/// Label of a kind in the embedding header.
+fn kind_label(kind: &SourceKind) -> &'static str {
+    match kind {
+        SourceKind::Logs => "Log",
+        SourceKind::Metrics => "Metric",
+        SourceKind::Monitor => "Monitor",
+        SourceKind::Incident => "Incident",
+        SourceKind::Dashboard => "Dashboard",
+        SourceKind::SLO => "SLO",
+        SourceKind::Git => "Git",
+    }
+}
+
+/// High-signal metadata per kind as (header label, metadata key).
+fn header_fields(kind: &SourceKind) -> &'static [(&'static str, &'static str)] {
+    match kind {
+        SourceKind::Incident => &[("severity", "severity"), ("state", "state")],
+        SourceKind::Logs => &[("status", "status")],
+        SourceKind::Monitor => &[("type", "monitor_type")],
+        SourceKind::SLO => &[("type", "slo_type"), ("target", "target")],
+        SourceKind::Metrics | SourceKind::Dashboard | SourceKind::Git => &[],
+    }
+}
+
+/// `value` on one line (whitespace collapsed), cut to `max_bytes`.
+fn header_value(value: &str, max_bytes: usize) -> String {
+    let flat = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    truncate_bytes(&flat, max_bytes).to_string()
+}
+
+/// What is embedded for a chunk: a short context header, a blank line, then the chunk
+/// text. The stored `Text` and the answer prompt are unaffected.
+///
+/// ```text
+/// [Incident] Checkout latency above 2s
+/// service: checkout · env: prod · severity: SEV-2 · state: resolved
+///
+/// <chunk text>
+/// ```
+///
+/// Every chunk of a document gets the header, so later chunks of a long document still
+/// carry its title, and a log's vector carries its service even when the message never
+/// names it. Empty fields are left out. Everything in it is a field of `doc`, so
+/// [`content_hash`] covers it; it adds at most [`EMBEDDING_HEADER_MAX_CHARS`] chars.
+pub fn embedding_input(doc: &RagDocument) -> String {
+    let title = header_value(&doc.title, HEADER_TITLE_MAX_BYTES);
+    let mut out = format!("[{}]", kind_label(&doc.kind));
+    if !title.is_empty() {
+        out.push(' ');
+        out.push_str(&title);
+    }
+    let mut fields: Vec<String> = vec![];
+    for (label, value) in [("service", &doc.service), ("env", &doc.environment)] {
+        let value = header_value(value, HEADER_VALUE_MAX_BYTES);
+        if !value.is_empty() {
+            fields.push(format!("{label}: {value}"));
+        }
+    }
+    for (label, key) in header_fields(&doc.kind) {
+        let value = match doc.metadata.get(*key) {
+            Some(serde_json::Value::String(s)) => header_value(s, HEADER_VALUE_MAX_BYTES),
+            Some(serde_json::Value::Number(n)) => n.to_string(),
+            _ => String::new(),
+        };
+        if !value.is_empty() {
+            let unit = if *key == "target" { "%" } else { "" };
+            fields.push(format!("{label}: {value}{unit}"));
+        }
+    }
+    if !fields.is_empty() {
+        out.push('\n');
+        out.push_str(&fields.join(" · "));
+    }
+    out.push_str("\n\n");
+    out.push_str(&doc.text);
+    out
+}
 
 /// Stable hash (64 hex chars) of everything that determines a document's stored points:
 /// every field of `doc` (text, title, URI, kind, timestamp, service, environment and
-/// metadata), the chunking parameters and the embedding model. Object keys are sorted
-/// before hashing, so metadata key order does not matter.
+/// metadata, which includes everything [`embedding_input`] adds), the chunking
+/// parameters and the embedding model. Object keys are sorted before hashing, so
+/// metadata key order does not matter.
 pub fn content_hash(
     doc: &RagDocument,
     max_chars: usize,
@@ -206,6 +299,135 @@ mod tests {
         for (what, hash) in changed {
             assert_ne!(hash, base, "{what} must change the hash");
         }
+    }
+
+    #[test]
+    fn test_embedding_input_header_per_kind() {
+        let mut incident = create_test_doc("Checkout p95 above 2s for 40 minutes.");
+        incident.kind = SourceKind::Incident;
+        incident.title = "Checkout latency".into();
+        incident.service = "checkout".into();
+        incident.environment = "prod".into();
+        incident
+            .metadata
+            .insert("severity".into(), serde_json::json!("SEV-2"));
+        incident
+            .metadata
+            .insert("state".into(), serde_json::json!("resolved"));
+        incident
+            .metadata
+            .insert("customer_impact".into(), serde_json::json!("EU"));
+        assert_eq!(
+            embedding_input(&incident),
+            "[Incident] Checkout latency\n\
+             service: checkout · env: prod · severity: SEV-2 · state: resolved\n\n\
+             Checkout p95 above 2s for 40 minutes."
+        );
+
+        let mut slo = create_test_doc("text");
+        slo.kind = SourceKind::SLO;
+        slo.title = "Checkout availability".into();
+        slo.metadata
+            .insert("slo_type".into(), serde_json::json!("metric"));
+        slo.metadata
+            .insert("target".into(), serde_json::json!(99.9));
+        assert!(
+            embedding_input(&slo).starts_with(
+                "[SLO] Checkout availability\n\
+                 service: test-service · env: test · type: metric · target: 99.9%\n\n"
+            ),
+            "{}",
+            embedding_input(&slo)
+        );
+
+        let mut monitor = create_test_doc("text");
+        monitor.kind = SourceKind::Monitor;
+        monitor
+            .metadata
+            .insert("monitor_type".into(), serde_json::json!("query alert"));
+        assert!(embedding_input(&monitor).contains("· type: query alert\n\n"));
+
+        let mut log = create_test_doc("lock wait timeout exceeded");
+        log.title = "Log: inventory - error".into();
+        log.service = "inventory".into();
+        log.metadata
+            .insert("status".into(), serde_json::json!("error"));
+        assert_eq!(
+            embedding_input(&log),
+            "[Log] Log: inventory - error\nservice: inventory · env: test · status: error\n\n\
+             lock wait timeout exceeded"
+        );
+    }
+
+    #[test]
+    fn test_embedding_input_omits_empty_fields() {
+        let mut dashboard = create_test_doc("Latency overview");
+        dashboard.kind = SourceKind::Dashboard;
+        dashboard.title = "Payments".into();
+        dashboard.service = String::new();
+        dashboard.environment = "  ".into();
+        dashboard
+            .metadata
+            .insert("author".into(), serde_json::json!("a@b.c"));
+        assert_eq!(
+            embedding_input(&dashboard),
+            "[Dashboard] Payments\n\nLatency overview"
+        );
+
+        let mut bare = create_test_doc("x");
+        bare.kind = SourceKind::Incident;
+        bare.title = String::new();
+        bare.service = String::new();
+        bare.environment = String::new();
+        bare.metadata
+            .insert("severity".into(), serde_json::json!(""));
+        bare.metadata
+            .insert("state".into(), serde_json::Value::Null);
+        assert_eq!(embedding_input(&bare), "[Incident]\n\nx");
+    }
+
+    /// Every chunk carries the document's header, so later chunks keep the title.
+    #[test]
+    fn test_embedding_input_is_added_to_every_chunk() {
+        let mut doc = create_test_doc(&"runbook step. ".repeat(40));
+        doc.title = "Ledger reconciliation drift".into();
+        let chunks = chunk(100, 10, &doc);
+        assert!(chunks.len() > 3);
+        for c in &chunks {
+            let input = embedding_input(c);
+            assert!(
+                input.starts_with("[Log] Ledger reconciliation drift\n"),
+                "{input}"
+            );
+            assert!(input.ends_with(&c.text));
+            // The stored text itself is unchanged.
+            assert!(!c.text.contains("Ledger"));
+        }
+    }
+
+    #[test]
+    fn test_embedding_input_header_is_bounded_and_utf8_safe() {
+        let mut doc = create_test_doc("body");
+        doc.kind = SourceKind::Incident;
+        doc.title = format!("{}\n\t{}", "å".repeat(400), "決済".repeat(100));
+        doc.service = "🚀".repeat(200);
+        doc.environment = "e\u{0301}".repeat(200);
+        doc.metadata
+            .insert("severity".into(), serde_json::json!("ö".repeat(300)));
+        doc.metadata
+            .insert("state".into(), serde_json::json!("👩\u{200D}💻".repeat(50)));
+        let input = embedding_input(&doc);
+        let header = input.strip_suffix("\n\nbody").unwrap();
+        assert!(!header.contains('\t'));
+        assert_eq!(header.lines().count(), 2);
+        assert!(
+            header.chars().count() <= EMBEDDING_HEADER_MAX_CHARS,
+            "{} chars",
+            header.chars().count()
+        );
+        // Cuts never leave a dangling combining mark or joiner.
+        assert!(!header.contains(" \u{0301}") && !header.ends_with('\u{200D}'));
+        assert!(header.contains(&"å".repeat(HEADER_TITLE_MAX_BYTES / 2)));
     }
 
     #[test]

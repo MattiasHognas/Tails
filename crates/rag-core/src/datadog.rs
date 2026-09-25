@@ -287,11 +287,14 @@ impl Datadog {
 
     /// Fetches every error/warning log in `[from_iso, to_iso]` with
     /// `POST /api/v2/logs/events/search`, oldest first, following the
-    /// `meta.page.after` cursor until the last page.
+    /// `meta.page.after` cursor until the last page, and returns one document per
+    /// (service, environment, status, message pattern); see [`crate::log_patterns`].
+    /// Logs without a parseable timestamp are skipped.
     pub async fn search_logs(&self, from_iso: &str, to_iso: &str) -> Result<Vec<RagDocument>> {
         let url = format!("{}/api/v2/logs/events/search", self.api_base);
 
-        let mut docs = Vec::new();
+        let mut events = Vec::new();
+        let mut skipped = 0usize;
         let mut cursor: Option<String> = None;
         loop {
             let query = log_search_body(
@@ -319,7 +322,12 @@ impl Datadog {
             let logs = result["data"]
                 .as_array()
                 .ok_or_else(|| anyhow::anyhow!("Unexpected log search response: missing data"))?;
-            docs.extend(logs.iter().map(|log| self.log_document(log)));
+            for log in logs {
+                match log_event(log) {
+                    Some(e) => events.push(e),
+                    None => skipped += 1,
+                }
+            }
 
             // `meta.page.after` is absent on the last page.
             match result["meta"]["page"]["after"].as_str() {
@@ -333,9 +341,17 @@ impl Datadog {
             }
         }
 
-        Ok(docs)
+        if skipped > 0 {
+            tracing::warn!(skipped, "skipped logs without a parseable timestamp");
+        }
+        let app_base = format!("https://app.{}", self.site);
+        Ok(crate::log_patterns::group(&events)
+            .iter()
+            .map(|p| p.to_document(&app_base))
+            .collect())
     }
 
+    /// One log as its own document; live evidence analyses these one by one.
     fn log_document(&self, log: &serde_json::Value) -> RagDocument {
         let id = log["id"].as_str().unwrap_or("").to_string();
         let attrs = &log["attributes"];
@@ -343,18 +359,8 @@ impl Datadog {
         let status = attrs["status"].as_str().unwrap_or("").to_string();
         let timestamp = attrs["timestamp"].as_str().map(|s| s.to_string());
 
-        let tags = attrs["tags"]
-            .as_array()
-            .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
-            .unwrap_or_default();
-
-        // Logs carry the reserved `service` attribute; tags are only a fallback.
-        let service = attrs["service"]
-            .as_str()
-            .map(normalize_scope_value)
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| tag_value(&tags, "service"));
-        let environment = tag_value(&tags, "env");
+        let tags = attr_tags(attrs);
+        let (service, environment) = log_scope(attrs, &tags);
 
         let mut metadata = serde_json::Map::new();
         metadata.insert(
@@ -765,6 +771,42 @@ fn tag_value(tags: &[&str], key: &str) -> String {
         .find_map(|t| t.strip_prefix(key)?.strip_prefix(':'))
         .map(normalize_scope_value)
         .unwrap_or_default()
+}
+
+fn attr_tags(attrs: &serde_json::Value) -> Vec<&str> {
+    attrs["tags"]
+        .as_array()
+        .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
+        .unwrap_or_default()
+}
+
+/// A log's service and environment, normalized like the payload. Logs carry the
+/// reserved `service` attribute; tags are only a fallback.
+fn log_scope(attrs: &serde_json::Value, tags: &[&str]) -> (String, String) {
+    let service = attrs["service"]
+        .as_str()
+        .map(normalize_scope_value)
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| tag_value(tags, "service"));
+    (service, tag_value(tags, "env"))
+}
+
+/// A log from the log search response as the pattern grouping reads it; `None` without
+/// a parseable timestamp.
+pub fn log_event(log: &serde_json::Value) -> Option<crate::log_patterns::LogEvent> {
+    let attrs = &log["attributes"];
+    let timestamp = DateTime::parse_from_rfc3339(attrs["timestamp"].as_str()?)
+        .ok()?
+        .with_timezone(&Utc);
+    let (service, environment) = log_scope(attrs, &attr_tags(attrs));
+    Some(crate::log_patterns::LogEvent {
+        id: log["id"].as_str().unwrap_or("").to_string(),
+        timestamp,
+        service,
+        environment,
+        status: attrs["status"].as_str().unwrap_or("").to_string(),
+        message: attrs["message"].as_str().unwrap_or("").to_string(),
+    })
 }
 
 /// Reads an incident field (`{"type": ..., "value": ...}`) as a string, taking the
@@ -1305,24 +1347,113 @@ mod tests {
             .await
             .unwrap();
 
-        let ids: Vec<_> = docs.iter().map(|d| d.id.as_str()).collect();
+        // Three logs from three pages, one per (status, pattern) group.
+        assert_eq!(docs.len(), 3);
+        let mut ids: Vec<&str> = docs
+            .iter()
+            .flat_map(|d| d.metadata["sample_log_ids"].as_array().unwrap())
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        ids.sort();
         assert_eq!(
             ids,
             [
-                "log_AQAAAYAZdbh47dGwNwAAAABBWUFaZGJyMUFBQ0s4OEN3YmZ1UDJRQUI",
-                "log_AQAAAYAZdboJ7dGwNgAAAABBWUFaZGJyMUFBQ0s4OEN3YmZ1UDJRQUE",
-                "log_AQAAAYAZdboK7dGwOAAAAABBWUFaZGJyMUFBQ0s4OEN3YmZ1UDJRQUM",
+                "AQAAAYAZdbh47dGwNwAAAABBWUFaZGJyMUFBQ0s4OEN3YmZ1UDJRQUI",
+                "AQAAAYAZdboJ7dGwNgAAAABBWUFaZGJyMUFBQ0s4OEN3YmZ1UDJRQUE",
+                "AQAAAYAZdboK7dGwOAAAAABBWUFaZGJyMUFBQ0s4OEN3YmZ1UDJRQUM",
             ]
         );
-        assert_eq!(docs[0].environment, "integrations-lab");
-        assert_eq!(docs[0].metadata["status"], "ok");
+        for d in &docs {
+            assert!(
+                d.id.starts_with(crate::log_patterns::DOC_ID_PREFIX),
+                "{}",
+                d.id
+            );
+            assert_eq!(d.environment, "integrations-lab");
+            assert_eq!(d.metadata["count"], 1);
+        }
+        let ok = docs.iter().find(|d| d.metadata["status"] == "ok").unwrap();
+        assert_eq!(ok.timestamp.as_deref(), Some("2022-04-11T16:29:47.000Z"));
         assert_eq!(
-            docs[0].timestamp.as_deref(),
-            Some("2022-04-11T16:29:47.000Z")
+            ok.metadata["pattern"],
+            "#.#.#.# - - [#/Apr/#:#:#:# +#] \"GET / HTTP/#.#\" # # #.#"
+        );
+        assert!(
+            ok.source_uri.starts_with(
+                "https://app.datadoghq.com/logs?query=env%3Aintegrations-lab%20status%3Aok&from_ts="
+            ),
+            "{}",
+            ok.source_uri
+        );
+        let last = docs
+            .iter()
+            .filter_map(|d| d.timestamp.as_deref())
+            .max()
+            .unwrap();
+        assert_eq!(last, "2022-04-11T16:29:47.402Z");
+    }
+
+    /// Logs differing only in numbers and IDs become one document with their count.
+    #[tokio::test]
+    async fn test_search_logs_groups_repeated_messages() {
+        let server = MockServer::start().await;
+        let log = |id: &str, ts: &str, msg: &str| {
+            serde_json::json!({"id": id, "type": "log", "attributes": {
+                "service": "Checkout", "status": "error", "timestamp": ts,
+                "message": msg, "tags": ["env:prod"]}})
+        };
+        let mut data: Vec<serde_json::Value> = (0..250)
+            .map(|i| {
+                log(
+                    &format!("id-{i}"),
+                    &format!("2022-04-11T16:{:02}:{:02}.000Z", i / 60, i % 60),
+                    &format!(
+                        "timeout after {}ms for order {:08x}-e29b-41d4-a716-446655440000",
+                        900 + i,
+                        i
+                    ),
+                )
+            })
+            .collect();
+        data.push(log(
+            "other",
+            "2022-04-11T16:30:00.000Z",
+            "db pool exhausted",
+        ));
+        data.push(log("no-ts", "not a time", "db pool exhausted"));
+        Mock::given(method("POST"))
+            .and(path("/api/v2/logs/events/search"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"data": data, "meta": {"page": {}}})),
+            )
+            .mount(&server)
+            .await;
+
+        let docs = mock_client(&server)
+            .search_logs("2022-04-11T16:00:00Z", "2022-04-11T17:00:00Z")
+            .await
+            .unwrap();
+        assert_eq!(docs.len(), 2);
+        let timeouts = docs
+            .iter()
+            .find(|d| d.metadata["pattern"] == "timeout after #ms for order <uuid>")
+            .unwrap();
+        assert_eq!(timeouts.metadata["count"], 250);
+        assert_eq!(timeouts.service, "checkout");
+        assert_eq!(timeouts.metadata["first_seen"], "2022-04-11T16:00:00.000Z");
+        assert_eq!(
+            timeouts.timestamp.as_deref(),
+            Some("2022-04-11T16:04:09.000Z")
         );
         assert_eq!(
-            docs[2].timestamp.as_deref(),
-            Some("2022-04-11T16:29:47.402Z")
+            timeouts.metadata["samples"].as_array().unwrap().len(),
+            crate::log_patterns::MAX_SAMPLES
+        );
+        let pool = docs.iter().find(|d| d.id != timeouts.id).unwrap();
+        assert_eq!(
+            pool.metadata["count"], 1,
+            "the log without a timestamp is skipped"
         );
     }
 
@@ -1341,7 +1472,11 @@ mod tests {
             .search_logs("2022-04-11T16:00:00Z", "2022-04-11T17:00:00Z")
             .await
             .unwrap();
-        assert_eq!(docs.len(), 2);
+        let counted: u64 = docs
+            .iter()
+            .map(|d| d.metadata["count"].as_u64().unwrap())
+            .sum();
+        assert_eq!(counted, 2);
     }
 
     #[tokio::test]
@@ -1400,8 +1535,15 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(docs[0].service, "sinatra-app");
-        assert_eq!(docs[1].service, "");
+        let service_of = |status: &str| {
+            docs.iter()
+                .find(|d| d.metadata["status"] == status)
+                .unwrap()
+                .service
+                .clone()
+        };
+        assert_eq!(service_of("ok"), "sinatra-app");
+        assert_eq!(service_of("info"), "");
     }
 
     #[tokio::test]

@@ -19,7 +19,7 @@
 use anyhow::Result;
 use futures::{StreamExt, TryStreamExt, stream};
 use rag_core::{
-    chunk::{chunk, chunk_id, content_hash},
+    chunk::{chunk, chunk_id, content_hash, embedding_input},
     domain::{RagDocument, SourceKind},
     openai::{OpenAiClient, embedding_batches},
     qdrant::{
@@ -29,6 +29,9 @@ use rag_core::{
 };
 use std::collections::HashMap;
 use uuid::Uuid;
+
+/// A stored point's `Metadata`.
+pub type Metadata = serde_json::Map<String, serde_json::Value>;
 
 /// Points per Qdrant upsert request
 const UPSERT_BATCH_SIZE: usize = 64;
@@ -47,6 +50,8 @@ pub trait Embedder {
 pub trait PointStore {
     /// Bookkeeping of the points in `ids` that exist.
     async fn retrieve(&self, ids: &[Uuid]) -> Result<Vec<StoredPointState>>;
+    /// `Metadata` of the points in `ids` that exist.
+    async fn retrieve_metadata(&self, ids: &[Uuid]) -> Result<Vec<(Uuid, Metadata)>>;
     async fn upsert(&self, points: Vec<QPoint>) -> Result<()>;
     /// Deletes chunks `from_index..` of document `doc_id`.
     async fn delete_surplus(
@@ -76,6 +81,10 @@ impl Embedder for OpenAiClient {
 impl PointStore for Qdrant {
     async fn retrieve(&self, ids: &[Uuid]) -> Result<Vec<StoredPointState>> {
         Ok(self.retrieve_states(ids).await?)
+    }
+
+    async fn retrieve_metadata(&self, ids: &[Uuid]) -> Result<Vec<(Uuid, Metadata)>> {
+        Ok(Qdrant::retrieve_metadata(self, ids).await?)
     }
 
     async fn upsert(&self, points: Vec<QPoint>) -> Result<()> {
@@ -191,7 +200,9 @@ impl<E: Embedder, S: PointStore> IncrementalSink<E, S> {
         stats.unchanged = plans.iter().filter(|p| p.unchanged).count();
         stats.embedded_docs = plans.len() - stats.unchanged;
         stats.embedded_chunks = changed.len();
-        let texts: Vec<String> = changed.iter().map(|(c, _, _)| c.text.clone()).collect();
+        // The vector carries a context header (kind, title, service, environment, key
+        // metadata); the stored `Text` stays the chunk text.
+        let texts: Vec<String> = changed.iter().map(|(c, _, _)| embedding_input(c)).collect();
         let batches = embedding_batches(
             &texts,
             self.params.embed_batch_size,
@@ -260,6 +271,24 @@ impl<E: Embedder, S: PointStore> IncrementalSink<E, S> {
             stats.deleted_stale = self.delete_unseen(kind, sync_id, docs.is_empty()).await?;
         }
         Ok(stats)
+    }
+
+    /// The stored metadata of the first chunk of each of `doc_ids` that is indexed.
+    pub async fn stored_metadata(&self, doc_ids: &[String]) -> Result<HashMap<String, Metadata>> {
+        let by_point: HashMap<Uuid, &String> = doc_ids
+            .iter()
+            .map(|id| (point_id(&chunk_id(id, 0)), id))
+            .collect();
+        let ids: Vec<Uuid> = by_point.keys().copied().collect();
+        Ok(stream::iter(ids.chunks(LOOKUP_BATCH_SIZE))
+            .map(|ids| self.store.retrieve_metadata(ids))
+            .buffer_unordered(self.concurrency())
+            .try_collect::<Vec<_>>()
+            .await?
+            .into_iter()
+            .flatten()
+            .filter_map(|(id, md)| Some((by_point.get(&id)?.to_string(), md)))
+            .collect())
     }
 
     /// Chunks and hashes `docs` and compares them with the stored points.
@@ -446,6 +475,15 @@ pub mod fakes {
                 .collect())
         }
 
+        async fn retrieve_metadata(&self, ids: &[Uuid]) -> Result<Vec<(Uuid, Metadata)>> {
+            let points = self.points.lock().unwrap();
+            Ok(ids
+                .iter()
+                .filter_map(|id| points.get(id))
+                .map(|p| (p.id, p.payload.metadata.clone()))
+                .collect())
+        }
+
         async fn upsert(&self, points: Vec<QPoint>) -> Result<()> {
             self.upsert_in_flight.hold().await;
             let mut stored = self.points.lock().unwrap();
@@ -621,7 +659,58 @@ mod tests {
 
         let stats = sink.index(&[legacy], &SyncScope::Window).await.unwrap();
         assert_eq!(stats.embedded_docs, 1);
-        assert_eq!(sink.embedder.embedded_texts(), ["short"]);
+        assert_eq!(
+            sink.embedder.embedded_texts(),
+            ["[Log] Title log_a\nservice: svc · env: prod\n\nshort"]
+        );
+    }
+
+    /// Every chunk is embedded with its document's header; the stored text stays the
+    /// chunk text.
+    #[tokio::test]
+    async fn chunks_are_embedded_with_the_context_header() {
+        let sink = sink();
+        let mut d = doc(
+            "incident_1",
+            SourceKind::Incident,
+            "first part, second part",
+        );
+        d.metadata.insert("severity".into(), "SEV-1".into());
+        sink.index(std::slice::from_ref(&d), &SyncScope::Window)
+            .await
+            .unwrap();
+        let chunks = chunk(10, 2, &d);
+        assert!(chunks.len() > 2);
+        let embedded = sink.embedder.embedded_texts();
+        assert_eq!(embedded.len(), chunks.len());
+        let stored = sink.store.points.lock().unwrap();
+        for (c, text) in chunks.iter().zip(&embedded) {
+            assert_eq!(
+                *text,
+                format!(
+                    "[Incident] Title incident_1\nservice: svc · env: prod · severity: SEV-1\n\n{}",
+                    c.text
+                )
+            );
+            assert_eq!(stored[&point_id(&c.id)].payload.text, c.text);
+        }
+    }
+
+    #[tokio::test]
+    async fn stored_metadata_reads_the_first_chunk_of_indexed_documents() {
+        let sink = sink();
+        let mut d = doc("logpattern_a", SourceKind::Logs, &"x".repeat(30));
+        d.metadata.insert("count".into(), 7.into());
+        sink.index(std::slice::from_ref(&d), &SyncScope::Window)
+            .await
+            .unwrap();
+        let found = sink
+            .stored_metadata(&["logpattern_a".into(), "logpattern_missing".into()])
+            .await
+            .unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found["logpattern_a"]["count"], 7);
+        assert_eq!(found["logpattern_a"]["chunk_index"], 0);
     }
 
     #[tokio::test]
@@ -770,13 +859,16 @@ mod tests {
     #[tokio::test]
     async fn embedding_requests_respect_size_and_char_budget() {
         let mut sink = sink();
-        sink.params.embed_batch_size = 3;
-        sink.params.embed_batch_max_chars = 25;
-        // Ten 10-char chunks from two documents.
+        // Ten 10-char chunks from two documents; each input also carries its header, and
+        // the budget fits two inputs.
         let docs = [
             doc("log_a", SourceKind::Logs, &"a".repeat(42)),
             doc("log_b", SourceKind::Logs, &"b".repeat(42)),
         ];
+        let input = embedding_input(&chunk(10, 2, &docs[0])[0]).chars().count();
+        let budget = 2 * input + 1;
+        sink.params.embed_batch_size = 3;
+        sink.params.embed_batch_max_chars = budget;
         sink.index(&docs, &SyncScope::Window).await.unwrap();
 
         let requests = sink.embedder.requests.lock().unwrap();
@@ -785,7 +877,8 @@ mod tests {
         for r in requests.iter() {
             assert!(r.len() <= 3, "{} inputs", r.len());
             let chars: usize = r.iter().map(|t| t.chars().count()).sum();
-            assert!(chars <= 25, "{chars} chars");
+            assert!(chars <= budget, "{chars} chars");
+            assert!(r.len() <= 2, "{} inputs", r.len());
         }
     }
 

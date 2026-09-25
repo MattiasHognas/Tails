@@ -6,14 +6,17 @@ mod pipeline_tests;
 use anyhow::Result;
 use checkpoint::{Checkpoints, Window};
 use chrono::{DateTime, Duration, Utc};
-use incremental::{Embedder, IncrementalSink, IndexParams, IndexStats, PointStore, SyncScope};
+use incremental::{
+    Embedder, IncrementalSink, IndexParams, IndexStats, Metadata, PointStore, SyncScope,
+};
 use rag_core::{
     datadog::Datadog,
     domain::{RagDocument, SourceKind},
+    log_patterns,
     openai::OpenAiClient,
     qdrant::Qdrant,
 };
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 /// Maximum characters per chunk
@@ -91,6 +94,8 @@ trait SourceFetcher {
 /// every write (upserts and deletes) succeeded.
 trait DocumentSink {
     async fn index(&self, docs: &[RagDocument], scope: &SyncScope) -> Result<IndexStats>;
+    /// Stored metadata of the documents in `doc_ids` that are indexed.
+    async fn stored_metadata(&self, doc_ids: &[String]) -> Result<HashMap<String, Metadata>>;
 }
 
 impl SourceFetcher for Datadog {
@@ -104,7 +109,11 @@ impl SourceFetcher for Datadog {
             Source::Slos => self.list_slos().await,
             Source::Metrics => self.list_metrics(&from_iso, &to_iso).await,
             Source::Incidents => self.get_incidents(&from_iso, &to_iso).await,
-            Source::Logs => self.search_logs(&from_iso, &to_iso).await,
+            // From a whole minute, so pattern counts line up across runs.
+            Source::Logs => {
+                let from = log_patterns::fetch_start(window.from).to_rfc3339();
+                self.search_logs(&from, &to_iso).await
+            }
         }
     }
 }
@@ -113,6 +122,31 @@ impl<E: Embedder, S: PointStore> DocumentSink for IncrementalSink<E, S> {
     async fn index(&self, docs: &[RagDocument], scope: &SyncScope) -> Result<IndexStats> {
         IncrementalSink::index(self, docs, scope).await
     }
+
+    async fn stored_metadata(&self, doc_ids: &[String]) -> Result<HashMap<String, Metadata>> {
+        IncrementalSink::stored_metadata(self, doc_ids).await
+    }
+}
+
+/// Log pattern documents count only the logs of this run's fetch. Combines each with
+/// its stored point, so the stored count, first and last time seen cover every run and
+/// logs in the overlap with the previous run are counted once (see
+/// [`rag_core::log_patterns`]).
+async fn merge_log_patterns(
+    sink: &impl DocumentSink,
+    docs: Vec<RagDocument>,
+    window: &Window,
+) -> Result<Vec<RagDocument>> {
+    let ids: Vec<String> = docs.iter().map(|d| d.id.clone()).collect();
+    let stored = sink.stored_metadata(&ids).await?;
+    let start = log_patterns::fetch_start(window.from);
+    Ok(docs
+        .into_iter()
+        .map(|d| match stored.get(&d.id) {
+            Some(md) => log_patterns::merge_document(d, md, start),
+            None => d,
+        })
+        .collect())
 }
 
 /// Drops documents whose id was already seen, keeping the first occurrence. Overlapping
@@ -160,7 +194,10 @@ async fn index_sources(
 
         // A failed fetch never reaches the sink, so it can't delete anything.
         let result = async {
-            let docs = dedupe_by_id(fetcher.fetch(source, &window).await?);
+            let mut docs = dedupe_by_id(fetcher.fetch(source, &window).await?);
+            if source == Source::Logs {
+                docs = merge_log_patterns(sink, docs, &window).await?;
+            }
             sink.index(&docs, &source.sync_scope(&sync_id)).await
         }
         .await;
@@ -277,7 +314,6 @@ mod tests {
     use super::*;
     use incremental::fakes::{FakeEmbedder, FakeStore};
     use rag_core::{chunk::chunk, qdrant::QPoint};
-    use std::collections::HashMap;
     use std::sync::Mutex;
 
     fn chunk_documents(docs: &[RagDocument]) -> Vec<RagDocument> {
@@ -455,6 +491,10 @@ mod tests {
                 embedded_chunks: chunks.len(),
                 ..IndexStats::default()
             })
+        }
+
+        async fn stored_metadata(&self, _: &[String]) -> Result<HashMap<String, Metadata>> {
+            Ok(HashMap::new())
         }
     }
 
@@ -809,6 +849,138 @@ mod tests {
 
         assert_eq!(sink.embedder.embedded_texts().len(), embedded);
         assert_eq!(sink.store.chunk_ids(), ["log_a#c0", "monitor_1#c0"]);
+    }
+
+    /// Serves error logs like Datadog: those in the fetched range, grouped by pattern.
+    struct LogFetcher {
+        events: Mutex<Vec<log_patterns::LogEvent>>,
+    }
+
+    impl SourceFetcher for LogFetcher {
+        async fn fetch(&self, source: Source, window: &Window) -> Result<Vec<RagDocument>> {
+            if source != Source::Logs {
+                return Ok(vec![]);
+            }
+            let from = log_patterns::fetch_start(window.from);
+            let events: Vec<_> = self
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|e| e.timestamp >= from && e.timestamp <= window.to)
+                .cloned()
+                .collect();
+            Ok(log_patterns::group(&events)
+                .iter()
+                .map(|p| p.to_document("https://app.datadoghq.eu"))
+                .collect())
+        }
+    }
+
+    fn log_event(id: &str, at: &str) -> log_patterns::LogEvent {
+        log_patterns::LogEvent {
+            id: id.into(),
+            timestamp: ts(at),
+            service: "checkout".into(),
+            environment: "prod".into(),
+            status: "error".into(),
+            // Messages differ only in a number, so every log is one pattern.
+            message: format!("cache miss for key {}", 4711 * id.len()),
+        }
+    }
+
+    /// Stored state of the only log pattern point.
+    fn stored_pattern(sink: &IncrementalSink<FakeEmbedder, FakeStore>) -> RagDocument {
+        let points = sink.store.points.lock().unwrap();
+        let logs: Vec<_> = points
+            .values()
+            .filter(|p| p.payload.kind == SourceKind::Logs)
+            .collect();
+        assert_eq!(logs.len(), 1, "one point per pattern");
+        RagDocument::from(logs[0].payload.clone())
+    }
+
+    /// Runs overlap by `INDEXER_OVERLAP_MINUTES`; a pattern seen in both is one point that
+    /// counts every log once, including one that reached Datadog after the first run.
+    #[tokio::test]
+    async fn test_log_patterns_count_each_log_once_across_overlapping_runs() {
+        let path = temp_checkpoint("log-patterns");
+        let fetcher = LogFetcher {
+            events: Mutex::new(vec![
+                log_event("1", "2025-01-01T10:45:00Z"),
+                log_event("2", "2025-01-01T11:30:00Z"),
+                log_event("3", "2025-01-01T11:55:00Z"),
+            ]),
+        };
+        let sink = incremental_sink();
+        let mut checkpoints = Checkpoints::default();
+        let first = ts("2025-01-01T12:00:00Z");
+        assert!(
+            index_sources(&fetcher, &sink, &mut checkpoints, &path, &config(), first)
+                .await
+                .is_empty()
+        );
+        assert_eq!(stored_pattern(&sink).metadata["count"], 3);
+
+        // Before the next run (window 11:50..12:15:30): a late log inside the overlap and
+        // a new one.
+        fetcher.events.lock().unwrap().extend([
+            log_event("late", "2025-01-01T11:58:00Z"),
+            log_event("4", "2025-01-01T12:10:00Z"),
+        ]);
+        let before_second = checkpoints.clone();
+        let second = ts("2025-01-01T12:15:30Z");
+        assert!(
+            index_sources(&fetcher, &sink, &mut checkpoints, &path, &config(), second)
+                .await
+                .is_empty()
+        );
+        let window = checkpoint::window(
+            before_second.get("logs"),
+            second,
+            config().lookback,
+            config().overlap,
+        );
+        assert_eq!(window.from, ts("2025-01-01T11:50:00Z"));
+        let doc = stored_pattern(&sink);
+        assert_eq!(doc.metadata["count"], 5);
+        assert_eq!(doc.metadata["first_seen"], "2025-01-01T10:45:00.000Z");
+        assert_eq!(doc.metadata["last_seen"], "2025-01-01T12:10:00.000Z");
+        assert_eq!(doc.timestamp.as_deref(), Some("2025-01-01T12:10:00.000Z"));
+        assert!(
+            doc.text.contains("Occurrences: 5 error log(s)"),
+            "{}",
+            doc.text
+        );
+
+        // The same window again (the checkpoint save failed): nothing changes and nothing
+        // is embedded.
+        let embedded = sink.embedder.embedded_texts().len();
+        let mut retry = before_second;
+        index_sources(&fetcher, &sink, &mut retry, &path, &config(), second).await;
+        assert_eq!(sink.embedder.embedded_texts().len(), embedded);
+        assert_eq!(stored_pattern(&sink).metadata["count"], 5);
+    }
+
+    /// Chunks plus the embedding header stay far below the per-request budget and the
+    /// per-input token limit (8192 tokens; one char is at most about one token).
+    #[test]
+    fn test_embedding_inputs_fit_the_batch_budget() {
+        let longest = CHUNK_SIZE + rag_core::chunk::EMBEDDING_HEADER_MAX_CHARS;
+        assert!(longest < 4000, "{longest}");
+        assert!(longest * 16 <= EMBED_BATCH_MAX_CHARS);
+        let mut doc = create_test_doc();
+        doc.kind = SourceKind::Incident;
+        doc.title = "å".repeat(1000);
+        doc.service = "s".repeat(500);
+        doc.environment = "e".repeat(500);
+        doc.metadata
+            .insert("severity".into(), "v".repeat(500).into());
+        doc.metadata.insert("state".into(), "w".repeat(500).into());
+        doc.text = "x".repeat(CHUNK_SIZE * 2);
+        for c in chunk(CHUNK_SIZE, CHUNK_OVERLAP, &doc) {
+            assert!(rag_core::chunk::embedding_input(&c).chars().count() <= longest);
+        }
     }
 
     #[tokio::test]
