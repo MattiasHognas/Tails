@@ -67,6 +67,8 @@ RAG_TOPK_DEFAULT=16
 RAG_TOPK_MAX=32
 RAG_TOPK_FIXED=              # optional: always use this K (1-64)
 RAG_SEARCH_CANDIDATES=64
+RAG_FUSION=rrf               # rrf|dbsf: how dense and keyword results are fused (docs/ARCHITECTURE.md#retrieval-and-ranking)
+RAG_KEYWORD_STOPWORDS=off    # on|off: drop English function words from keyword queries (documents unchanged)
 
 # Timeouts, deadlines and retries (optional; milliseconds)
 RAG_HTTP_CONNECT_TIMEOUT_MS=5000     # per connection attempt (OpenAI + Qdrant clients)
@@ -312,11 +314,15 @@ the writer sent and evaluates the filter subset Tails uses (`must`/`should`/`mus
 `match` value/any/except, numeric and datetime `range`, `is_empty`, `is_null`, `has_id`)
 and the hybrid query: a collection of named cosine dense and IDF sparse vectors, and
 `POST /points/query` with filtered dense and sparse prefetches fused by reciprocal rank
-fusion, scored the way Qdrant 1.19 scores them (sparse: `Σ query value · idf · stored
-value` over shared indices, `idf = ln(1 + (N − n + 0.5)/(n + 0.5))` over the collection;
-fusion: `Σ 1/(k + rank)`; equal scores, which Qdrant orders arbitrarily, by point ID).
-`support::qdrant::tests` checks these scores against hand-computed values, on the fake
-and (ignored by default) on a real Qdrant. Anything else, such as the old unnamed
+fusion or distribution-based score fusion, scored the way Qdrant 1.19 scores them
+(sparse: `Σ query value · idf · stored value` over shared indices,
+`idf = ln(1 + (N − n + 0.5)/(n + 0.5))` over the collection; RRF: `Σ 1/(k + rank)`;
+DBSF: per list `(s − μ + 3σ) / 6σ` with Welford's mean and sample σ in f32, unclipped,
+0.5 for one point or equal scores, summed; equal scores, which Qdrant orders
+arbitrarily, by point ID). `support::qdrant::tests` checks these scores against
+hand-computed values (including ties, one-point lists, points missing from a list and
+an outlier beyond 3σ), on the fake and (ignored by default, `query_api_matches_real_qdrant`
+and `dbsf_matches_real_qdrant`) on a real Qdrant. Anything else, such as the old unnamed
 vector, a plain `points/search` or another fusion, it rejects and the test fails. Each test also has a `*_real_qdrant`
 variant, ignored by default, that uses a fresh collection on `QDRANT_TEST_ENDPOINT`.
 
@@ -335,7 +341,8 @@ QDRANT_TEST_ENDPOINT=http://localhost:6333 cargo test -p rag-indexer --bin rag-i
   --ignored --exact pipeline_tests::contract::pipeline_contract_real_qdrant \
   pipeline_tests::unicode::unicode_round_trip_real_qdrant \
   pipeline_tests::quality::incident_questions_real_qdrant \
-  pipeline_tests::support::qdrant::tests::query_api_matches_real_qdrant
+  pipeline_tests::support::qdrant::tests::query_api_matches_real_qdrant \
+  pipeline_tests::support::qdrant::tests::dbsf_matches_real_qdrant
 ```
 
 The tests live in the indexer's binary crate (a `#[cfg(test)]` module), because that is
@@ -397,8 +404,10 @@ cargo test -p rag-indexer incident_questions_in_memory -- --nocapture
 ```
 
 ```
-question                     recall prec@R exclude scope   cites  intent   obs  evid srcs  notes
-q01-checkout-slow-yesterday    1.00   1.00     8/8    ok     5/5     5/5   2/2   0/0    5
+incident questions v4 | store: in-memory fake Qdrant | fusion=rrf stopwords=off | models: ...
+question                     recall prec@R margin exclude scope   cites  intent   obs  evid srcs  notes
+q01-checkout-slow-yesterday    1.00   1.00      -     8/8    ok     5/5     5/5   2/2   0/0    6
+q09-checkout-march-2           1.00   1.00  1.284     4/4    ok     1/1     1/1   0/0   0/0    4
 ...
 aggregate over 36 questions (known gaps excluded):
   recall@k                   1.000 (threshold 0.95)
@@ -406,7 +415,11 @@ aggregate over 36 questions (known gaps excluded):
 
 - `recall`: share of `mustRetrieve` among `sources` (k = every source given to the
   answer model). `prec@R`: share of the first R sources that are must/may documents,
-  R = number of `mustRetrieve`. `exclude`: `mustNotRetrieve` kept out of `sources`.
+  R = number of `mustRetrieve`. `margin` (not thresholded): the lowest reranked score of
+  a retrieved `mustRetrieve` source over the highest score of a source that is neither
+  must nor may, from the prompt's `Score:` lines; above 1 the answer ranks first, and
+  the closer to 1 the more fragile that is (`-` when there is nothing to compare).
+  `exclude`: `mustNotRetrieve` kept out of `sources`.
   `scope`: the response's `scope` equals the expected keys.
 - `cites`: citations in the answer that resolve / all citations (deliberate negative
   controls excluded). `intent`: intended citations that point at the intended document
@@ -437,6 +450,19 @@ observation IDs are assigned chronologically, so run once and read the collected
 observations in `notes` before writing `expect.timeline`. A question documenting a
 known limitation gets `"knownGap": "<why>"`: it is reported but not counted, and the
 report says when it starts passing.
+
+**Comparing retrieval configurations:** the harness's API reads `RAG_FUSION` and
+`RAG_KEYWORD_STOPWORDS` like `rag-api` (the report's first line names them), so run it
+once per configuration and compare the aggregates and the per-question `margin`:
+
+```bash
+for f in rrf dbsf; do for s in off on; do
+  RAG_FUSION=$f RAG_KEYWORD_STOPWORDS=$s cargo test -p rag-indexer --bin rag-indexer \
+    incident_questions_in_memory -- --nocapture > "report-$f-$s.txt"
+done; done
+```
+
+With real embeddings, use `E2E_COMPARE` of the [end-to-end run](#end-to-end-tests).
 
 **Changing thresholds:** thresholds are the committed floor, not the current score. Raise
 one when a change improves the aggregate for good. Lower one only together with the
@@ -527,6 +553,23 @@ model's query instruction, bge's by default; empty for a model without one), `TE
 cache), `FAKES_ADDR` (default `127.0.0.1:8900`), `API_ADDR` (where the started `rag-api`
 listens via `RAG_API_ADDR`, default `127.0.0.1:5191`), `E2E_SKIP_BUILD=1`, `E2E_KEEP=1`
 (keep the collection and the logs). Both addresses must be free.
+
+**Comparing query-side configurations:** fusion (`RAG_FUSION`) and keyword stopwords
+(`RAG_KEYWORD_STOPWORDS`) only change how `rag-api` queries, so one index serves them
+all. `E2E_COMPARE` lists further configurations as `fusion:stopwords`; after the main
+run (the configuration in the environment, else the defaults), `tails-e2e` asks every
+question again under each, and `scripts/e2e_compare.py` prints their aggregates side by
+side and every question whose recall, precision@R, excluded distractors or `margin`
+differs. Only the main run decides the exit status. The CI job compares the defaults
+with the other three combinations:
+
+```bash
+E2E_COMPARE="dbsf:off rrf:on dbsf:on" E2E_DOCKER=qdrant,tei scripts/e2e.sh
+```
+
+For a question whose must-retrieve documents are not all ranked first, `tails-e2e`
+also prints ("explain") the top documents of dense and keyword search alone, the fused
+hybrid search under the run's configuration, and the reranked scores.
 
 The model is pinned to a Hugging Face commit (`TEI_MODEL_REVISION`, passed to TEI as
 `REVISION`), because the e2e thresholds were measured with it and a new upload of the same

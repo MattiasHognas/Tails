@@ -23,7 +23,12 @@
 //!   `tf·(k1+1) / (tf + k1·(1 − b + b·len/avg_len))` with `k1` = 1.2, `b` = 0.75 and a
 //!   fixed `avg_len` of [`AVG_DOC_TOKENS`], so repeating a word saturates and long
 //!   chunks do not win by length alone.
-//! - **Query values** ([`query_vector`]): 1 per distinct token.
+//! - **Query values** ([`query_vector`]): 1 per distinct token. Optionally
+//!   (`RAG_KEYWORD_STOPWORDS=on`, [`query_vector_without_stopwords`]) without the
+//!   English function words of [`QUERY_STOPWORDS`]: in a collection of logs and
+//!   incidents a word like "did" or "which" can be rare enough for a high IDF, so a
+//!   question's grammar would outweigh its subject. Only queries are filtered; stored
+//!   document vectors (and so the IDF) are unchanged.
 //! - **IDF** is applied by Qdrant (`modifier: idf` on the sparse vector), from the
 //!   whole collection: `ln(1 + (N − n + 0.5) / (n + 0.5))`, N points with a sparse
 //!   vector, n of them containing the token. The score of a point is
@@ -180,10 +185,49 @@ pub fn document_vector(text: &str) -> SparseVector {
     )
 }
 
+/// English function words dropped from keyword queries when `RAG_KEYWORD_STOPWORDS` is
+/// on: articles, pronouns, auxiliaries, question words, common prepositions and
+/// conjunctions (a subset of the common NLTK/Snowball English list). Words that carry
+/// meaning in operations text are deliberately kept: negations (`no`, `not`),
+/// directions and states (`down`, `up`, `out`, `off`, `over`, `under`, `again`),
+/// `now`, `may` (a month) and `us` (as in `us-east-1`).
+pub const QUERY_STOPWORDS: &[&str] = &[
+    "a", "about", "after", "all", "am", "an", "and", "any", "are", "as", "at", "be", "because",
+    "been", "before", "being", "between", "both", "but", "by", "can", "could", "did", "do", "does",
+    "doing", "during", "each", "every", "for", "from", "had", "has", "have", "having", "he", "her",
+    "here", "hers", "him", "his", "how", "i", "if", "in", "into", "is", "it", "its", "just", "me",
+    "my", "of", "on", "only", "or", "other", "our", "ours", "shall", "she", "should", "so", "some",
+    "such", "than", "that", "the", "their", "theirs", "them", "then", "there", "these", "they",
+    "this", "those", "through", "to", "too", "until", "very", "was", "we", "were", "what", "when",
+    "where", "which", "while", "who", "whom", "whose", "why", "will", "with", "would", "you",
+    "your", "yours",
+];
+
+/// Whether `token` (lowercased, as [`tokenize`] yields it) is in [`QUERY_STOPWORDS`].
+pub fn is_query_stopword(token: &str) -> bool {
+    QUERY_STOPWORDS.binary_search(&token).is_ok()
+}
+
 /// The sparse query vector of a question: 1 per distinct token. Empty when the
 /// question has no tokens; the caller then skips the keyword search.
 pub fn query_vector(text: &str) -> SparseVector {
-    let distinct: BTreeSet<String> = tokenize(text).into_iter().collect();
+    query_vector_of(tokenize(text))
+}
+
+/// [`query_vector`] without the tokens in [`QUERY_STOPWORDS`]. Parts of identifiers
+/// are filtered like words, but the whole identifier stays (`is-alive` keeps
+/// `is-alive` and `alive`). Empty when only stopwords are left.
+pub fn query_vector_without_stopwords(text: &str) -> SparseVector {
+    query_vector_of(
+        tokenize(text)
+            .into_iter()
+            .filter(|t| !is_query_stopword(t))
+            .collect(),
+    )
+}
+
+fn query_vector_of(tokens: Vec<String>) -> SparseVector {
+    let distinct: BTreeSet<String> = tokens.into_iter().collect();
     let mut map = BTreeMap::new();
     for t in distinct {
         *map.entry(token_index(&t)).or_insert(0.0) += 1.0;
@@ -197,6 +241,38 @@ mod tests {
 
     fn toks(text: &str) -> Vec<String> {
         tokenize(text)
+    }
+
+    #[test]
+    fn query_stopwords_are_sorted_lowercase_and_unique() {
+        assert!(QUERY_STOPWORDS.windows(2).all(|w| w[0] < w[1]));
+        for w in QUERY_STOPWORDS {
+            assert_eq!(toks(w), [*w], "{w} is one lowercase token");
+        }
+        // Words that mean something in operations text stay searchable.
+        for kept in ["no", "not", "down", "up", "out", "off", "now", "may", "us"] {
+            assert!(!is_query_stopword(kept), "{kept}");
+        }
+    }
+
+    #[test]
+    fn stopwords_are_dropped_from_queries_only_when_asked() {
+        let q = "Which errors did the inventory service log yesterday?";
+        let without = query_vector_without_stopwords(q);
+        assert_eq!(
+            without,
+            query_vector("errors inventory service log yesterday")
+        );
+        assert_eq!(query_vector(q).indices.len(), 8);
+        // Identifiers keep their whole token; only a stopword part is dropped.
+        assert_eq!(
+            query_vector_without_stopwords("is-alive check"),
+            query_vector_of(vec!["is-alive".into(), "alive".into(), "check".into()])
+        );
+        // Nothing but stopwords: no keyword search.
+        assert!(query_vector_without_stopwords("What was it?").is_empty());
+        // Documents keep every token.
+        assert_eq!(document_vector("did it").indices.len(), 2);
     }
 
     #[test]

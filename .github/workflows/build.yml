@@ -74,6 +74,7 @@ jobs:
         pipeline_tests::unicode::unicode_round_trip_real_qdrant
         pipeline_tests::quality::incident_questions_real_qdrant
         pipeline_tests::support::qdrant::tests::query_api_matches_real_qdrant
+        pipeline_tests::support::qdrant::tests::dbsf_matches_real_qdrant
 
     - name: Generate code coverage
       run: cargo llvm-cov report --lcov --output-path lcov.info
@@ -139,11 +140,14 @@ jobs:
     - name: Build release binaries
       run: cargo build --workspace --release --locked
 
+    # The main run (default fusion and keyword stopwords) decides the job. The other
+    # query-side configurations are asked on the same index for comparison only.
     - name: End-to-end run
       env:
         E2E_SKIP_BUILD: 1
         QDRANT_ENDPOINT: http://localhost:6333
         TEI_URL: http://localhost:8080
+        E2E_COMPARE: "dbsf:off rrf:on dbsf:on"
       run: scripts/e2e.sh
 
     - name: text-embeddings-inference logs

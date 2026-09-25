@@ -5,7 +5,6 @@ use crate::openai::OpenAiClient;
 use crate::qdrant::{Qdrant, SearchQuery};
 use crate::reranker::{TimeFocus, rerank_mmr_signals};
 use crate::resilience::{env_duration_ms, run_stage};
-use crate::sparse::query_vector;
 use crate::text::{TRUNCATION_MARKER, truncate_with_marker};
 use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
@@ -408,7 +407,7 @@ pub async fn retrieve(
     timeouts: &StageTimeouts,
 ) -> Result<Vec<Hit>, RagError> {
     // Dense search embeds the queries with the model's query prefix, if any; keyword
-    // search tokenizes them as asked.
+    // search tokenizes them as asked (without stopwords when so configured).
     let embed = oa.embed_queries(queries);
     let dense = run_stage(Stage::Embedding, timeouts.embedding, embed).await?;
     let searches: Vec<SearchQuery> = queries
@@ -416,7 +415,7 @@ pub async fn retrieve(
         .zip(dense)
         .map(|(text, dense)| SearchQuery {
             dense,
-            sparse: query_vector(text),
+            sparse: qd.hybrid.keyword_query(text),
         })
         .collect();
     run_stage(
@@ -469,6 +468,7 @@ pub async fn answer_candidates(
 mod tests {
     use super::*;
     use crate::domain::{RagDocument, SourceKind};
+    use crate::sparse::query_vector;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -940,6 +940,7 @@ mod tests {
             ],
             8,
             None,
+            crate::qdrant::Fusion::Rrf,
         );
         assert_eq!(lists, 4);
         assert_eq!(body, want);

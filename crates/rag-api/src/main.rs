@@ -14,6 +14,7 @@ async fn main() -> Result<()> {
     let addr = rag_api::listen_addr(std::env::var(rag_api::LISTEN_ADDR_VAR).ok().as_deref())?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("listening on {}", addr);
+    tracing::info!(hybrid = %state.qd.hybrid.describe(), "hybrid search");
     rag_api::serve(listener, state).await?;
     Ok(())
 }

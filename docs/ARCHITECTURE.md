@@ -360,16 +360,42 @@ with `--json`) on stderr and exits with status 1.
   - both again for the planner's rewrite, when there is one that differs (one more
     embedding, in the same request).
 
-  Qdrant fuses the lists with reciprocal rank fusion: a point at 0-based rank `r` of a
-  list scores `1 / (2 + r)`, summed over the lists (`k` = 2, sent explicitly). Dense
-  search finds paraphrases; keyword search finds the exact error code, exception, metric
-  name or host a question quotes, which a dense vector blurs with similar ones.
-- **Scores:** a hit's score is its fused score divided by the best possible one (first in
-  every list), so it is in (0, 1]: 1 is first everywhere, 0.667 second in all, 0.5 first
-  in half of the lists or third in all. Only ranks count, not raw similarities, so the scale is the same for
-  every question; the reranker's kind priors, recency weight and relevance/diversity
-  balance apply to it as they did to cosine similarities. The answer prompt shows the
-  reranked score.
+  Dense search finds paraphrases; keyword search finds the exact error code, exception,
+  metric name or host a question quotes, which a dense vector blurs with similar ones.
+  Qdrant fuses the lists (`RAG_FUSION`):
+  - `rrf` (default): reciprocal rank fusion. A point at 0-based rank `r` of a list
+    scores `1 / (2 + r)`, summed over the lists (`k` = 2, sent explicitly). Only ranks
+    count.
+  - `dbsf`: distribution-based score fusion (`{"fusion": "dbsf"}`). Qdrant maps each
+    list's raw scores to `(s − (μ − 3σ)) / 6σ`, μ and σ the list's mean and *sample*
+    standard deviation, and sums them over the lists. Not clipped: a point more than 3σ
+    above its list's mean scores above 1 for it. A list of one point, or of equal
+    scores, maps to 0.5; a list a point is not in adds nothing. So a decisive keyword
+    match (24.6 against a runner-up at 1.8) counts for more than a near tie in dense
+    search (0.730 against 0.724), which RRF scores alike. (Verified against Qdrant
+    1.19.1, whose source is `lib/segment/src/common/score_fusion.rs`.)
+
+  RRF stays the default because DBSF was not better everywhere when measured
+  (pull request #56): with real embeddings (e2e, `bge-small-en-v1.5`) it ranks the
+  outage incident first for "the root cause of the last checkout outage" (precision@R
+  0.944 → 0.972), but with the in-process harness's bag-of-words embeddings it lets a
+  distractor into the sources of another question: DBSF compresses the tail of a dense
+  list whose scores barely differ into a narrow band, so kind priors and MMR's diversity
+  term decide which of those documents fill the last slots. With only two candidates
+  in a list DBSF is rank-based anyway (any two scores map to 0.5 ± 0.118).
+- **Scores:** a hit's score is its fused score divided by the best possible one, so it is
+  in [0, 1] and on the same scale for every question:
+  - RRF: the best is first in every list. 1 is first everywhere, 0.667 second in all,
+    0.5 first in half of the lists or third in all.
+  - DBSF: the best is 3σ above the mean in every list, so the score is the mean of the
+    point's per-list scores: 1 at 3σ above the mean everywhere, 0.5 at the mean
+    everywhere (or 3σ above in half the lists and absent from the others). When the top
+    hit exceeds 1 (a far outlier), every score is divided by the top hit's instead, so
+    the order and ratios stay and several hits are not capped at 1 alike.
+
+  The reranker's kind priors, recency weight and relevance/diversity balance apply to
+  either scale; they were chosen for RRF's rank gaps (see the recency weight below). The
+  answer prompt shows the reranked score.
 - **Top-K:** `choose_topk()` picks how many hits the answer uses. It starts at
   `RAG_TOPK_DEFAULT` (16), adds 6 for root-cause questions ("why", "root cause", "rca"),
   2 for explicit time ranges and 2 for incident questions, capped at `RAG_TOPK_MAX` (32).
@@ -419,6 +445,9 @@ with `--json`) on stderr and exits with status 1.
     from 20 minutes ago before an equally matching one from five days ago) but never
     lifts a fresh event over one that clearly matches better. A day old weighs 0.875,
     five days 0.758, a week or more ≈ 0.75.
+  - These rank gaps are RRF's. Under DBSF the gap between two hits follows their raw
+    scores, so a near tie in every list is a near tie in the fused score too, and the
+    recency weight and kind prior decide it.
   - Age is measured from `now`, not from the newest candidate: relative to the newest
     candidate, a stale index would give its newest event the full bonus, and a
     document's weight would change with which other documents were retrieved.
@@ -569,6 +598,16 @@ Each chunk is also stored with a sparse keyword vector of the same embedding inp
 - **Values:** stored chunks carry BM25 term-frequency weights
   (`tf·(k1+1) / (tf + k1·(1 − b + b·len/256))`, k1 = 1.2, b = 0.75); questions 1 per
   distinct token.
+- **Query stopwords** (`RAG_KEYWORD_STOPWORDS`, default `off`, which measured no
+  better; see pull request #56): with `on`, English
+  function words (articles, pronouns, auxiliaries such as `did`, question words, common
+  prepositions and conjunctions; `sparse::QUERY_STOPWORDS`) are dropped from the
+  question's keyword vector. In a corpus of logs and incidents such a word can be rare
+  enough for a high IDF: "Which errors did the inventory service log yesterday?" put a
+  checkout log saying "card vault did not respond" first in keyword search. Words that
+  mean something in operations text stay (`no`, `not`, `down`, `up`, `out`, `off`,
+  `now`, `may`, `us`). Stored vectors, and so the IDF, are unchanged, so switching it
+  needs no re-index.
 - **IDF:** the collection's sparse vector has Qdrant's `idf` modifier, so Qdrant weights
   each query token by `ln(1 + (N − n + 0.5) / (n + 0.5))` over the whole collection (N
   points with a sparse vector, n containing the token). A code that appears in one log
