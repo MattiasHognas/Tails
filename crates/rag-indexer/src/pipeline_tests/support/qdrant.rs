@@ -7,9 +7,10 @@
 //! against a real server in [`tests::query_api_matches_real_qdrant`]): named cosine
 //! dense vectors, sparse vectors scored as `Σ query value · idf · stored value` over
 //! shared indices with Qdrant's IDF modifier, and prefetches fused by reciprocal rank
-//! fusion. Anything it does not implement (an endpoint, a filter condition, a query
-//! form, a collection option) is recorded and fails [`Store::finish`] rather than
-//! silently matching.
+//! fusion or distribution-based score fusion (the fused scores checked against a real
+//! server in [`tests::dbsf_matches_real_qdrant`]). Anything it does not implement (an
+//! endpoint, a filter condition, a query form, a collection option) is recorded and
+//! fails [`Store::finish`] rather than silently matching.
 
 use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 use rag_core::qdrant::Qdrant;
@@ -269,24 +270,81 @@ fn sort_scored(scored: &mut [(f32, String)]) {
     scored.sort_by(|a, b| b.0.total_cmp(&a.0).then(id_key(&a.1).cmp(&id_key(&b.1))));
 }
 
-/// Qdrant's reciprocal rank fusion: a point at 0-based position `r` of a list scores
-/// `1 / (k + r)`, summed over the lists it appears in.
-fn rrf(lists: &[Vec<String>], k: f32) -> Vec<(f32, String)> {
-    let mut scores: BTreeMap<&str, f32> = BTreeMap::new();
+/// A prefetch list: `(score, point id)`, best first.
+type Scored = Vec<(f32, String)>;
+
+/// Sums each point's per-list scores and sorts the result ([`sort_scored`]).
+fn sum_lists(lists: impl IntoIterator<Item = Scored>) -> Scored {
+    let mut scores: BTreeMap<String, f32> = BTreeMap::new();
     for list in lists {
-        for (rank, id) in list.iter().enumerate() {
-            *scores.entry(id).or_default() += 1.0 / (k + rank as f32);
+        for (score, id) in list {
+            *scores.entry(id).or_default() += score;
         }
     }
-    let mut fused: Vec<(f32, String)> = scores
-        .into_iter()
-        .map(|(id, s)| (s, id.to_string()))
-        .collect();
+    let mut fused: Scored = scores.into_iter().map(|(id, s)| (s, id)).collect();
     sort_scored(&mut fused);
     fused
 }
 
-/// `k` of a fusion query: `{"fusion": "rrf"}` (Qdrant's default k = 2) or
+/// Qdrant's reciprocal rank fusion: a point at 0-based position `r` of a list scores
+/// `1 / (k + r)`, summed over the lists it appears in.
+fn rrf(lists: &[Scored], k: f32) -> Scored {
+    sum_lists(lists.iter().map(|list| {
+        list.iter()
+            .enumerate()
+            .map(|(rank, (_, id))| (1.0 / (k + rank as f32), id.clone()))
+            .collect()
+    }))
+}
+
+/// Qdrant's distribution-based score fusion (`lib/segment/src/common/score_fusion.rs`,
+/// v1.19): each list's scores are mapped to `(s - lo) / (hi - lo)` with
+/// `lo, hi = mean ∓ 3·σ`, from Welford's one-pass mean and *sample* variance (n - 1) in
+/// f32, without clipping (a point more than 3σ out scores outside [0, 1]); a list of
+/// one point, or of equal scores, maps to 0.5. The normalized scores are summed over
+/// the lists a point appears in.
+fn dbsf(lists: &[Scored]) -> Scored {
+    sum_lists(lists.iter().map(|list| {
+        if list.len() < 2 {
+            return list.iter().map(|(_, id)| (0.5, id.clone())).collect();
+        }
+        let (mut mean, mut aggregate) = (0f32, 0f32);
+        for ((score, _), k) in list.iter().zip(1usize..) {
+            let old_delta = score - mean;
+            mean += old_delta / k as f32;
+            aggregate += old_delta * (score - mean);
+        }
+        let std_dev = (aggregate / (list.len() as f32 - 1.0)).sqrt();
+        let (lo, hi) = (mean - 3.0 * std_dev, mean + 3.0 * std_dev);
+        list.iter()
+            .map(|(score, id)| {
+                let norm = if lo == hi {
+                    0.5
+                } else {
+                    (score - lo) / (hi - lo)
+                };
+                (norm, id.clone())
+            })
+            .collect()
+    }))
+}
+
+/// How a fused query combines its prefetches.
+#[derive(Debug, PartialEq)]
+enum Fusion {
+    Rrf { k: f32 },
+    Dbsf,
+}
+
+/// The fusion of a query: `{"fusion": "dbsf"}`, or RRF ([`rrf_k`]).
+fn fusion(query: &Value) -> Result<Fusion, String> {
+    if query == &json!({"fusion": "dbsf"}) {
+        return Ok(Fusion::Dbsf);
+    }
+    rrf_k(query).map(|k| Fusion::Rrf { k })
+}
+
+/// `k` of an RRF query: `{"fusion": "rrf"}` (Qdrant's default k = 2) or
 /// `{"rrf": {"k": n}}`.
 fn rrf_k(query: &Value) -> Result<f32, String> {
     if query == &json!({"fusion": "rrf"}) {
@@ -438,8 +496,9 @@ impl Collection {
         Value::Object(out)
     }
 
-    /// One prefetch: the `limit` best points matching its filter by its vector.
-    fn prefetch(&self, p: &Value) -> Result<Vec<String>, String> {
+    /// One prefetch: the `limit` best points matching its filter by its vector, with
+    /// their scores.
+    fn prefetch(&self, p: &Value) -> Result<Scored, String> {
         let obj = p.as_object().ok_or("prefetch must be an object")?;
         if let Some(k) = obj
             .keys()
@@ -483,7 +542,8 @@ impl Collection {
             return Err(format!("unknown vector name {using}"));
         };
         sort_scored(&mut scored);
-        Ok(scored.into_iter().take(limit).map(|(_, id)| id).collect())
+        scored.truncate(limit);
+        Ok(scored)
     }
 
     /// `POST /points/query` with fused prefetches, the only form Tails sends.
@@ -499,14 +559,18 @@ impl Collection {
             .as_array()
             .filter(|p| !p.is_empty())
             .ok_or("only fused prefetch queries are supported")?;
-        let k = rrf_k(&body["query"])?;
+        let fusion = fusion(&body["query"])?;
         let limit = body["limit"].as_u64().unwrap_or(10) as usize;
         let with = body.get("with_payload").cloned().unwrap_or(json!(false));
         let lists = prefetch
             .iter()
             .map(|p| self.prefetch(p))
             .collect::<Result<Vec<_>, _>>()?;
-        let points: Vec<Value> = rrf(&lists, k)
+        let fused = match fusion {
+            Fusion::Rrf { k } => rrf(&lists, k),
+            Fusion::Dbsf => dbsf(&lists),
+        };
+        let points: Vec<Value> = fused
             .into_iter()
             .take(limit)
             .map(|(score, id)| {
@@ -757,10 +821,14 @@ impl Store {
             .expect("create collection");
     }
 
-    /// A client like the indexer's and the API's, pointed at this store.
+    /// A client like the indexer's and the API's, pointed at this store. Fusion and
+    /// keyword stopwords come from `RAG_FUSION` and `RAG_KEYWORD_STOPWORDS` like the
+    /// API's, so the question set can be measured under each configuration.
     pub fn qdrant(&self) -> Qdrant {
         let mut q = Qdrant::new(self.endpoint(), self.collection().to_string());
         q.retry = rag_core::resilience::RetryPolicy::none();
+        q.hybrid = rag_core::qdrant::HybridConfig::from_env()
+            .expect("RAG_FUSION and RAG_KEYWORD_STOPWORDS must be valid");
         q
     }
 
@@ -914,7 +982,8 @@ mod tests {
 
     #[test]
     fn rrf_sums_reciprocal_ranks_per_list() {
-        let list = |ids: &[&str]| ids.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // Only the order counts, not the scores.
+        let list = |ids: &[&str]| -> Scored { ids.iter().map(|s| (0.0, s.to_string())).collect() };
         // k = 2, 0-based ranks: a 1/2 + 1/4, b 1/3 + 1/2, c 1/4, d 1/3.
         let fused = rrf(&[list(&["a", "b", "c"]), list(&["b", "d", "a"])], 2.0);
         let want = [
@@ -937,6 +1006,42 @@ mod tests {
         assert_eq!(rrf_k(&json!({"rrf": {"k": 60}})).unwrap(), 60.0);
         assert!(rrf_k(&json!({"fusion": "dbsf"})).is_err());
         assert!(rrf_k(&json!({"rrf": {"k": 2, "weights": [1, 2]}})).is_err());
+        assert_eq!(fusion(&json!({"fusion": "dbsf"})).unwrap(), Fusion::Dbsf);
+        assert_eq!(
+            fusion(&json!({"rrf": {"k": 2}})).unwrap(),
+            Fusion::Rrf { k: 2.0 }
+        );
+        // Qdrant has no DBSF parameters; it ignores unknown keys, the fake refuses them.
+        assert!(fusion(&json!({"fusion": "dbsf", "weights": [1, 2]})).is_err());
+        assert!(fusion(&json!({"dbsf": {}})).is_err());
+    }
+
+    #[test]
+    fn dbsf_normalizes_each_list_by_mean_and_three_sample_deviations() {
+        let list = |scored: &[(f32, &str)]| -> Scored {
+            scored.iter().map(|(s, id)| (*s, id.to_string())).collect()
+        };
+        // [3, 1]: mean 2, sample σ = √2, so lo, hi = 2 ∓ 3√2 and 3 ↦ 0.5 + 1/(6√2).
+        // A list of one point and a list of equal scores map to 0.5.
+        let fused = dbsf(&[
+            list(&[(3.0, "a"), (1.0, "b")]),
+            list(&[(7.0, "b")]),
+            list(&[(2.0, "c"), (2.0, "a")]),
+        ]);
+        let d = 1.0 / (6.0 * 2f32.sqrt());
+        let want = [("a", 0.5 + d + 0.5), ("b", 0.5 - d + 0.5), ("c", 0.5)];
+        assert_eq!(fused.len(), want.len());
+        for ((score, id), (want_id, want_score)) in fused.iter().zip(want) {
+            assert_eq!(id, want_id);
+            assert!((score - want_score).abs() < 1e-6, "{id}: {score}");
+        }
+        // Not clipped: 1 point far above 11 equal ones is more than 3σ out.
+        let mut far = vec![(100.0, "0".to_string())];
+        far.extend((1..12).map(|i| (1.0, i.to_string())));
+        let fused = dbsf(&[far]);
+        assert_eq!(fused[0].1, "0");
+        assert!(fused[0].0 > 1.0, "{fused:?}");
+        assert!(dbsf(&[vec![]]).is_empty());
     }
 
     async fn post_query(store: &Store, body: Value) -> Vec<(u64, f32)> {
@@ -974,7 +1079,24 @@ mod tests {
     /// collection with the production layout, against scores computed by hand. The
     /// same checks pass on Qdrant 1.19.1. No two points tie in any list, because
     /// Qdrant orders ties arbitrarily.
-    async fn check_query_api(store: Store) {
+    async fn upsert(store: &Store, body: Value) {
+        let url = format!(
+            "{}/collections/{}/points?wait=true",
+            store.endpoint(),
+            store.collection()
+        );
+        Store::http()
+            .put(&url)
+            .json(&body)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+    }
+
+    /// Five points with the production layout (named `dense` and `sparse` vectors).
+    async fn insert_points(store: &Store) {
         let sv = |indices: &[u32], values: &[f32]| json!({"indices": indices, "values": values});
         let point = |id: u64, dense: [f32; 2], sparse: Option<Value>, k: &str| {
             let mut vector = json!({"dense": dense});
@@ -983,26 +1105,23 @@ mod tests {
             }
             json!({"id": id, "vector": vector, "payload": {"k": k}})
         };
-        let url = format!(
-            "{}/collections/{}/points?wait=true",
-            store.endpoint(),
-            store.collection()
-        );
-        Store::http()
-            .put(&url)
-            .json(&json!({"points": [
+        upsert(
+            store,
+            json!({"points": [
                 point(1, [1.0, 0.0], Some(sv(&[1, 2], &[1.0, 2.0])), "a"),
                 point(2, [0.9, 0.1], Some(sv(&[1], &[1.0])), "b"),
                 point(3, [0.0, 1.0], Some(sv(&[3], &[2.0])), "a"),
                 point(4, [0.5, 0.5], Some(sv(&[1, 3], &[3.0, 1.0])), "b"),
                 // Without a sparse vector: never returned by the sparse search.
                 point(5, [-1.0, 0.0], None, "b"),
-            ]}))
-            .send()
-            .await
-            .unwrap()
-            .error_for_status()
-            .unwrap();
+            ]}),
+        )
+        .await;
+    }
+
+    async fn check_query_api(store: Store) {
+        insert_points(&store).await;
+        let sv = |indices: &[u32], values: &[f32]| json!({"indices": indices, "values": values});
 
         // One sparse list, k = 2: the fused score of rank r is 1/(2 + r). With N = 4
         // points with a sparse vector, term 1 in 3 of them, term 2 in 1 and term 3 in 2,
@@ -1068,9 +1187,152 @@ mod tests {
         store.finish().await;
     }
 
+    /// Fused results compared by score per point, in non-increasing score order, for
+    /// cases with ties: Qdrant orders equal scores arbitrarily.
+    fn assert_scores_any_tie_order(got: &[(u64, f32)], want: &[(u64, f32)]) {
+        assert_eq!(got.len(), want.len(), "{got:?} vs {want:?}");
+        for (id, want_score) in want {
+            let score = got.iter().find(|(g, _)| g == id).map(|(_, s)| *s);
+            assert!(
+                score.is_some_and(|s| (s - want_score).abs() < 1e-5),
+                "{id}: {got:?} vs {want:?}"
+            );
+        }
+        assert!(got.windows(2).all(|w| w[0].1 >= w[1].1), "{got:?}");
+    }
+
+    /// Distribution-based score fusion on the collection of [`check_query_api`],
+    /// against scores computed by hand (the per-list scores are those of
+    /// [`check_query_api`]; `n(s)` = `(s - mean + 3σ) / 6σ` with the sample σ of the
+    /// list). The same checks pass on Qdrant 1.19.1.
+    async fn check_dbsf(store: Store) {
+        insert_points(&store).await;
+        let sv = |indices: &[u32], values: &[f32]| json!({"indices": indices, "values": values});
+        let dbsf = |prefetch: Value| json!({"prefetch": prefetch, "query": {"fusion": "dbsf"}, "limit": 10});
+        let dense = |q: [f32; 2]| json!({"query": q, "using": "dense", "limit": 10});
+        let sparse = |q: Value, limit: u64| json!({"query": q, "using": "sparse", "limit": limit});
+
+        // Dense [1, 0]: 1: 1, 2: 0.99388, 4: 0.70711, 3: 0, 5: -1 (mean 0.34016, σ
+        // 0.83346) ↦ 0.62895, 0.62775, 0.57171, 0.43351, 0.23808. Sparse {3: 1}:
+        // 3: 1.38629, 4: 0.69315 (σ = 0.49013) ↦ 0.61785, 0.38215. Points 1, 2 and 5
+        // are missing from the sparse list and get nothing for it.
+        let a = [
+            (3, 0.43351 + 0.61785),
+            (4, 0.57171 + 0.38215),
+            (1, 0.62895),
+            (2, 0.62775),
+            (5, 0.23808),
+        ];
+        assert_scores(
+            &post_query(
+                &store,
+                dbsf(json!([dense([1.0, 0.0]), sparse(sv(&[3], &[1.0]), 10)])),
+            )
+            .await,
+            &a,
+        );
+        // Sparse limited to one point: a list of one scores 0.5.
+        assert_scores(
+            &post_query(
+                &store,
+                dbsf(json!([dense([1.0, 0.0]), sparse(sv(&[3], &[1.0]), 1)])),
+            )
+            .await,
+            &[
+                (3, 0.43351 + 0.5),
+                (1, 0.62895),
+                (2, 0.62775),
+                (4, 0.57171),
+                (5, 0.23808),
+            ],
+        );
+        // Ties within a list and in the result: sparse {1: 1} scores 4: 1.07003 and
+        // 1, 2: 0.35667 each ↦ 0.69245, 0.40377, 0.40377.
+        assert_scores_any_tie_order(
+            &post_query(&store, dbsf(json!([sparse(sv(&[1], &[1.0]), 10)]))).await,
+            &[(4, 0.69245), (1, 0.40377), (2, 0.40377)],
+        );
+        // A list of equal scores (sparse {1: 1} on points 1 and 2 only) maps to 0.5.
+        // Dense [0, 1]: 3: 1, 4: 0.70711, 2: 0.11043, 1 and 5: 0 (a tie) ↦ 0.72992,
+        // 0.62412, 0.40858, 0.36869, 0.36869.
+        let only_1_2 = json!({"must": [{"has_id": [1, 2]}]});
+        let mut equal = sparse(sv(&[1], &[1.0]), 10);
+        equal["filter"] = only_1_2;
+        assert_scores_any_tie_order(
+            &post_query(&store, dbsf(json!([dense([0.0, 1.0]), equal]))).await,
+            &[
+                (2, 0.40858 + 0.5),
+                (1, 0.36869 + 0.5),
+                (3, 0.72992),
+                (4, 0.62412),
+                (5, 0.36869),
+            ],
+        );
+        // One dense list of one point.
+        let mut one = dense([1.0, 0.0]);
+        one["limit"] = json!(1);
+        assert_scores(&post_query(&store, dbsf(json!([one]))).await, &[(1, 0.5)]);
+        // Four lists, as for a question and its rewrite: the per-list scores add up.
+        assert_scores(
+            &post_query(
+                &store,
+                dbsf(json!([
+                    dense([1.0, 0.0]),
+                    sparse(sv(&[3], &[1.0]), 10),
+                    dense([0.0, 1.0]),
+                    sparse(sv(&[1, 2], &[1.0, 1.0]), 10)
+                ])),
+            )
+            .await,
+            &[
+                (4, 2.03390),
+                (3, 1.78129),
+                (1, 1.68191),
+                (2, 1.39613),
+                (5, 0.60677),
+            ],
+        );
+
+        // Not clipped: twelve more points share term 9, one of them 100 times as
+        // strongly. Its score is 3.175σ above the mean: 0.5 + 3.175 / 6 = 1.02924; the
+        // others 0.45189.
+        let more: Vec<Value> = (6..18u64)
+            .map(|id| {
+                let w = if id == 6 { 100.0 } else { 1.0 };
+                json!({"id": id, "vector": {"dense": [0.0, 1.0], "sparse": sv(&[9], &[w])},
+                       "payload": {"k": "c"}})
+            })
+            .collect();
+        upsert(&store, json!({ "points": more })).await;
+        let mut all = dbsf(json!([sparse(sv(&[9], &[1.0]), 20)]));
+        all["limit"] = json!(20);
+        let got = post_query(&store, all).await;
+        assert_eq!(got.len(), 12);
+        assert_eq!(got[0].0, 6);
+        assert!((got[0].1 - 1.02924).abs() < 1e-5, "{got:?}");
+        assert!(
+            got[1..].iter().all(|(_, s)| (s - 0.45189).abs() < 1e-5),
+            "{got:?}"
+        );
+        store.finish().await;
+    }
+
     #[tokio::test]
     async fn fake_query_api_matches_hand_computed_scores() {
         check_query_api(Store::fake(2).await).await;
+    }
+
+    #[tokio::test]
+    async fn fake_dbsf_matches_hand_computed_scores() {
+        check_dbsf(Store::fake(2).await).await;
+    }
+
+    /// `QDRANT_TEST_ENDPOINT=http://localhost:6333 cargo test -p rag-indexer --bin
+    /// rag-indexer dbsf_matches_real_qdrant -- --ignored`
+    #[tokio::test]
+    #[ignore = "requires QDRANT_TEST_ENDPOINT pointing at an isolated Qdrant server"]
+    async fn dbsf_matches_real_qdrant() {
+        check_dbsf(Store::real(2).await).await;
     }
 
     /// `QDRANT_TEST_ENDPOINT=http://localhost:6333 cargo test -p rag-indexer --bin
@@ -1159,7 +1421,7 @@ mod tests {
             send(
                 Method::POST,
                 query,
-                json!({"prefetch": dense_prefetch, "query": {"fusion": "dbsf"}}),
+                json!({"prefetch": dense_prefetch, "query": {"fusion": "dbsf", "weights": [2]}}),
             )
             .await,
             send(

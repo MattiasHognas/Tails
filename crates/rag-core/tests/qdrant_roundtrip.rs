@@ -3,7 +3,7 @@ use rag_core::{
     chunk::{chunk, chunk_id, content_hash},
     domain::{Hit, RagDocument, SourceKind},
     qdrant::{
-        QPoint, Qdrant, SYNC_ID_KEY, SearchQuery, StoredPointState, point_id,
+        Fusion, QPoint, Qdrant, SYNC_ID_KEY, SearchQuery, StoredPointState, point_id,
         surplus_chunks_filter, unsynced_filter,
     },
     retrieval::RetrievalScope,
@@ -84,7 +84,7 @@ async fn search(
 }
 
 /// Keyword search finds an exact identifier the dense vector misses, both questions
-/// are fused in one query, and scores are normalized RRF.
+/// are fused in one query, and scores are normalized RRF (or DBSF).
 async fn check_hybrid_search(qdrant: &Qdrant) -> Result<()> {
     let doc = |id: &str, text: &str| RagDocument {
         id: id.into(),
@@ -127,6 +127,32 @@ async fn check_hybrid_search(qdrant: &Qdrant) -> Result<()> {
     assert_eq!(got[1].0, "log_similar#c0", "{got:?}");
     assert!((got[1].1 - 0.5).abs() < 1e-5, "{got:?}");
     assert_eq!(got.len(), 3);
+
+    // The same search fused by DBSF. Dense cosines similar 0.981, exact 0.196, other 0
+    // normalize by mean ± 3 sample σ to 0.689, 0.437, 0.374; the keyword list holds
+    // exact alone, 0.5. Of the best possible 2 (3σ up in both lists): exact 0.4685,
+    // similar 0.3445, other 0.1870.
+    let mut dbsf = qdrant.clone();
+    dbsf.hybrid.fusion = Fusion::Dbsf;
+    let got = ranked(
+        search(
+            &dbsf,
+            &[0.2, 1.0, 0.0],
+            "why ERR_CONN_RESET?",
+            Some(filter.clone()),
+        )
+        .await?,
+    );
+    let want = [
+        ("log_exact#c0", 0.4685),
+        ("log_similar#c0", 0.34449),
+        ("log_other#c0", 0.18701),
+    ];
+    assert_eq!(got.len(), want.len(), "{got:?}");
+    for ((id, score), (want_id, want_score)) in got.iter().zip(want) {
+        assert_eq!(id, want_id, "{got:?}");
+        assert!((score - want_score).abs() < 1e-4, "{got:?}");
+    }
 
     // The question and a rewrite in one query: four lists. `exact` is first by the
     // question's dense and keyword searches and third by the rewrite's dense one;

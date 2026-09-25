@@ -24,6 +24,10 @@
 //!   exactly one `[DOC #n]` block of the answer prompt and that block states the given
 //!   facts (for example a log pattern's count in the question's window).
 //!
+//! Per question only, not a threshold: the ranking margin ([`Row::margin`]), how
+//! clearly the must-retrieve documents beat the best other source, to compare
+//! configurations (fusion, stopwords) beyond pass or fail.
+//!
 //! Documents are compared as the sources they are listed as: the days of one log pattern
 //! (`Metadata.pattern_id`) are one source, so `log_<id>` matches whichever day
 //! represents the pattern.
@@ -401,6 +405,12 @@ pub struct Row {
     pub evidence_ok: usize,
     pub evidence_total: usize,
     pub sources: usize,
+    /// The lowest reranked score of a retrieved `mustRetrieve` source divided by the
+    /// highest score of a source that is neither `mustRetrieve` nor `mayRetrieve`, from
+    /// the answer prompt's `Score:` lines. Above 1 the must-retrieve sources rank
+    /// first; the closer to 1, the more fragile that is. `None` without a prompt,
+    /// without must-retrieve sources or without other sources.
+    pub margin: Option<f64>,
     /// Metric misses, reported in the notes.
     pub problems: Vec<String>,
     /// Broken invariants that must hold whatever the embeddings: a source that is not
@@ -636,6 +646,30 @@ pub fn score(
     // Evidence given to the answer model.
     if answers == Answers::Canned {
         let blocks = prompt_blocks(prompt.unwrap_or_default());
+        let scores: Vec<(&String, f64)> = blocks
+            .iter()
+            .filter_map(|(n, block)| {
+                let id = ids.get(n.wrapping_sub(1))?;
+                let score = block
+                    .lines()
+                    .find_map(|l| l.strip_prefix("Score: "))?
+                    .trim()
+                    .parse()
+                    .ok()?;
+                Some((id, score))
+            })
+            .collect();
+        let must = scores
+            .iter()
+            .filter(|(id, _)| e.must_retrieve.contains(id))
+            .map(|(_, s)| *s)
+            .reduce(f64::min);
+        let other = scores
+            .iter()
+            .filter(|(id, _)| !relevant(id))
+            .map(|(_, s)| *s)
+            .reduce(f64::max);
+        row.margin = must.zip(other).map(|(m, o)| m / o.max(1e-9));
         for x in &e.evidence {
             row.evidence_total += 1;
             let mine: Vec<&String> = blocks
@@ -738,10 +772,11 @@ pub fn score(
 /// The report's column header.
 pub fn print_header() {
     println!(
-        "{:<28} {:>6} {:>6} {:>7} {:>5} {:>7} {:>7} {:>5} {:>5} {:>4}  notes",
+        "{:<28} {:>6} {:>6} {:>6} {:>7} {:>5} {:>7} {:>7} {:>5} {:>5} {:>4}  notes",
         "question",
         "recall",
         "prec@R",
+        "margin",
         "exclude",
         "scope",
         "cites",
@@ -757,10 +792,11 @@ pub fn print_row(row: &Row) {
     let mut notes = row.problems.clone();
     notes.extend(row.hard.iter().map(|h| format!("HARD: {h}")));
     println!(
-        "{:<28} {:>6.2} {:>6.2} {:>7} {:>5} {:>7} {:>7} {:>5} {:>5} {:>4}  {}{}",
+        "{:<28} {:>6.2} {:>6.2} {:>6} {:>7} {:>5} {:>7} {:>7} {:>5} {:>5} {:>4}  {}{}",
         row.id.chars().take(28).collect::<String>(),
         row.recall,
         row.precision,
+        row.margin.map_or("-".to_string(), |m| format!("{m:.3}")),
         format!("{}/{}", row.excluded, row.distractors),
         if row.scope_ok { "ok" } else { "FAIL" },
         format!("{}/{}", row.citations_valid, row.citations_total),

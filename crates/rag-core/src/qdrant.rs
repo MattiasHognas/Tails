@@ -2,7 +2,7 @@ use crate::chunk::embedding_input;
 use crate::domain::{Hit, RagDocument, SourceKind};
 use crate::error::{RagError, Stage, UpstreamError};
 use crate::resilience::{HttpConfig, RetryPolicy, send_with_retry};
-use crate::sparse::{SparseVector, document_vector};
+use crate::sparse::{SparseVector, document_vector, query_vector, query_vector_without_stopwords};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -17,12 +17,130 @@ pub const SPARSE_VECTOR: &str = "sparse";
 /// normalization in [`Qdrant::hybrid_search`]) cannot change with a Qdrant upgrade.
 pub const RRF_K: u32 = 2;
 
+/// How [`Qdrant::hybrid_search`] fuses its dense and keyword prefetch lists
+/// (`RAG_FUSION`). See docs/ARCHITECTURE.md#retrieval.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Fusion {
+    /// Reciprocal rank fusion (`{"rrf": {"k": RRF_K}}`): a point at 0-based rank `r`
+    /// of a list scores `1 / (k + r)`, summed over the lists. Only ranks count.
+    #[default]
+    Rrf,
+    /// Distribution-based score fusion (`{"fusion": "dbsf"}`): Qdrant maps each list's
+    /// raw scores to `(s − (μ − 3σ)) / 6σ` (μ and σ the list's mean and sample standard
+    /// deviation; not clipped, so a far outlier exceeds 1; 0.5 for a list of one point
+    /// or of equal scores) and sums them over the lists. How far apart the raw scores
+    /// are counts, not only their order.
+    Dbsf,
+}
+
+impl Fusion {
+    /// `rrf` or `dbsf`, case-insensitive.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "rrf" => Some(Fusion::Rrf),
+            "dbsf" => Some(Fusion::Dbsf),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Fusion::Rrf => "rrf",
+            Fusion::Dbsf => "dbsf",
+        }
+    }
+
+    /// The `query` of the fused request.
+    fn query(self) -> serde_json::Value {
+        match self {
+            Fusion::Rrf => json!({"rrf": {"k": RRF_K}}),
+            Fusion::Dbsf => json!({"fusion": "dbsf"}),
+        }
+    }
+
+    /// The score of a point whose fused score is `raw`, in [0, 1]: `raw` divided by the
+    /// best score this fusion gives over `lists` prefetch lists, capped at 1.
+    ///
+    /// - RRF: the best is first in every list, `lists / k`.
+    /// - DBSF: the best is 3σ above the mean in every list, `lists`, so the score is
+    ///   the mean of the point's normalized scores over the lists (0 for a list it is
+    ///   not in, 0.5 at a list's mean). An outlier further out than 3σ exceeds that;
+    ///   when the response's `top` point does, every score is divided by `top` instead,
+    ///   so the order and ratios of the points stay (the top point scores 1) rather than
+    ///   several points being capped at 1 alike. Negative scores (far below a list's
+    ///   mean) count as 0.
+    pub fn normalize(self, raw: f32, lists: usize, top: f32) -> f32 {
+        let best = match self {
+            Fusion::Rrf => lists as f32 / RRF_K as f32,
+            Fusion::Dbsf => (lists as f32).max(top),
+        };
+        (raw / best).clamp(0.0, 1.0)
+    }
+}
+
+/// Query-side settings of [`Qdrant::hybrid_search`], from `RAG_FUSION` and
+/// `RAG_KEYWORD_STOPWORDS`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HybridConfig {
+    pub fusion: Fusion,
+    /// Drop English function words ([`crate::sparse::QUERY_STOPWORDS`]) from the
+    /// keyword query vectors. Stored document vectors are never filtered.
+    pub query_stopwords: bool,
+}
+
+impl HybridConfig {
+    /// `RAG_FUSION` (`rrf` | `dbsf`) and `RAG_KEYWORD_STOPWORDS` (`on` | `off`); unset
+    /// or empty means the default. Any other value is an error, so a typo cannot
+    /// silently serve (or measure) another configuration.
+    pub fn from_env() -> Result<Self> {
+        let d = Self::default();
+        let var = |name: &str| std::env::var(name).ok().filter(|v| !v.trim().is_empty());
+        let fusion = match var("RAG_FUSION") {
+            None => d.fusion,
+            Some(v) => Fusion::parse(&v)
+                .ok_or_else(|| anyhow::anyhow!("RAG_FUSION must be rrf or dbsf, not {v:?}"))?,
+        };
+        let query_stopwords = match var("RAG_KEYWORD_STOPWORDS") {
+            None => d.query_stopwords,
+            Some(v) => match v.trim().to_ascii_lowercase().as_str() {
+                "on" | "true" | "1" | "yes" => true,
+                "off" | "false" | "0" | "no" => false,
+                _ => anyhow::bail!("RAG_KEYWORD_STOPWORDS must be on or off, not {v:?}"),
+            },
+        };
+        Ok(Self {
+            fusion,
+            query_stopwords,
+        })
+    }
+
+    /// The keyword query vector of `text` under this configuration.
+    pub fn keyword_query(&self, text: &str) -> SparseVector {
+        if self.query_stopwords {
+            query_vector_without_stopwords(text)
+        } else {
+            query_vector(text)
+        }
+    }
+
+    /// `fusion=rrf stopwords=off`, for logs and reports.
+    pub fn describe(&self) -> String {
+        format!(
+            "fusion={} stopwords={}",
+            self.fusion.name(),
+            if self.query_stopwords { "on" } else { "off" }
+        )
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Qdrant {
     pub endpoint: String,
     pub collection: String,
     pub http: reqwest::Client,
     pub retry: RetryPolicy,
+    /// Fusion and keyword query settings of [`Qdrant::hybrid_search`].
+    pub hybrid: HybridConfig,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -89,12 +207,12 @@ pub struct SearchQuery {
 
 /// Body of the hybrid `POST /collections/{c}/points/query` and the number of prefetch
 /// lists it fuses: per query a dense and (unless it has no tokens) a sparse prefetch,
-/// each restricted by `filter` and returning up to `limit` points, fused with reciprocal
-/// rank fusion ([`RRF_K`]).
+/// each restricted by `filter` and returning up to `limit` points, fused with `fusion`.
 pub fn hybrid_query_body(
     queries: &[SearchQuery],
     limit: usize,
     filter: Option<&serde_json::Value>,
+    fusion: Fusion,
 ) -> (serde_json::Value, usize) {
     let prefetch_of = |query: serde_json::Value, using: &str| {
         let mut p = json!({"query": query, "using": using, "limit": limit});
@@ -113,7 +231,7 @@ pub fn hybrid_query_body(
     let lists = prefetch.len();
     let body = json!({
         "prefetch": prefetch,
-        "query": {"rrf": {"k": RRF_K}},
+        "query": fusion.query(),
         "limit": limit,
         "with_payload": true,
     });
@@ -258,6 +376,7 @@ impl Qdrant {
             collection,
             http: HttpConfig::default().build_client(),
             retry: RetryPolicy::default(),
+            hybrid: HybridConfig::default(),
         }
     }
 
@@ -268,6 +387,7 @@ impl Qdrant {
         );
         qdrant.http = HttpConfig::from_env().build_client();
         qdrant.retry = RetryPolicy::from_env();
+        qdrant.hybrid = HybridConfig::from_env()?;
         Ok(qdrant)
     }
 
@@ -489,14 +609,19 @@ impl Qdrant {
     }
 
     /// Hybrid search: dense and keyword search for every query, each restricted by
-    /// `filter`, fused by Qdrant with reciprocal rank fusion (see [`hybrid_query_body`]).
+    /// `filter`, fused by Qdrant with [`HybridConfig::fusion`] (see
+    /// [`hybrid_query_body`]).
     ///
-    /// Returns at most `limit` hits. A hit's score is its fused RRF score divided by the
-    /// best possible one (first in every prefetch list), so it lies in (0, 1]: 1 means
-    /// ranked first by every search, 0.667 second by all, 0.5 first by half of them or
-    /// third by all (with [`RRF_K`] = 2). Only ranks count, not the raw similarities, so
-    /// scores of different questions are comparable and the reranker's kind priors and
-    /// recency weight ([`crate::reranker::recency_weight`]) scale them like before.
+    /// Returns at most `limit` hits, with scores in [0, 1] ([`Fusion::normalize`]):
+    /// - RRF (default): the fused score divided by the best possible one (first in
+    ///   every prefetch list): 1 means ranked first by every search, 0.667 second by
+    ///   all, 0.5 first by half of them or third by all (with [`RRF_K`] = 2).
+    /// - DBSF: the mean over the lists of the point's normalized score: 0.5 at a list's
+    ///   mean, 1 at 3σ above it, 0 in a list it is not in.
+    ///
+    /// Either way the scale does not depend on the units of the raw similarities, so
+    /// the reranker's kind priors and recency weight
+    /// ([`crate::reranker::recency_weight`]) scale every question's scores alike.
     pub async fn hybrid_search(
         &self,
         queries: &[SearchQuery],
@@ -516,7 +641,7 @@ impl Qdrant {
             score: f32,
             payload: QdrantPayload,
         }
-        let (req, lists) = hybrid_query_body(queries, limit, filter.as_ref());
+        let (req, lists) = hybrid_query_body(queries, limit, filter.as_ref(), self.hybrid.fusion);
         if lists == 0 {
             return Err(RagError::failed(
                 Stage::Retrieval,
@@ -534,13 +659,14 @@ impl Qdrant {
             .json()
             .await
             .map_err(|e| RagError::failed(Stage::Retrieval, UpstreamError::from_reqwest(e)))?;
-        let best = lists as f32 / RRF_K as f32;
+        let fusion = self.hybrid.fusion;
+        let top = v.result.points.first().map_or(0.0, |p| p.score);
         Ok(v.result
             .points
             .into_iter()
             .map(|it| Hit {
                 doc: it.payload.into(),
-                score: (it.score / best).min(1.0),
+                score: fusion.normalize(it.score, lists, top),
             })
             .collect())
     }
@@ -745,6 +871,137 @@ mod tests {
     }
 
     #[test]
+    fn hybrid_config_reads_fusion_and_stopwords_from_env() {
+        use crate::test_support::EnvVarGuard;
+        let _env_lock = lock_env();
+        let _f = EnvVarGuard::preserve("RAG_FUSION");
+        let _s = EnvVarGuard::preserve("RAG_KEYWORD_STOPWORDS");
+        let set = |fusion: Option<&str>, stopwords: Option<&str>| unsafe {
+            match fusion {
+                Some(v) => std::env::set_var("RAG_FUSION", v),
+                None => std::env::remove_var("RAG_FUSION"),
+            }
+            match stopwords {
+                Some(v) => std::env::set_var("RAG_KEYWORD_STOPWORDS", v),
+                None => std::env::remove_var("RAG_KEYWORD_STOPWORDS"),
+            }
+        };
+        set(None, None);
+        assert_eq!(HybridConfig::from_env().unwrap(), HybridConfig::default());
+        assert_eq!(
+            Qdrant::new_from_env().unwrap().hybrid,
+            HybridConfig::default()
+        );
+        set(Some(" DBSF "), Some("on"));
+        let c = HybridConfig::from_env().unwrap();
+        assert_eq!(
+            c,
+            HybridConfig {
+                fusion: Fusion::Dbsf,
+                query_stopwords: true
+            }
+        );
+        assert_eq!(c.describe(), "fusion=dbsf stopwords=on");
+        assert_eq!(Qdrant::new_from_env().unwrap().hybrid, c);
+        set(Some("rrf"), Some("off"));
+        assert_eq!(
+            HybridConfig::from_env().unwrap(),
+            HybridConfig {
+                fusion: Fusion::Rrf,
+                query_stopwords: false
+            }
+        );
+        // Empty is unset; a typo is an error, never a silent default.
+        set(Some(""), Some(" "));
+        assert_eq!(HybridConfig::from_env().unwrap(), HybridConfig::default());
+        set(Some("rfr"), None);
+        let err = HybridConfig::from_env().unwrap_err().to_string();
+        assert!(err.contains("RAG_FUSION"), "{err}");
+        assert!(Qdrant::new_from_env().is_err());
+        set(None, Some("maybe"));
+        let err = HybridConfig::from_env().unwrap_err().to_string();
+        assert!(err.contains("RAG_KEYWORD_STOPWORDS"), "{err}");
+    }
+
+    #[test]
+    fn keyword_queries_drop_stopwords_only_when_configured() {
+        let q = "Which errors did the inventory service log?";
+        let off = HybridConfig::default();
+        let on = HybridConfig {
+            query_stopwords: true,
+            ..off
+        };
+        assert_eq!(off.keyword_query(q), query_vector(q));
+        assert_eq!(
+            on.keyword_query(q),
+            query_vector("errors inventory service log")
+        );
+    }
+
+    #[test]
+    fn fused_scores_are_normalized_per_fusion() {
+        // RRF: best is first in every list, lists / k.
+        assert_eq!(Fusion::Rrf.normalize(1.5, 3, 1.5), 1.0);
+        assert!((Fusion::Rrf.normalize(1.0 / 3.0, 3, 1.5) - 2.0 / 9.0).abs() < 1e-6);
+        // DBSF: the mean of the per-list normalized scores...
+        assert!((Fusion::Dbsf.normalize(1.5, 2, 1.5) - 0.75).abs() < 1e-6);
+        assert!((Fusion::Dbsf.normalize(0.5, 2, 1.5) - 0.25).abs() < 1e-6);
+        // ...unless the top point is beyond 3σ on average: then relative to the top,
+        // keeping the ratios instead of capping several points at 1.
+        assert_eq!(Fusion::Dbsf.normalize(2.5, 2, 2.5), 1.0);
+        assert!((Fusion::Dbsf.normalize(2.25, 2, 2.5) - 0.9).abs() < 1e-6);
+        assert!((Fusion::Dbsf.normalize(1.0, 2, 2.5) - 0.4).abs() < 1e-6);
+        // Far below every list's mean.
+        assert_eq!(Fusion::Dbsf.normalize(-0.1, 2, 1.0), 0.0);
+        assert_eq!(Fusion::parse("Dbsf"), Some(Fusion::Dbsf));
+        assert_eq!(Fusion::parse("rrf"), Some(Fusion::Rrf));
+        assert_eq!(Fusion::parse("sum"), None);
+        assert_eq!(Fusion::default(), Fusion::Rrf);
+    }
+
+    #[test]
+    fn dbsf_queries_fuse_the_same_prefetches_with_dbsf() {
+        let queries = [query(&[0.5, 0.25], "ERR_CONN_RESET")];
+        let (rrf, n_rrf) = hybrid_query_body(&queries, 10, None, Fusion::Rrf);
+        let (dbsf, n_dbsf) = hybrid_query_body(&queries, 10, None, Fusion::Dbsf);
+        assert_eq!(n_rrf, n_dbsf);
+        assert_eq!(dbsf["query"], serde_json::json!({"fusion": "dbsf"}));
+        assert_eq!(rrf["prefetch"], dbsf["prefetch"]);
+        assert_eq!(rrf["limit"], dbsf["limit"]);
+    }
+
+    #[tokio::test]
+    async fn dbsf_hybrid_search_normalizes_by_lists_or_the_top_point() {
+        use wiremock::matchers::{body_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let queries = [query(&[0.5, 0.25], "ERR_CONN_RESET")];
+        let (body, lists) = hybrid_query_body(&queries, 10, None, Fusion::Dbsf);
+        assert_eq!(lists, 2);
+        let point = |id: &str, score: f32| {
+            serde_json::json!({"id": 1, "version": 1, "score": score,
+                "payload": {"Title": "t", "Text": "x", "SourceUri": "u", "Service": "",
+                            "Environment": "", "id": id, "Timestamp": null, "Kind": "logs"}})
+        };
+        Mock::given(method("POST"))
+            .and(path("/collections/test/points/query"))
+            .and(body_json(body))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": {"points": [point("a", 1.6), point("b", 0.8)]}, "status": "ok"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut qd = mock_qdrant(server.uri());
+        qd.hybrid.fusion = Fusion::Dbsf;
+        let hits = qd.hybrid_search(&queries, 10, None).await.unwrap();
+        let scores: Vec<f32> = hits.iter().map(|h| h.score).collect();
+        assert!((scores[0] - 0.8).abs() < 1e-6, "{scores:?}");
+        assert!((scores[1] - 0.4).abs() < 1e-6, "{scores:?}");
+    }
+
+    #[test]
     fn test_qdrant_new_from_env_custom() {
         let _env_lock = lock_env();
 
@@ -844,7 +1101,7 @@ mod tests {
             query(&[0.5, 0.25], "ERR_CONN_RESET"),
             query(&[0.125, 0.75], "?"),
         ];
-        let (body, lists) = hybrid_query_body(&queries, 10, Some(&filter));
+        let (body, lists) = hybrid_query_body(&queries, 10, Some(&filter), Fusion::Rrf);
         // The second query has no tokens, so it only searches the dense vector.
         assert_eq!(lists, 3);
         assert_eq!(
@@ -863,7 +1120,7 @@ mod tests {
             })
         );
         // Without a filter the prefetches carry none.
-        let (body, lists) = hybrid_query_body(&queries[..1], 5, None);
+        let (body, lists) = hybrid_query_body(&queries[..1], 5, None, Fusion::Rrf);
         assert_eq!(lists, 2);
         for p in body["prefetch"].as_array().unwrap() {
             assert!(p.get("filter").is_none(), "{p}");
@@ -882,7 +1139,7 @@ mod tests {
             query(&[0.5, 0.25], "ERR_CONN_RESET"),
             query(&[0.125, 0.75], "?"),
         ];
-        let (body, _) = hybrid_query_body(&queries, 10, Some(&filter));
+        let (body, _) = hybrid_query_body(&queries, 10, Some(&filter), Fusion::Rrf);
         let payload = serde_json::json!({
             "Title": "Test Document",
             "Text": "Document content",

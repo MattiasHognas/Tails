@@ -65,9 +65,10 @@ async fn run(store: Store, models: Models) -> (Vec<Row>, Thresholds) {
     questions::to_groups(&mut dataset, &groups);
 
     println!(
-        "\nincident questions v{} | store: {} | models: {}",
+        "\nincident questions v{} | store: {} | {} | models: {}",
         dataset.version,
         store.describe(),
+        store.qdrant().hybrid.describe(),
         if models == Models::Fake {
             "fake embeddings + canned answers"
         } else {

@@ -29,6 +29,12 @@
 #   API_ADDR         where rag-api listens (RAG_API_ADDR) [127.0.0.1:5191]
 #   E2E_SKIP_BUILD   1: use the existing release binaries
 #   E2E_KEEP         1: keep the collection and the work directory
+#   E2E_COMPARE      further query-side configurations to ask the questions with after
+#                    the main run, on the same index, as fusion:stopwords separated by
+#                    spaces (e.g. "dbsf:off rrf:on dbsf:on"); a table compares them.
+#                    Informational: only the main run (RAG_FUSION and
+#                    RAG_KEYWORD_STOPWORDS as set, else the defaults) decides the exit
+#                    status [none]
 # API_ADDR and FAKES_ADDR must be free.
 set -euo pipefail
 
@@ -46,6 +52,7 @@ TEI_DATA="${TEI_DATA:-$HOME/.cache/tails-e2e/tei}"
 FAKES_ADDR="${FAKES_ADDR:-127.0.0.1:8900}"
 FAKES_URL="http://$FAKES_ADDR"
 API_ADDR="${API_ADDR:-127.0.0.1:5191}"
+E2E_COMPARE="${E2E_COMPARE:-}"
 COLLECTION="tails_e2e_$(date +%s)_$$"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/tails-e2e.XXXXXX")"
 PIDS=()
@@ -183,7 +190,32 @@ echo "rag-indexer exited 0 after $(( SECONDS - start ))s"
 grep -E "Indexed |created Qdrant collection" "$WORK/rag-indexer.log" | sed -E 's/^.*(INFO|WARN) [^ ]+: //' || true
 [[ -s "$WORK/watermark.json" ]] || { echo "rag-indexer wrote no watermark" >&2; exit 1; }
 
-log "Asking the incident questions through rag-cli"
-"$TARGET/tails-e2e" --api-bin "$TARGET/rag-api" --cli-bin "$TARGET/rag-cli" \
-  --api-base "http://$API_ADDR" --fakes "$FAKES_URL" --api-log "$WORK/rag-api.log"
+# Asks every question with the query-side configuration `$1` (a label), writing its
+# summary for the comparison table.
+ask_all() {
+  "$TARGET/tails-e2e" --api-bin "$TARGET/rag-api" --cli-bin "$TARGET/rag-cli" \
+    --api-base "http://$API_ADDR" --fakes "$FAKES_URL" --api-log "$WORK/rag-api-$1.log" \
+    --summary "$WORK/summary-$1.json"
+}
+
+log "Asking the incident questions through rag-cli (RAG_FUSION=${RAG_FUSION:-default}, RAG_KEYWORD_STOPWORDS=${RAG_KEYWORD_STOPWORDS:-default})"
+GATE=0
+ask_all main || GATE=$?
+SUMMARIES=("$WORK/summary-main.json")
+
+# Fusion and keyword stopwords only change how rag-api queries, so the other
+# configurations reuse the index. Informational: they never fail the run.
+for cfg in $E2E_COMPARE; do
+  fusion="${cfg%%:*}" stopwords="${cfg#*:}"
+  log "Comparison run (informational): RAG_FUSION=$fusion RAG_KEYWORD_STOPWORDS=$stopwords"
+  if ! RAG_FUSION="$fusion" RAG_KEYWORD_STOPWORDS="$stopwords" ask_all "$fusion-$stopwords"; then
+    echo "($cfg is below a threshold or failed a hard check; informational only)"
+  fi
+  [[ -f "$WORK/summary-$fusion-$stopwords.json" ]] && SUMMARIES+=("$WORK/summary-$fusion-$stopwords.json")
+done
+if [[ -n "$E2E_COMPARE" && -f "${SUMMARIES[0]}" ]]; then
+  log "Configurations compared (the first one decides the run)"
+  python3 "$ROOT/scripts/e2e_compare.py" "${SUMMARIES[@]}"
+fi
+[[ "$GATE" -eq 0 ]] || exit "$GATE"
 STATUS=0

@@ -2,9 +2,10 @@
 //! `rag-api` binaries after `rag-indexer` has indexed the corpus, and scores the
 //! answers. Driven by `scripts/e2e.sh`; see docs/DEVELOPMENT.md#end-to-end-tests.
 //!
-//! It reads the same environment as the binaries (`OPENAI_*`, `QDRANT_*`, `DD_*`), so
-//! the dimension probe goes to the embedding endpoint the indexer used and `rag-api`,
-//! which it starts itself, inherits the configuration.
+//! It reads the same environment as the binaries (`OPENAI_*`, `QDRANT_*`, `DD_*`,
+//! `RAG_FUSION`, `RAG_KEYWORD_STOPWORDS`), so the dimension probe goes to the embedding
+//! endpoint the indexer used and `rag-api`, which it starts itself, inherits the
+//! configuration.
 //!
 //! 1. Hard: the collection exists with the embedding model's dimension and has points.
 //! 2. Reads every stored point back with the reader's payload type.
@@ -19,8 +20,11 @@
 //!
 //! 5. Explains every question whose must-retrieve documents aren't all ranked first:
 //!    the top documents of dense search and of keyword search alone (per query text,
-//!    with the question's scope), and the reranked sources with their scores from the
-//!    answer prompt, so a ranking difference can be traced to its search.
+//!    with the question's scope, keyword queries as the API builds them), the fused
+//!    hybrid search, and the reranked sources with their scores from the answer
+//!    prompt, so a ranking difference can be traced to its search.
+//! 6. With `--summary`, writes the configuration, aggregates and per-question results
+//!    as JSON, for `scripts/e2e.sh` to compare configurations.
 //!
 //! Exits 1 when a hard check fails or an aggregate is below its threshold.
 
@@ -28,7 +32,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
 use rag_core::domain::RagDocument;
 use rag_core::openai::OpenAiClient;
-use rag_core::qdrant::QdrantPayload;
+use rag_core::qdrant::{HybridConfig, Qdrant, QdrantPayload, SearchQuery};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -65,6 +69,9 @@ struct Args {
     /// rag-api's output is appended here.
     #[arg(long, default_value = "rag-api.log")]
     api_log: PathBuf,
+    /// Write the configuration, aggregates and per-question results here as JSON.
+    #[arg(long)]
+    summary: Option<PathBuf>,
 }
 
 #[derive(Deserialize)]
@@ -282,11 +289,11 @@ async fn top_points(
 async fn explain(
     http: &reqwest::Client,
     oa: &OpenAiClient,
-    qdrant: &str,
-    collection: &str,
+    qd: &Qdrant,
     q: &Question,
     prompt: Option<&str>,
 ) -> Result<()> {
+    let (qdrant, collection) = (qd.endpoint.as_str(), qd.collection.as_str());
     println!(
         "\nexplain {} (must retrieve {:?}): {:?}",
         q.id, q.expect.must_retrieve, q.question
@@ -299,10 +306,18 @@ async fn explain(
         texts.push(rw.to_string());
     }
     let dense = oa.embed_queries(&texts).await?;
-    for (text, vector) in texts.iter().zip(dense) {
+    let searches: Vec<SearchQuery> = texts
+        .iter()
+        .zip(&dense)
+        .map(|(text, dense)| SearchQuery {
+            dense: dense.clone(),
+            sparse: qd.hybrid.keyword_query(text),
+        })
+        .collect();
+    for (text, search) in texts.iter().zip(&searches) {
         let lists = [
-            ("dense", json!(vector)),
-            ("keyword", json!(rag_core::sparse::query_vector(text))),
+            ("dense", json!(search.dense)),
+            ("keyword", json!(search.sparse)),
         ];
         for (name, query) in lists {
             let using = if name == "dense" { "dense" } else { "sparse" };
@@ -316,6 +331,30 @@ async fn explain(
                 println!("    {}. {score:.4}  {id}  {title}", rank + 1);
             }
         }
+    }
+    // As many candidates as the API retrieves: DBSF normalizes over the whole lists.
+    let candidates = std::env::var("RAG_SEARCH_CANDIDATES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(64);
+    println!(
+        "  hybrid search ({}, {candidates} candidates, normalized score):",
+        qd.hybrid.describe()
+    );
+    for (rank, hit) in qd
+        .hybrid_search(&searches, candidates, filter.clone())
+        .await?
+        .iter()
+        .take(5)
+        .enumerate()
+    {
+        println!(
+            "    {}. {:.4}  {}  {}",
+            rank + 1,
+            hit.score,
+            hit.doc.parent_id(),
+            hit.doc.title
+        );
     }
     println!("  reranked sources (score after kind prior and recency weight):");
     let mut title = None;
@@ -359,6 +398,10 @@ async fn main() -> Result<()> {
     .with_context(|| format!("{thresholds_path:?}"))?;
     let qdrant = env("QDRANT_ENDPOINT")?.trim_end_matches('/').to_string();
     let collection_name = env("QDRANT_COLLECTION")?;
+    // The API's retrieval settings: rag-api inherits the same environment.
+    let hybrid = HybridConfig::from_env()?;
+    let mut qd = Qdrant::new(qdrant.clone(), collection_name.clone());
+    qd.hybrid = hybrid;
     let mut hard: Vec<String> = vec![];
 
     // The embedding model's dimension, from the endpoint the indexer used.
@@ -458,9 +501,10 @@ async fn main() -> Result<()> {
     let rows: Vec<Row> = rows.into_iter().flatten().collect();
 
     println!(
-        "\nincident questions v{} | real Qdrant | embeddings: {} (dimension {dim}) | \
+        "\nincident questions v{} | real Qdrant | {} | embeddings: {} (dimension {dim}) | \
          canned plans and answers | {} questions in {:.1}s",
         dataset.version,
+        hybrid.describe(),
         oa.embedding_model,
         rows.len(),
         started.elapsed().as_secs_f64()
@@ -471,16 +515,7 @@ async fn main() -> Result<()> {
     }
     questions::print_aggregate(&rows, &e2e.thresholds);
     for (i, prompt) in &to_explain {
-        if let Err(e) = explain(
-            &http,
-            &oa,
-            &qdrant,
-            &collection_name,
-            &dataset.questions[*i],
-            prompt.as_deref(),
-        )
-        .await
-        {
+        if let Err(e) = explain(&http, &oa, &qd, &dataset.questions[*i], prompt.as_deref()).await {
             println!("  (could not explain: {e:#})");
         }
     }
@@ -503,8 +538,44 @@ async fn main() -> Result<()> {
     } else {
         println!("quality: BELOW THRESHOLD: {below:?}");
     }
+    if let Some(path) = &args.summary {
+        let summary = summary(&hybrid, &rows, &hard, &below);
+        std::fs::write(path, serde_json::to_string_pretty(&summary)?)
+            .with_context(|| format!("{path:?}"))?;
+    }
     if !hard.is_empty() || !below.is_empty() {
         std::process::exit(1);
     }
     Ok(())
+}
+
+/// The run as JSON: configuration, aggregates, per-question results and failures.
+fn summary(hybrid: &HybridConfig, rows: &[Row], hard: &[String], below: &[String]) -> Value {
+    let a = questions::aggregate(rows);
+    json!({
+        "fusion": hybrid.fusion.name(),
+        "stopwords": hybrid.query_stopwords,
+        "aggregate": {
+            "recallAtK": a.recall_at_k,
+            "precisionAtR": a.precision_at_r,
+            "distractorExclusion": a.distractor_exclusion,
+            "scopeAccuracy": a.scope_accuracy,
+            "citationValidity": a.citation_validity,
+            "citationAccuracy": a.citation_accuracy,
+            "observationRecall": a.observation_recall,
+            "negativeControlsFlagged": a.negative_controls_flagged,
+            "evidenceAccuracy": a.evidence_accuracy,
+        },
+        "questions": rows.iter().map(|r| json!({
+            "id": r.id,
+            "recall": r.recall,
+            "precision": r.precision,
+            "excluded": r.excluded,
+            "distractors": r.distractors,
+            "margin": r.margin,
+            "problems": r.problems,
+        })).collect::<Vec<_>>(),
+        "hard": hard,
+        "belowThreshold": below,
+    })
 }
