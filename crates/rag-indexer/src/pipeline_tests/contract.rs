@@ -23,7 +23,12 @@
 //! - bookkeeping keys (`ContentHash`, `ChunkCount`, `SyncId`) are written but never
 //!   reach `RagDocument` or `sources`; a second run leaves unchanged documents alone;
 //! - `sources` point at stored documents, are numbered like the prompt, and every
-//!   citation in the answer resolves (unknown ones are reported in `citationWarnings`).
+//!   citation in the answer resolves (unknown ones are reported in `citationWarnings`);
+//! - incident details and dashboard definitions: an incident's timeline and postmortem
+//!   and a dashboard's widgets reach the stored text, a dashboard's service from its
+//!   widget queries (`Auth-API`) matches the planner's `AUTH-API`, an incident whose
+//!   detail requests fail is still stored, and the second run fetches no dashboard
+//!   definition again.
 
 use super::support::{self, Corpus, FakeOpenAi, Store, at, openai::DIM};
 use rag_core::{
@@ -70,6 +75,15 @@ fn crafted() -> Corpus {
              "tags": ["service:checkout", "env:prod"]}
         ],
         "metrics": ["checkout.orders.completed"],
+        "dashboards": [
+            {"id": "dash-auth", "title": "Inloggning – översikt 🔐", "description": null,
+             "created_at": "2025-05-01T10:00:00+00:00", "modified_at": "2026-01-01T10:00:00+00:00",
+             "author_handle": "id@example.com", "template_variables": null,
+             "widgets": [
+                {"id": 1, "definition": {"type": "timeseries", "title": "Misslyckade inloggningar",
+                    "requests": [{"q": "sum:auth.login.failures{service:Auth-API,env:PROD}.as_count()"}]}}
+             ]}
+        ],
         "incidents": [
             {"id": "inc-auth", "type": "incidents", "attributes": {
                 "public_id": 901, "title": "Auth-API login failures",
@@ -77,7 +91,27 @@ fn crafted() -> Corpus {
                 "customer_impact_scope": "Users could not log in",
                 "fields": {"severity": {"type": "dropdown", "value": "SEV-1"},
                            "services": {"type": "autocomplete", "value": ["Auth-API"]},
-                           "env": {"type": "dropdown", "value": "PROD"}}}}
+                           "env": {"type": "dropdown", "value": "PROD"}}}},
+            {"id": "inc-flaky", "type": "incidents", "attributes": {
+                "public_id": 902, "title": "Checkout flaky retries",
+                "created": "2026-03-11T15:00:00+00:00", "state": "resolved",
+                "fields": {"services": {"type": "autocomplete", "value": ["checkout"]},
+                           "env": {"type": "dropdown", "value": "prod"}}}}
+        ],
+        "incidentTimelines": {"inc-auth": [
+            {"id": "c1", "type": "incident_timeline_cells", "attributes": {"cell_type": "markdown",
+             "created": "2026-03-11T14:20:00+00:00",
+             "content": {"content": "Roterade signeringsnyckeln tillbaka 🔑; inloggningar återställda."}}}
+        ]},
+        "incidentAttachments": {"inc-auth": [
+            {"id": "a1", "type": "incident_attachments", "attributes": {"attachment_type": "postmortem",
+             "attachment": {"title": "Postmortem 901", "documentUrl": "https://app.datadoghq.eu/notebook/901/pm"}}}
+        ]},
+        "notebooks": [
+            {"id": 901, "type": "notebooks", "attributes": {"name": "Postmortem 901", "cells": [
+                {"id": "x", "type": "notebook_cells", "attributes": {"definition": {"type": "markdown",
+                 "text": "Grundorsak: nyckelrotation utan överlapp."}}}
+            ]}}
         ],
         "logs": [
             log("auth-1", "Auth-API", "prod", "2026-03-11T14:02:00.000Z", "login failed för åsa.öberg"),
@@ -106,6 +140,7 @@ fn crafted() -> Corpus {
 fn corpus() -> Corpus {
     let mut c = Corpus::fixtures();
     c.extend(crafted());
+    c.failing_incident_details = vec!["inc-flaky".into()];
     c
 }
 
@@ -353,6 +388,17 @@ fn cases() -> Vec<Case> {
                 "Occurrences in the question's window: 1 (Wed 2026-03-11: 1; days in Europe/Stockholm",
             )],
         },
+        // A dashboard's service comes from its widget queries (`Auth-API`) and meets
+        // the planner's `AUTH-API`; the unscoped fixture dashboards stay out.
+        Case {
+            question: "Which dashboards show auth-api logins?",
+            plan: json!({"intent": "dashboardLookup", "service": "AUTH-API", "environment": "PROD"}),
+            request: json!({"kinds": ["dashboard"]}),
+            must: &["dashboard_dash-auth"],
+            must_not: &["dashboard_npw-6di-usv", "dashboard_448-ktj-ezs"],
+            each: |s| s["kind"] == "dashboard" && s["service"] == "auth-api",
+            evidence: &[],
+        },
         // `Kind` = "sLO" on both sides.
         Case {
             question: "availability objectives",
@@ -442,6 +488,24 @@ async fn run_contract(store: Store) {
     ] {
         assert_ne!(id(a), id(b));
     }
+    // Incident details and dashboard definitions reach the stored documents.
+    let auth = &expected["incident_inc-auth#c0"].text;
+    assert!(
+        auth.contains("Roterade signeringsnyckeln tillbaka 🔑")
+            && auth.contains("Postmortem: Postmortem 901\nGrundorsak: nyckelrotation"),
+        "{auth}"
+    );
+    let flaky = &expected["incident_inc-flaky#c0"];
+    assert!(!flaky.text.contains("Timeline") && !flaky.text.contains("Postmortem"));
+    let dash = &expected["dashboard_dash-auth#c0"];
+    assert_eq!(
+        (dash.service.as_str(), dash.environment.as_str()),
+        ("auth-api", "prod")
+    );
+    assert!(
+        dash.text
+            .contains("- Misslyckade inloggningar: sum:auth.login.failures")
+    );
     check_stored_points(&store, &expected).await;
     let stored = support::stored_chunks(&store).await;
 
@@ -531,8 +595,16 @@ async fn run_contract(store: Store) {
     // A second run 15 minutes later finds every document unchanged (only metric catalog
     // entries, stamped with the run time, are rewritten) and writes nothing else.
     let before = support::stored_chunks(&store).await;
-    support::index(&corpus, oa, &store, now + chrono::Duration::minutes(15)).await;
+    let requests = support::index(&corpus, oa, &store, now + chrono::Duration::minutes(15)).await;
     let after = support::stored_chunks(&store).await;
+    let definitions: Vec<_> = requests
+        .iter()
+        .filter(|p| p.starts_with("/api/v1/dashboard/"))
+        .collect();
+    assert!(
+        definitions.is_empty(),
+        "unchanged dashboards were fetched again: {definitions:?}"
+    );
     assert_eq!(
         before.keys().collect::<Vec<_>>(),
         after.keys().collect::<Vec<_>>()

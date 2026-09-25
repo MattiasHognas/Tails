@@ -28,7 +28,8 @@ pub struct Datadog {
     pub api_base: String,
     pub http: reqwest::Client,
     /// Retry budget for the live-evidence queries ([`Self::query_metrics`],
-    /// [`Self::search_log_events`]). Indexing calls are not retried here.
+    /// [`Self::search_log_events`]) and the per-incident and per-dashboard detail
+    /// fetches of indexing. The list and search calls of indexing are not retried here.
     pub retry: RetryPolicy,
 }
 
@@ -151,13 +152,14 @@ impl Datadog {
 
     /// Fetches incidents created within `[from_iso, to_iso]` using
     /// `GET /api/v2/incidents/search`, newest first, following offset pagination
-    /// until the results are older than the window.
+    /// until the results are older than the window, then each one's timeline and
+    /// postmortem (see [`crate::datadog_incidents`]).
     pub async fn get_incidents(&self, from_iso: &str, to_iso: &str) -> Result<Vec<RagDocument>> {
         let url = format!("{}/api/v2/incidents/search", self.api_base);
         let from = chrono::DateTime::parse_from_rfc3339(from_iso)?;
         let to = chrono::DateTime::parse_from_rfc3339(to_iso)?;
 
-        let mut docs = Vec::new();
+        let mut incidents_in_window = Vec::new();
         let mut offset: u64 = 0;
         loop {
             let response = self
@@ -201,7 +203,7 @@ impl Datadog {
                     break;
                 }
                 if created <= to {
-                    docs.push(self.incident_document(incident));
+                    incidents_in_window.push(incident.clone());
                 }
             }
 
@@ -219,70 +221,7 @@ impl Datadog {
             offset = next_offset;
         }
 
-        Ok(docs)
-    }
-
-    fn incident_document(&self, incident: &serde_json::Value) -> RagDocument {
-        let id = incident["id"].as_str().unwrap_or("").to_string();
-        let attrs = &incident["attributes"];
-        let fields = &attrs["fields"];
-        let title = attrs["title"].as_str().unwrap_or("").to_string();
-        let customer_impact = attrs["customer_impact_scope"]
-            .as_str()
-            .unwrap_or("")
-            .to_string();
-        let severity = attrs["severity"]
-            .as_str()
-            .map(str::to_string)
-            .or_else(|| incident_field(fields, "severity"))
-            .unwrap_or_else(|| "UNKNOWN".to_string());
-        let state = attrs["state"]
-            .as_str()
-            .map(str::to_string)
-            .or_else(|| incident_field(fields, "state"))
-            .unwrap_or_default();
-        let created = attrs["created"].as_str().map(|s| s.to_string());
-        let service =
-            normalize_scope_value(&incident_field(fields, "services").unwrap_or_default());
-        let environment = normalize_scope_value(
-            &incident_field(fields, "env")
-                .or_else(|| incident_field(fields, "environment"))
-                .unwrap_or_default(),
-        );
-
-        let mut metadata = serde_json::Map::new();
-        metadata.insert(
-            "severity".to_string(),
-            serde_json::Value::String(severity.clone()),
-        );
-        metadata.insert("state".to_string(), serde_json::Value::String(state));
-        metadata.insert(
-            "customer_impact".to_string(),
-            serde_json::Value::String(customer_impact.clone()),
-        );
-
-        let text = format!(
-            "{}\n\nSeverity: {}\n\nCustomer Impact: {}",
-            title, severity, customer_impact
-        );
-
-        // The web UI addresses incidents by their numeric public ID.
-        let app_id = attrs["public_id"]
-            .as_u64()
-            .map(|n| n.to_string())
-            .unwrap_or_else(|| id.clone());
-
-        RagDocument {
-            id: format!("incident_{}", id),
-            title,
-            text,
-            source_uri: format!("https://app.{}/incidents/{}", self.site, app_id),
-            kind: crate::domain::SourceKind::Incident,
-            timestamp: created,
-            service,
-            environment,
-            metadata,
-        }
+        Ok(self.incident_documents(incidents_in_window).await)
     }
 
     /// Fetches every error/warning log in `[from_iso, to_iso]` with
@@ -505,11 +444,11 @@ impl Datadog {
             .collect())
     }
 
-    /// Fetches all dashboards with `GET /api/v1/dashboard`, following `start`/`count`
-    /// pagination until a short page is returned.
-    pub async fn list_dashboards(&self) -> Result<Vec<RagDocument>> {
+    /// Fetches every dashboard list entry with `GET /api/v1/dashboard`, following
+    /// `start`/`count` pagination until a short page is returned.
+    pub async fn list_dashboard_summaries(&self) -> Result<Vec<serde_json::Value>> {
         let url = format!("{}/api/v1/dashboard", self.api_base);
-        let mut docs = Vec::new();
+        let mut summaries = Vec::new();
         let mut start: u64 = 0;
         loop {
             let response = self
@@ -532,49 +471,23 @@ impl Datadog {
             let dashboards = result["dashboards"].as_array().ok_or_else(|| {
                 anyhow::anyhow!("Unexpected dashboard list response: missing dashboards")
             })?;
-            docs.extend(dashboards.iter().map(|d| self.dashboard_document(d)));
+            summaries.extend(dashboards.iter().cloned());
             if (dashboards.len() as u64) < DASHBOARD_PAGE_SIZE {
                 break;
             }
             start += dashboards.len() as u64;
         }
 
-        Ok(docs)
+        Ok(summaries)
     }
 
-    fn dashboard_document(&self, dashboard: &serde_json::Value) -> RagDocument {
-        let id = dashboard["id"].as_str().unwrap_or("").to_string();
-        let title = dashboard["title"].as_str().unwrap_or("").to_string();
-        let description = dashboard["description"].as_str().unwrap_or("").to_string();
-        let author_handle = dashboard["author_handle"]
-            .as_str()
-            .unwrap_or("")
-            .to_string();
-        let created = dashboard["created_at"].as_str().map(|s| s.to_string());
-
-        let mut metadata = serde_json::Map::new();
-        metadata.insert(
-            "author".to_string(),
-            serde_json::Value::String(author_handle),
-        );
-
-        let text = if description.is_empty() {
-            title.clone()
-        } else {
-            format!("{}\n\n{}", title, description)
-        };
-
-        RagDocument {
-            id: format!("dashboard_{}", id),
-            title,
-            text,
-            source_uri: format!("https://app.{}/dashboard/{}", self.site, id),
-            kind: crate::domain::SourceKind::Dashboard,
-            timestamp: created,
-            service: String::new(),
-            environment: String::new(),
-            metadata,
-        }
+    /// Every dashboard with its definition fetched (within the per-run budget of
+    /// [`crate::datadog_dashboards`]); nothing stored is reused.
+    pub async fn list_dashboards(&self) -> Result<Vec<RagDocument>> {
+        let summaries = self.list_dashboard_summaries().await?;
+        Ok(self
+            .dashboard_documents(&summaries, &std::collections::HashMap::new())
+            .await)
     }
 
     pub async fn list_metrics(&self, from_iso: &str, to_iso: &str) -> Result<Vec<RagDocument>> {
@@ -809,17 +722,6 @@ pub fn log_event(log: &serde_json::Value) -> Option<crate::log_patterns::LogEven
     })
 }
 
-/// Reads an incident field (`{"type": ..., "value": ...}`) as a string, taking the
-/// first entry of multi-value fields such as `services`.
-fn incident_field(fields: &serde_json::Value, name: &str) -> Option<String> {
-    let value = &fields[name]["value"];
-    value
-        .as_str()
-        .or_else(|| value.as_array()?.first()?.as_str())
-        .filter(|v| !v.is_empty())
-        .map(str::to_string)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -955,13 +857,16 @@ mod tests {
             (log.service.as_str(), log.environment.as_str()),
             ("auth-api", "prod")
         );
-        let incident = dd.incident_document(&serde_json::json!({
-            "id": "x",
-            "attributes": {"title": "t", "fields": {
-                "services": {"value": ["Payments"]},
-                "environment": {"value": "Staging"}
-            }}
-        }));
+        let incident = dd.incident_document(
+            &serde_json::json!({
+                "id": "x",
+                "attributes": {"title": "t", "fields": {
+                    "services": {"value": ["Payments"]},
+                    "environment": {"value": "Staging"}
+                }}
+            }),
+            &Default::default(),
+        );
         assert_eq!(
             (incident.service.as_str(), incident.environment.as_str()),
             ("payments", "staging")
@@ -1203,21 +1108,12 @@ mod tests {
         fields["env"] = serde_json::json!({"type": "dropdown", "value": "prod"});
         incident["attributes"]["customer_impact_scope"] = serde_json::json!("EU checkout");
 
-        let doc = dd.incident_document(&incident);
+        let doc = dd.incident_document(&incident, &Default::default());
         assert_eq!(doc.service, "checkout");
         assert_eq!(doc.environment, "prod");
         assert_eq!(doc.metadata["customer_impact"], "EU checkout");
         assert!(doc.text.contains("Customer Impact: EU checkout"));
         assert_eq!(doc.source_uri, "https://app.datadoghq.eu/incidents/128961");
-    }
-
-    #[test]
-    fn test_incident_field_handles_null_values() {
-        let fields = &fixture("incidents_search_page1.json")["data"]["attributes"]["incidents"][0]
-            ["data"]["attributes"]["fields"];
-        assert_eq!(incident_field(fields, "services"), None);
-        assert_eq!(incident_field(fields, "state").as_deref(), Some("active"));
-        assert_eq!(incident_field(fields, "missing"), None);
     }
 
     #[tokio::test]
@@ -1557,14 +1453,31 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
+        // Each listed dashboard's definition is fetched (a recorded `GET` body).
+        Mock::given(method("GET"))
+            .and(path("/api/v1/dashboard/npw-6di-usv"))
+            .and(header("DD-API-KEY", "test_api_key"))
+            .and(header("DD-APPLICATION-KEY", "test_app_key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(fixture("dashboard_get.json")))
+            .expect(1)
+            .mount(&server)
+            .await;
 
         let docs = mock_client(&server).list_dashboards().await.unwrap();
 
         assert_eq!(docs.len(), 1);
         assert_eq!(docs[0].id, "dashboard_npw-6di-usv");
-        // A null description leaves only the title.
-        assert_eq!(docs[0].text, docs[0].title);
+        // A null description leaves the title, then the widget's query.
+        assert_eq!(
+            docs[0].text,
+            format!("{}\n\nWidgets:\n- runtime:jvm", docs[0].title)
+        );
         assert_eq!(docs[0].metadata["author"], "frog@datadoghq.com");
+        assert_eq!(
+            docs[0].metadata["modified_at"],
+            "2023-02-16T21:47:50.216943+00:00"
+        );
+        assert_eq!(docs[0].service, "");
     }
 
     #[tokio::test]
