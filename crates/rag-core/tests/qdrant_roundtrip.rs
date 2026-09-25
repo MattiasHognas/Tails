@@ -3,8 +3,8 @@ use rag_core::{
     chunk::{chunk, chunk_id, content_hash},
     domain::{Hit, RagDocument, SourceKind},
     qdrant::{
-        Fusion, QPoint, Qdrant, SYNC_ID_KEY, SearchQuery, StoredPointState, point_id,
-        surplus_chunks_filter, unsynced_filter,
+        Fusion, QPoint, Qdrant, Rrf, RrfWeights, SYNC_ID_KEY, SearchQuery, StoredPointState,
+        point_id, surplus_chunks_filter, unsynced_filter,
     },
     retrieval::RetrievalScope,
     sparse::query_vector,
@@ -152,6 +152,44 @@ async fn check_hybrid_search(qdrant: &Qdrant) -> Result<()> {
     for ((id, score), (want_id, want_score)) in got.iter().zip(want) {
         assert_eq!(id, want_id, "{got:?}");
         assert!((score - want_score).abs() < 1e-4, "{got:?}");
+    }
+
+    // RRF with another k and with weights, normalized by the best possible score. Dense
+    // ranks similar, exact, other; keyword has exact alone. A point at 0-based rank r
+    // of a list of weight w scores 1 / ((r + 1) / w + k - 1).
+    let cases = [
+        // k = 10: exact 1/11 + 1/10, similar 1/10, other 1/12, of the best 2/10.
+        (10, None, [0.954_545, 0.5, 0.416_667]),
+        // Keyword twice the dense weight, k = 2: exact 1/3 + 1/1.5, similar 1/2,
+        // other 1/4, of the best 1/2 + 1/1.5.
+        (2, Some((1.0, 2.0)), [0.857_143, 0.428_571, 0.214_286]),
+        // Dense twice the keyword weight: exact 1/2 + 1/2, similar 1/1.5, other 1/2.5.
+        (2, Some((2.0, 1.0)), [0.857_143, 0.571_429, 0.342_857]),
+    ];
+    for (k, weights, want) in cases {
+        let mut rrf = qdrant.clone();
+        rrf.hybrid.fusion = Fusion::Rrf(Rrf {
+            k,
+            weights: weights.map(|(dense, keyword)| RrfWeights { dense, keyword }),
+        });
+        let got = ranked(
+            search(
+                &rrf,
+                &[0.2, 1.0, 0.0],
+                "why ERR_CONN_RESET?",
+                Some(filter.clone()),
+            )
+            .await?,
+        );
+        let ids: Vec<&str> = got.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["log_exact#c0", "log_similar#c0", "log_other#c0"],
+            "{got:?}"
+        );
+        for ((_, score), want) in got.iter().zip(want) {
+            assert!((score - want).abs() < 1e-5, "k {k} {weights:?}: {got:?}");
+        }
     }
 
     // The question and a rewrite in one query: four lists. `exact` is first by the

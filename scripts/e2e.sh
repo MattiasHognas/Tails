@@ -13,9 +13,15 @@
 #   E2E_DOCKER=qdrant,tei scripts/e2e.sh   # start both with docker, stop them after
 #   E2E_EMBEDDINGS=fake scripts/e2e.sh     # no model: tails-fakes' hashed bag-of-words
 #                                          # embeddings (checks the plumbing only)
+#   E2E_EMBEDDINGS=openai OPENAI_EMBEDDING_API_KEY=... scripts/e2e.sh
+#                                          # OpenAI's embeddings (text-embedding-3-small);
+#                                          # chat stays on the fakes
 #
 # Environment (defaults in brackets):
-#   E2E_EMBEDDINGS   tei | fake [tei]
+#   E2E_EMBEDDINGS   tei | openai | fake [tei]. openai: OPENAI_EMBEDDING_BASE_URL
+#                    [https://api.openai.com], OPENAI_EMBEDDING_MODEL
+#                    [text-embedding-3-small], OPENAI_EMBEDDING_API_KEY [OPENAI_API_KEY],
+#                    OPENAI_EMBEDDING_QUERY_PREFIX and _DOCUMENT_PREFIX [none]
 #   E2E_DOCKER       containers to start: qdrant, tei, or both comma-separated [none]
 #   QDRANT_ENDPOINT  [http://127.0.0.1:6333]
 #   TEI_URL          [http://127.0.0.1:8080]
@@ -23,18 +29,23 @@
 #   TEI_MODEL        [BAAI/bge-small-en-v1.5]
 #   TEI_QUERY_PREFIX the model's query instruction (OPENAI_EMBEDDING_QUERY_PREFIX)
 #                    [bge's "Represent this sentence for searching relevant passages: "]
+#   TEI_DOCUMENT_PREFIX  the model's document prefix (OPENAI_EMBEDDING_DOCUMENT_PREFIX),
+#                    e.g. e5's "passage: " [none, as bge wants]
 #   TEI_MODEL_REVISION  the model's Hugging Face commit; TEI must report it [5c38ec7c405ec4b44b94cc5a9bb96e735b38267a]
 #   TEI_DATA         model cache mounted into the TEI container [~/.cache/tails-e2e/tei]
 #   FAKES_ADDR       [127.0.0.1:8900]
 #   API_ADDR         where rag-api listens (RAG_API_ADDR) [127.0.0.1:5191]
 #   E2E_SKIP_BUILD   1: use the existing release binaries
 #   E2E_KEEP         1: keep the collection and the work directory
+#   E2E_OUT          directory to copy every run's tails-e2e --summary JSON into [none]
 #   E2E_COMPARE      further query-side configurations to ask the questions with after
 #                    the main run, on the same index, as fusion:stopwords separated by
-#                    spaces (e.g. "dbsf:off rrf:on dbsf:on"); a table compares them.
-#                    Informational: only the main run (RAG_FUSION and
-#                    RAG_KEYWORD_STOPWORDS as set, else the defaults) decides the exit
-#                    status [none]
+#                    spaces (e.g. "dbsf:off rrf:on dbsf:on"); a table compares them. An
+#                    rrf entry can add :k=<RAG_RRF_K> and :w=<dense>,<keyword>
+#                    (RAG_RRF_WEIGHTS), e.g. "rrf:off:k=60 rrf:off:w=1,2".
+#                    Informational: only the main run (RAG_FUSION, RAG_RRF_K,
+#                    RAG_RRF_WEIGHTS and RAG_KEYWORD_STOPWORDS as set, else the
+#                    defaults) decides the exit status [none]
 # API_ADDR and FAKES_ADDR must be free.
 set -euo pipefail
 
@@ -47,6 +58,7 @@ TEI_URL="${TEI_URL:-http://127.0.0.1:8080}"
 TEI_IMAGE="${TEI_IMAGE:-ghcr.io/huggingface/text-embeddings-inference:cpu-1.9.4}"
 TEI_MODEL="${TEI_MODEL:-BAAI/bge-small-en-v1.5}"
 TEI_QUERY_PREFIX="${TEI_QUERY_PREFIX-Represent this sentence for searching relevant passages: }"
+TEI_DOCUMENT_PREFIX="${TEI_DOCUMENT_PREFIX:-}"
 TEI_MODEL_REVISION="${TEI_MODEL_REVISION-5c38ec7c405ec4b44b94cc5a9bb96e735b38267a}"
 TEI_DATA="${TEI_DATA:-$HOME/.cache/tails-e2e/tei}"
 FAKES_ADDR="${FAKES_ADDR:-127.0.0.1:8900}"
@@ -140,15 +152,31 @@ case "$E2E_EMBEDDINGS" in
     EMBEDDING_URL="$TEI_URL"
     EMBEDDING_MODEL="$TEI_MODEL"
     QUERY_PREFIX="$TEI_QUERY_PREFIX"
+    DOCUMENT_PREFIX="$TEI_DOCUMENT_PREFIX"
+    FAKES_FLAGS=()
+    ;;
+  openai)
+    # A hosted OpenAI-compatible /v1/embeddings; the chat model stays faked, so the key
+    # only goes to the embeddings endpoint.
+    EMBEDDING_URL="${OPENAI_EMBEDDING_BASE_URL:-https://api.openai.com}"
+    EMBEDDING_MODEL="${OPENAI_EMBEDDING_MODEL:-text-embedding-3-small}"
+    export OPENAI_EMBEDDING_API_KEY="${OPENAI_EMBEDDING_API_KEY:-${OPENAI_API_KEY:-}}"
+    if [[ -z "$OPENAI_EMBEDDING_API_KEY" ]]; then
+      echo "E2E_EMBEDDINGS=openai needs OPENAI_EMBEDDING_API_KEY (or OPENAI_API_KEY)" >&2
+      exit 1
+    fi
+    QUERY_PREFIX="${OPENAI_EMBEDDING_QUERY_PREFIX:-}"
+    DOCUMENT_PREFIX="${OPENAI_EMBEDDING_DOCUMENT_PREFIX:-}"
     FAKES_FLAGS=()
     ;;
   fake)
     EMBEDDING_URL="$FAKES_URL"
     EMBEDDING_MODEL="fake-bow-1024"
     QUERY_PREFIX=""
+    DOCUMENT_PREFIX=""
     FAKES_FLAGS=(--embeddings)
     ;;
-  *) echo "E2E_EMBEDDINGS must be tei or fake" >&2; exit 1 ;;
+  *) echo "E2E_EMBEDDINGS must be tei, openai or fake" >&2; exit 1 ;;
 esac
 
 log "Starting tails-fakes on $FAKES_ADDR"
@@ -164,7 +192,7 @@ export OPENAI_CHAT_MODEL=fake-chat
 export OPENAI_EMBEDDING_BASE_URL="$EMBEDDING_URL"
 export OPENAI_EMBEDDING_MODEL="$EMBEDDING_MODEL"
 export OPENAI_EMBEDDING_QUERY_PREFIX="$QUERY_PREFIX"
-unset OPENAI_EMBEDDING_DOCUMENT_PREFIX
+export OPENAI_EMBEDDING_DOCUMENT_PREFIX="$DOCUMENT_PREFIX"
 export QDRANT_ENDPOINT="$QDRANT_URL"
 export QDRANT_COLLECTION="$COLLECTION"
 export DD_API_KEY=e2e DD_APP_KEY=e2e DD_SITE=datadoghq.eu
@@ -198,7 +226,7 @@ ask_all() {
     --summary "$WORK/summary-$1.json"
 }
 
-log "Asking the incident questions through rag-cli (RAG_FUSION=${RAG_FUSION:-default}, RAG_KEYWORD_STOPWORDS=${RAG_KEYWORD_STOPWORDS:-default})"
+log "Asking the incident questions through rag-cli (RAG_FUSION=${RAG_FUSION:-default}, RAG_RRF_K=${RAG_RRF_K:-default}, RAG_RRF_WEIGHTS=${RAG_RRF_WEIGHTS:-default}, RAG_KEYWORD_STOPWORDS=${RAG_KEYWORD_STOPWORDS:-default})"
 GATE=0
 ask_all main || GATE=$?
 SUMMARIES=("$WORK/summary-main.json")
@@ -206,13 +234,30 @@ SUMMARIES=("$WORK/summary-main.json")
 # Fusion and keyword stopwords only change how rag-api queries, so the other
 # configurations reuse the index. Informational: they never fail the run.
 for cfg in $E2E_COMPARE; do
-  fusion="${cfg%%:*}" stopwords="${cfg#*:}"
-  log "Comparison run (informational): RAG_FUSION=$fusion RAG_KEYWORD_STOPWORDS=$stopwords"
-  if ! RAG_FUSION="$fusion" RAG_KEYWORD_STOPWORDS="$stopwords" ask_all "$fusion-$stopwords"; then
+  IFS=: read -r fusion stopwords extra <<<"$cfg"
+  k="" weights=""
+  IFS=: read -ra params <<<"$extra"
+  for p in "${params[@]}"; do
+    case "$p" in
+      k=*) k="${p#k=}" ;;
+      w=*) weights="${p#w=}" ;;
+      *) echo "E2E_COMPARE: unknown parameter $p in $cfg (expected k=<n> or w=<dense>,<keyword>)" >&2; exit 1 ;;
+    esac
+  done
+  name="$(tr -c 'A-Za-z0-9\n' '-' <<<"$cfg")"
+  log "Comparison run (informational): RAG_FUSION=$fusion RAG_KEYWORD_STOPWORDS=$stopwords${k:+ RAG_RRF_K=$k}${weights:+ RAG_RRF_WEIGHTS=$weights}"
+  if ! RAG_FUSION="$fusion" RAG_KEYWORD_STOPWORDS="$stopwords" RAG_RRF_K="$k" RAG_RRF_WEIGHTS="$weights" \
+    ask_all "$name"; then
     echo "($cfg is below a threshold or failed a hard check; informational only)"
   fi
-  [[ -f "$WORK/summary-$fusion-$stopwords.json" ]] && SUMMARIES+=("$WORK/summary-$fusion-$stopwords.json")
+  [[ -f "$WORK/summary-$name.json" ]] && SUMMARIES+=("$WORK/summary-$name.json")
 done
+if [[ -n "${E2E_OUT:-}" ]]; then
+  mkdir -p "$E2E_OUT"
+  for f in "${SUMMARIES[@]}"; do
+    [[ -f "$f" ]] && cp "$f" "$E2E_OUT/"
+  done
+fi
 if [[ -n "$E2E_COMPARE" && -f "${SUMMARIES[0]}" ]]; then
   log "Configurations compared (the first one decides the run)"
   python3 "$ROOT/scripts/e2e_compare.py" "${SUMMARIES[@]}"

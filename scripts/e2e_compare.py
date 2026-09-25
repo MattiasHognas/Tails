@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Compares tails-e2e --summary files of one index asked with different query-side
-configurations (RAG_FUSION, RAG_KEYWORD_STOPWORDS). Used by scripts/e2e.sh when
+configurations (RAG_FUSION, RAG_RRF_K, RAG_RRF_WEIGHTS, RAG_KEYWORD_STOPWORDS). Used by scripts/e2e.sh when
 E2E_COMPARE is set; the first file is the run that decides the exit status.
 
 Prints the aggregates per configuration, then every question whose recall,
@@ -26,7 +26,8 @@ METRICS = [
 
 
 def label(s):
-    return f"{s['fusion']}/{'stop' if s['stopwords'] else 'nostop'}"
+    # fusionLabel carries RRF's non-default k and weights, e.g. rrf(k=10) or rrf(k=2,w=1:2).
+    return f"{s.get('fusionLabel', s['fusion'])}/{'stop' if s['stopwords'] else 'nostop'}"
 
 
 def main(paths):

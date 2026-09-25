@@ -21,8 +21,9 @@ instruction, such as bge or e5, get it through `OPENAI_EMBEDDING_QUERY_PREFIX` a
 `OPENAI_EMBEDDING_DOCUMENT_PREFIX` (see [DEVELOPMENT.md](docs/DEVELOPMENT.md)).
 
 **Hybrid search tuning:** `RAG_FUSION` (`rrf`, default, or `dbsf`) sets how `rag-api` fuses
-dense and keyword results, and `RAG_KEYWORD_STOPWORDS=on` drops English function words
-from keyword queries. Neither needs a re-index; see
+dense and keyword results (for `rrf`, `RAG_RRF_K`, default 2, and
+`RAG_RRF_WEIGHTS=dense,keyword`, default equal), and `RAG_KEYWORD_STOPWORDS=on` drops
+English function words from keyword queries. Neither needs a re-index; see
 [Retrieval and ranking](docs/ARCHITECTURE.md#retrieval-and-ranking).
 
 ---

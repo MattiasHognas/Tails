@@ -940,9 +940,9 @@ mod tests {
             ],
             8,
             None,
-            crate::qdrant::Fusion::Rrf,
+            crate::qdrant::Fusion::default(),
         );
-        assert_eq!(lists, 4);
+        assert_eq!(lists.len(), 4);
         assert_eq!(body, want);
     }
 }

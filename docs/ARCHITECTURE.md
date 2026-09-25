@@ -364,8 +364,14 @@ with `--json`) on stderr and exits with status 1.
   metric name or host a question quotes, which a dense vector blurs with similar ones.
   Qdrant fuses the lists (`RAG_FUSION`):
   - `rrf` (default): reciprocal rank fusion. A point at 0-based rank `r` of a list
-    scores `1 / (2 + r)`, summed over the lists (`k` = 2, sent explicitly). Only ranks
-    count.
+    scores `1 / (k + r)`, summed over the lists (`k` = 2 unless `RAG_RRF_K` sets
+    another, always sent explicitly). Only ranks count. `RAG_RRF_WEIGHTS=dense,keyword`
+    (e.g. `1,2`) weights the dense and keyword lists (Qdrant 1.17 or later; one weight
+    per prefetch list is sent): a list of weight `w` scores rank `r` as
+    `1 / ((r + 1) / w + k − 1)`, so at weight 2 its second point counts like the first
+    of an unweighted list. The larger `k`, the less a weight changes the top ranks.
+    Both were measured and left at their defaults (`k` = 2, equal weights); see
+    [the fusion experiment](experiments/fusion-containers.md).
   - `dbsf`: distribution-based score fusion (`{"fusion": "dbsf"}`). Qdrant maps each
     list's raw scores to `(s − (μ − 3σ)) / 6σ`, μ and σ the list's mean and *sample*
     standard deviation, and sums them over the lists. Not clipped: a point more than 3σ
@@ -373,10 +379,13 @@ with `--json`) on stderr and exits with status 1.
     scores, maps to 0.5; a list a point is not in adds nothing. So a decisive keyword
     match (24.6 against a runner-up at 1.8) counts for more than a near tie in dense
     search (0.730 against 0.724), which RRF scores alike. (Verified against Qdrant
-    1.19.1, whose source is `lib/segment/src/common/score_fusion.rs`.)
+    1.19.1, whose source is `lib/segment/src/common/score_fusion.rs`.) DBSF takes no
+    parameters; Qdrant ignores a `weights` key next to `"fusion": "dbsf"`, so `RAG_RRF_K`
+    and `RAG_RRF_WEIGHTS` are refused with `dbsf`.
 
   RRF stays the default because DBSF was not better everywhere when measured
-  (pull request #56): with real embeddings (e2e, `bge-small-en-v1.5`) it ranks the
+  (pull request #56, and against six embedding models in
+  [fusion-containers.md](experiments/fusion-containers.md)): with real embeddings (e2e, `bge-small-en-v1.5`) it ranks the
   outage incident first for "the root cause of the last checkout outage" (precision@R
   0.944 → 0.972), but with the in-process harness's bag-of-words embeddings it lets a
   distractor into the sources of another question: DBSF compresses the tail of a dense
@@ -386,7 +395,8 @@ with `--json`) on stderr and exits with status 1.
 - **Scores:** a hit's score is its fused score divided by the best possible one, so it is
   in [0, 1] and on the same scale for every question:
   - RRF: the best is first in every list. 1 is first everywhere, 0.667 second in all,
-    0.5 first in half of the lists or third in all.
+    0.5 first in half of the lists or third in all (at `k` = 2, unweighted; with
+    weights, the best is `Σ 1 / (1 / w + k − 1)` over the lists).
   - DBSF: the best is 3σ above the mean in every list, so the score is the mean of the
     point's per-list scores: 1 at 3σ above the mean everywhere, 0.5 at the mean
     everywhere (or 3σ above in half the lists and absent from the others). When the top
