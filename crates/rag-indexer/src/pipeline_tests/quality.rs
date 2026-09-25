@@ -8,267 +8,18 @@
 //! with a canned planner reply, deterministic embeddings and a canned answer model
 //! that cites by reading its prompt, so every run is identical.
 //!
-//! Per question and in aggregate (known gaps excluded) it measures:
-//! - `recall@k`: share of `mustRetrieve` documents among `sources` (k = all sources
-//!   given to the answer model, i.e. the reranked top-K);
-//! - `precision@R`: share of the first R sources that are `mustRetrieve` or
-//!   `mayRetrieve`, with R = number of `mustRetrieve` documents (ranking quality);
-//! - distractor exclusion: share of `mustNotRetrieve` documents kept out of `sources`;
-//! - scope accuracy: the response's `scope` equals the expected one;
-//! - citation validity: share of citations in answers that resolve to a source or an
-//!   observation (deliberate negative controls excluded);
-//! - citation accuracy: share of intended citations that point at the intended
-//!   document, i.e. `[DOC #n]` in the answer is `sources[n-1]`;
-//! - observation recall: expected timeline observations present with kind and service;
-//! - negative controls flagged: deliberately unknown citations reported in
-//!   `citationWarnings`;
-//! - evidence accuracy: share of `evidence` entries met, i.e. the document appears as
-//!   exactly one `[DOC #n]` block of the answer prompt and that block states the given
-//!   facts (for example a log pattern's count in the question's window).
+//! The data model, the metrics and the hard checks on every question are in
+//! [`tails_fakes::questions`], shared with the end-to-end run of the built binaries
+//! (`tails-e2e`, real embeddings).
 //!
-//! Documents are compared as the sources they are listed as: the days of one log pattern
-//! (`Metadata.pattern_id`) are one source, so `log_<id>` matches whichever day
-//! represents the pattern.
-//!
-//! Hard checks on every question: `sources` are stored documents numbered like the
-//! prompt, no source is listed twice, and `citationWarnings` equals
-//! [`validate_citations`] on the answer.
-//!
-//! The test fails when an aggregate drops below `thresholds` in `questions.json`. Run
-//! with `-- --nocapture` for the report. See docs/DEVELOPMENT.md.
+//! The test fails when a hard check breaks or an aggregate drops below `thresholds` in
+//! `questions.json`. Run with `-- --nocapture` for the report. See docs/DEVELOPMENT.md.
 
-use super::support::{self, Corpus, FakeOpenAi, Store, at, datadog::Live, openai::DIM};
-use chrono::{DateTime, Duration, Utc};
-use rag_core::citations::validate_citations;
+use super::support::{self, FakeOpenAi, Store, openai::DIM};
 use rag_core::openai::OpenAiClient;
-use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
-use std::path::PathBuf;
-
-fn data_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/incident_questions")
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct Dataset {
-    version: u32,
-    #[allow(dead_code)]
-    description: String,
-    defaults: Defaults,
-    thresholds: Thresholds,
-    questions: Vec<Question>,
-}
-
-#[derive(Debug, Deserialize)]
-struct Defaults {
-    now: String,
-    timezone: String,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize, Default)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct Thresholds {
-    recall_at_k: f64,
-    precision_at_r: f64,
-    distractor_exclusion: f64,
-    scope_accuracy: f64,
-    citation_validity: f64,
-    citation_accuracy: f64,
-    observation_recall: f64,
-    negative_controls_flagged: f64,
-    evidence_accuracy: f64,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct Question {
-    id: String,
-    question: String,
-    #[allow(dead_code)]
-    note: Option<String>,
-    known_gap: Option<String>,
-    now: Option<String>,
-    timezone: Option<String>,
-    plan: Value,
-    request: Option<Value>,
-    expect: Expect,
-    live: Option<LiveSpec>,
-    hypotheses: Option<Value>,
-    answer: AnswerSpec,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct Expect {
-    scope: Value,
-    must_retrieve: Vec<String>,
-    #[serde(default)]
-    may_retrieve: Vec<String>,
-    #[serde(default)]
-    must_not_retrieve: Vec<String>,
-    timeline: Option<TimelineExpect>,
-    /// Facts the answer model must be given about a source (see [`EvidenceExpect`]).
-    #[serde(default)]
-    evidence: Vec<EvidenceExpect>,
-}
-
-/// What the prompt must tell the answer model about one source: `document` appears as
-/// exactly one `[DOC #n]` block, and that block contains every string in `contains`
-/// (for example the count of a log pattern in the question's window). This checks the
-/// evidence text itself, which retrieval metrics cannot see.
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct EvidenceExpect {
-    document: String,
-    contains: Vec<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct TimelineExpect {
-    status: String,
-    #[serde(default)]
-    observations: Vec<ObservationExpect>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ObservationExpect {
-    id: String,
-    kind: String,
-    service: Option<String>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LiveSpec {
-    #[serde(default)]
-    metrics: Vec<MetricSpec>,
-    #[serde(default)]
-    logs: Vec<LogSpec>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct MetricSpec {
-    query: String,
-    baseline: f64,
-    spikes: Vec<Point>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Point {
-    at: String,
-    value: f64,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LogSpec {
-    query: String,
-    bursts: Vec<Burst>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Burst {
-    at: String,
-    count: usize,
-    message: String,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct AnswerSpec {
-    #[serde(default)]
-    cite_documents: Vec<String>,
-    #[serde(default)]
-    cite_observations: Vec<String>,
-    #[serde(default)]
-    extra: String,
-    #[serde(default)]
-    expect_citation_warnings: Vec<String>,
-}
-
-fn load() -> (Dataset, Corpus) {
-    let read = |name: &str| -> Value {
-        let path = data_dir().join(name);
-        serde_json::from_str(&std::fs::read_to_string(&path).unwrap())
-            .unwrap_or_else(|e| panic!("{path:?}: {e}"))
-    };
-    let mut dataset: Dataset =
-        serde_json::from_value(read("questions.json")).expect("questions.json");
-    let mut corpus = Corpus::from_json(&read("corpus.json"));
-    corpus.extend(Corpus::fixtures());
-    // Logs are indexed as pattern documents: `log_<id>` names the one holding log <id>.
-    let resolve = |ids: &mut Vec<String>| {
-        let mut out: Vec<String> = vec![];
-        for id in ids.iter().map(|id| corpus.resolve(id)) {
-            if !out.contains(&id) {
-                out.push(id);
-            }
-        }
-        *ids = out;
-    };
-    for q in &mut dataset.questions {
-        resolve(&mut q.expect.must_retrieve);
-        resolve(&mut q.expect.may_retrieve);
-        resolve(&mut q.expect.must_not_retrieve);
-        resolve(&mut q.answer.cite_documents);
-        for x in &mut q.expect.evidence {
-            x.document = corpus.resolve(&x.document);
-        }
-    }
-    (dataset, corpus)
-}
-
-/// Live Datadog data for one question: hourly series over the four days before
-/// `now` (covering any window and its baseline) and bursts of error logs.
-fn live_data(spec: &LiveSpec, now: DateTime<Utc>) -> Live {
-    let mut live = Live::default();
-    for m in &spec.metrics {
-        let spikes: Vec<(DateTime<Utc>, f64)> =
-            m.spikes.iter().map(|p| (at(&p.at), p.value)).collect();
-        let from = now - Duration::days(4);
-        let from = from - Duration::seconds(from.timestamp().rem_euclid(3600));
-        live.series.insert(
-            m.query.clone(),
-            Live::hourly(from, now, m.baseline, &spikes),
-        );
-    }
-    for l in &spec.logs {
-        let tag = |key: &str| {
-            l.query
-                .split_whitespace()
-                .find_map(|t| t.strip_prefix(key))
-                .unwrap_or_default()
-                .to_string()
-        };
-        let (service, env) = (tag("service:"), tag("env:"));
-        let events: Vec<Value> = l
-            .bursts
-            .iter()
-            .flat_map(|b| {
-                let start = at(&b.at);
-                (0..b.count)
-                    .map(move |i| (start + Duration::seconds(30 * i as i64), b.message.clone()))
-            })
-            .enumerate()
-            .map(|(i, (t, message))| {
-                json!({"id": format!("live-{service}-{i}"), "type": "log", "attributes": {
-                    "service": service, "status": "error", "message": message,
-                    "timestamp": t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-                    "tags": [format!("env:{env}")]
-                }})
-            })
-            .collect();
-        live.logs.insert(l.query.clone(), events);
-    }
-    live
-}
+use tails_fakes::questions::{self, Answers, Row, Thresholds};
 
 /// Which answer model and embeddings the run uses.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -281,71 +32,24 @@ enum Models {
     OpenAi,
 }
 
-#[derive(Default)]
-struct Row {
-    id: String,
-    known_gap: bool,
-    recall: f64,
-    precision: f64,
-    excluded: usize,
-    distractors: usize,
-    scope_ok: bool,
-    citations_valid: usize,
-    citations_total: usize,
-    intended_ok: usize,
-    intended_total: usize,
-    obs_found: usize,
-    obs_expected: usize,
-    negatives_flagged: usize,
-    negatives_total: usize,
-    evidence_ok: usize,
-    evidence_total: usize,
-    sources: usize,
-    problems: Vec<String>,
-}
-
-fn ratio(n: usize, d: usize) -> f64 {
-    if d == 0 { 1.0 } else { n as f64 / d as f64 }
-}
-
-struct Aggregate {
-    recall_at_k: f64,
-    precision_at_r: f64,
-    distractor_exclusion: f64,
-    scope_accuracy: f64,
-    citation_validity: f64,
-    citation_accuracy: f64,
-    observation_recall: f64,
-    negative_controls_flagged: f64,
-    evidence_accuracy: f64,
-}
-
-fn aggregate(rows: &[Row]) -> Aggregate {
-    let counted: Vec<&Row> = rows.iter().filter(|r| !r.known_gap).collect();
-    let n = counted.len().max(1) as f64;
-    let sum = |f: fn(&Row) -> usize| counted.iter().map(|r| f(r)).sum::<usize>();
-    Aggregate {
-        recall_at_k: counted.iter().map(|r| r.recall).sum::<f64>() / n,
-        precision_at_r: counted.iter().map(|r| r.precision).sum::<f64>() / n,
-        distractor_exclusion: ratio(sum(|r| r.excluded), sum(|r| r.distractors)),
-        scope_accuracy: counted.iter().filter(|r| r.scope_ok).count() as f64 / n,
-        citation_validity: ratio(sum(|r| r.citations_valid), sum(|r| r.citations_total)),
-        citation_accuracy: ratio(sum(|r| r.intended_ok), sum(|r| r.intended_total)),
-        observation_recall: ratio(sum(|r| r.obs_found), sum(|r| r.obs_expected)),
-        negative_controls_flagged: ratio(sum(|r| r.negatives_flagged), sum(|r| r.negatives_total)),
-        evidence_accuracy: ratio(sum(|r| r.evidence_ok), sum(|r| r.evidence_total)),
+impl Models {
+    fn answers(self) -> Answers {
+        match self {
+            Models::Fake => Answers::Canned,
+            Models::OpenAi => Answers::Real,
+        }
     }
 }
 
 async fn run(store: Store, models: Models) -> (Vec<Row>, Thresholds) {
-    let (mut dataset, corpus) = load();
+    let (mut dataset, corpus) = questions::load_dir(&questions::data_dir());
     let fake = FakeOpenAi::default();
     let fake_server = fake.start().await;
     let oa: OpenAiClient = match models {
         Models::Fake => support::openai_client(&fake_server.uri()),
         Models::OpenAi => OpenAiClient::new_from_env().expect("OPENAI_API_KEY"),
     };
-    let index_now = at(&dataset.defaults.now);
+    let index_now = support::at(&dataset.defaults.now);
     support::index(&corpus, oa.clone(), &store, index_now).await;
     let stored = support::stored_chunks(&store).await;
     let parents: BTreeMap<&str, &rag_core::domain::RagDocument> = stored
@@ -354,43 +58,11 @@ async fn run(store: Store, models: Models) -> (Vec<Row>, Thresholds) {
         .collect();
 
     // A typo in the dataset must fail loudly, not read as a retrieval miss.
-    for q in &dataset.questions {
-        let e = &q.expect;
-        for id in e
-            .must_retrieve
-            .iter()
-            .chain(&e.may_retrieve)
-            .chain(&e.must_not_retrieve)
-            .chain(&q.answer.cite_documents)
-            .chain(e.evidence.iter().map(|x| &x.document))
-        {
-            assert!(
-                parents.contains_key(id.as_str()),
-                "{}: unknown document {id}",
-                q.id
-            );
-        }
-    }
+    let unknown = questions::unknown_ids(&dataset, &parents);
+    assert!(unknown.is_empty(), "{unknown:?}");
     // Expectations name sources: the days of one log pattern are one source.
-    let groups = source_groups(&parents);
-    for q in &mut dataset.questions {
-        let to_groups = |ids: &mut Vec<String>| {
-            let mut out: Vec<String> = vec![];
-            for g in ids.iter().map(|id| groups[id].clone()) {
-                if !out.contains(&g) {
-                    out.push(g);
-                }
-            }
-            *ids = out;
-        };
-        to_groups(&mut q.expect.must_retrieve);
-        to_groups(&mut q.expect.may_retrieve);
-        to_groups(&mut q.expect.must_not_retrieve);
-        to_groups(&mut q.answer.cite_documents);
-        for x in &mut q.expect.evidence {
-            x.document = groups[&x.document].clone();
-        }
-    }
+    let groups = questions::source_groups(&parents);
+    questions::to_groups(&mut dataset, &groups);
 
     println!(
         "\nincident questions v{} | store: {} | models: {}",
@@ -402,24 +74,12 @@ async fn run(store: Store, models: Models) -> (Vec<Row>, Thresholds) {
             "OpenAI"
         }
     );
-    println!(
-        "{:<28} {:>6} {:>6} {:>7} {:>5} {:>7} {:>7} {:>5} {:>5} {:>4}  notes",
-        "question",
-        "recall",
-        "prec@R",
-        "exclude",
-        "scope",
-        "cites",
-        "intent",
-        "obs",
-        "evid",
-        "srcs"
-    );
+    questions::print_header();
 
     let mut rows = vec![];
     for q in &dataset.questions {
-        let now = at(q.now.as_deref().unwrap_or(&dataset.defaults.now));
-        let tz = q.timezone.as_deref().unwrap_or(&dataset.defaults.timezone);
+        let now = q.now(&dataset.defaults);
+        let tz = q.timezone(&dataset.defaults);
         {
             let mut script = fake.script.lock().unwrap();
             script.plans.insert(q.question.clone(), q.plan.clone());
@@ -431,25 +91,14 @@ async fn run(store: Store, models: Models) -> (Vec<Row>, Thresholds) {
             script.answers.insert(
                 q.question.clone(),
                 support::openai::AnswerScript {
-                    cite_uris: q
-                        .answer
-                        .cite_documents
-                        .iter()
-                        .map(|g| {
-                            parents
-                                .iter()
-                                .filter(|(id, _)| groups[**id] == *g)
-                                .map(|(_, d)| d.source_uri.clone())
-                                .collect()
-                        })
-                        .collect(),
+                    cite_uris: questions::cite_uris(q, &parents, &groups),
                     cite_observations: q.answer.cite_observations.clone(),
                     extra: q.answer.extra.clone(),
                 },
             );
         }
-        let live = support::datadog::serve_live(live_data(
-            q.live.as_ref().unwrap_or(&LiveSpec::default()),
+        let live = support::datadog::serve_live(questions::live_data(
+            q.live.as_ref().unwrap_or(&questions::LiveSpec::default()),
             now,
         ))
         .await;
@@ -462,396 +111,27 @@ async fn run(store: Store, models: Models) -> (Vec<Row>, Thresholds) {
             req["plan"] = q.plan.clone();
         }
         let resp = support::ask(&base, &req).await;
-        let prompt = fake
-            .script
-            .lock()
-            .unwrap()
-            .prompts
-            .get(&q.question)
-            .cloned();
-        let row = score(q, &resp, prompt.as_deref(), &parents, &groups, models);
-        println!(
-            "{:<28} {:>6.2} {:>6.2} {:>7} {:>5} {:>7} {:>7} {:>5} {:>5} {:>4}  {}{}",
-            q.id.chars().take(28).collect::<String>(),
-            row.recall,
-            row.precision,
-            format!("{}/{}", row.excluded, row.distractors),
-            if row.scope_ok { "ok" } else { "FAIL" },
-            format!("{}/{}", row.citations_valid, row.citations_total),
-            format!("{}/{}", row.intended_ok, row.intended_total),
-            format!("{}/{}", row.obs_found, row.obs_expected),
-            format!("{}/{}", row.evidence_ok, row.evidence_total),
-            row.sources,
-            if row.known_gap { "KNOWN GAP; " } else { "" },
-            row.problems.join("; "),
+        let prompt = fake.prompt(&q.question);
+        let row = questions::score(
+            q,
+            &resp,
+            prompt.as_deref(),
+            &parents,
+            &groups,
+            models.answers(),
         );
+        questions::print_row(&row);
+        assert!(row.hard.is_empty(), "{}: {:?}", q.id, row.hard);
         rows.push(row);
     }
-    let a = aggregate(&rows);
     let t = dataset.thresholds;
-    println!(
-        "aggregate over {} questions (known gaps excluded):",
-        rows.iter().filter(|r| !r.known_gap).count()
-    );
-    for (name, got, min) in [
-        ("recall@k", a.recall_at_k, t.recall_at_k),
-        ("precision@R", a.precision_at_r, t.precision_at_r),
-        (
-            "distractor exclusion",
-            a.distractor_exclusion,
-            t.distractor_exclusion,
-        ),
-        ("scope accuracy", a.scope_accuracy, t.scope_accuracy),
-        (
-            "citation validity",
-            a.citation_validity,
-            t.citation_validity,
-        ),
-        (
-            "citation accuracy",
-            a.citation_accuracy,
-            t.citation_accuracy,
-        ),
-        (
-            "observation recall",
-            a.observation_recall,
-            t.observation_recall,
-        ),
-        (
-            "negative controls flagged",
-            a.negative_controls_flagged,
-            t.negative_controls_flagged,
-        ),
-        (
-            "evidence accuracy",
-            a.evidence_accuracy,
-            t.evidence_accuracy,
-        ),
-    ] {
-        println!(
-            "  {name:<26} {got:.3} (threshold {min:.2}){}",
-            if got < min { "  BELOW THRESHOLD" } else { "" }
-        );
-    }
-    for r in rows.iter().filter(|r| r.known_gap) {
-        let passes = r.problems.is_empty();
-        println!(
-            "  known gap {}: {}",
-            r.id,
-            if passes {
-                "now passes; remove `knownGap` so it counts"
-            } else {
-                "still failing"
-            }
-        );
-    }
+    questions::print_aggregate(&rows, &t);
     store.finish().await;
     (rows, t)
 }
 
-/// Scores one response and checks the invariants that must always hold.
-fn score(
-    q: &Question,
-    resp: &Value,
-    prompt: Option<&str>,
-    parents: &BTreeMap<&str, &rag_core::domain::RagDocument>,
-    groups: &BTreeMap<String, String>,
-    models: Models,
-) -> Row {
-    let e = &q.expect;
-    // Sources as the groups the expectations name (see `source_groups`).
-    let ids: Vec<String> = support::source_ids(resp)
-        .iter()
-        .map(|id| groups.get(id).cloned().unwrap_or_else(|| id.clone()))
-        .collect();
-    let sources = resp["sources"].as_array().unwrap();
-    let mut row = Row {
-        id: q.id.clone(),
-        known_gap: q.known_gap.is_some(),
-        sources: ids.len(),
-        ..Row::default()
-    };
-
-    // Retrieval.
-    let found: Vec<&String> = e
-        .must_retrieve
-        .iter()
-        .filter(|id| ids.contains(id))
-        .collect();
-    row.recall = ratio(found.len(), e.must_retrieve.len());
-    let r = e.must_retrieve.len().min(ids.len());
-    let relevant = |id: &String| e.must_retrieve.contains(id) || e.may_retrieve.contains(id);
-    row.precision = if r == 0 {
-        0.0
-    } else {
-        ids[..r].iter().filter(|id| relevant(id)).count() as f64 / r as f64
-    };
-    let leaked: Vec<&String> = e
-        .must_not_retrieve
-        .iter()
-        .filter(|id| ids.contains(id))
-        .collect();
-    row.distractors = e.must_not_retrieve.len();
-    row.excluded = row.distractors - leaked.len();
-    if found.len() < e.must_retrieve.len() {
-        let missed: Vec<&String> = e
-            .must_retrieve
-            .iter()
-            .filter(|id| !ids.contains(id))
-            .collect();
-        row.problems.push(format!("missed {missed:?}"));
-    }
-    if !leaked.is_empty() {
-        row.problems.push(format!("distractors {leaked:?}"));
-    }
-    if row.precision < 1.0 {
-        row.problems
-            .push(format!("top {:?}", &ids[..r.max(1).min(ids.len())]));
-    }
-
-    // Scope: only the keys the dataset states.
-    for (k, want) in e.scope.as_object().unwrap() {
-        if resp["scope"][k] != *want {
-            row.problems
-                .push(format!("scope.{k} = {} (want {want})", resp["scope"][k]));
-        }
-    }
-    row.scope_ok = !row.problems.iter().any(|p| p.starts_with("scope."));
-
-    // Timeline.
-    let observations = resp["timeline"]["observations"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
-    let obs_ids: Vec<&str> = observations
-        .iter()
-        .filter_map(|o| o["id"].as_str())
-        .collect();
-    if let Some(t) = &e.timeline {
-        if resp["timeline"]["status"] != t.status.as_str() {
-            row.problems
-                .push(format!("timeline.status = {}", resp["timeline"]["status"]));
-        }
-        row.obs_expected = t.observations.len();
-        for o in &t.observations {
-            let hit = observations.iter().any(|x| {
-                x["id"] == o.id.as_str()
-                    && x["kind"] == o.kind.as_str()
-                    && o.service
-                        .as_ref()
-                        .is_none_or(|s| x["service"] == s.as_str())
-            });
-            if hit {
-                row.obs_found += 1;
-            } else {
-                row.problems
-                    .push(format!("no {} {} {:?}", o.id, o.kind, o.service));
-            }
-        }
-        if row.obs_found < row.obs_expected {
-            let got: Vec<String> = observations
-                .iter()
-                .map(|o| format!("{} {} {}", o["id"], o["kind"], o["service"]))
-                .collect();
-            let missing: Vec<String> = resp["timeline"]["missingEvidence"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .map(|m| format!("{} {}", m["subject"], m["reason"]))
-                .collect();
-            row.problems
-                .push(format!("observed {got:?}, missing {missing:?}"));
-        }
-    }
-
-    // Hard invariants: sources are stored documents, numbered like the prompt.
-    for s in sources {
-        let id = s["id"].as_str().unwrap();
-        let doc = parents
-            .get(id)
-            .unwrap_or_else(|| panic!("{}: source {id} is not stored", q.id));
-        assert_eq!(s["uri"], doc.source_uri, "{}: {id}", q.id);
-        assert_eq!(s["title"], doc.title, "{}: {id}", q.id);
-    }
-    for (i, id) in ids.iter().enumerate() {
-        assert!(
-            !ids[..i].contains(id),
-            "{}: {id} is listed twice in sources",
-            q.id
-        );
-    }
-    if let Some(prompt) = prompt.filter(|_| models == Models::Fake) {
-        let numbered = support::openai::prompt_numbers(prompt);
-        assert_eq!(numbered.len(), sources.len(), "{}: prompt vs sources", q.id);
-        for ((n, title, uri), s) in numbered.iter().zip(sources) {
-            assert_eq!(s["n"], *n, "{}", q.id);
-            assert_eq!(s["uri"], uri.as_str(), "{}", q.id);
-            assert!(
-                title.starts_with(&format!("{} (", s["title"].as_str().unwrap())),
-                "{}",
-                q.id
-            );
-        }
-    }
-
-    // Evidence given to the answer model.
-    if models == Models::Fake {
-        let blocks = support::openai::prompt_blocks(prompt.unwrap_or_default());
-        for x in &e.evidence {
-            row.evidence_total += 1;
-            let mine: Vec<&String> = blocks
-                .iter()
-                .filter(|(n, _)| ids.get(n.wrapping_sub(1)) == Some(&x.document))
-                .map(|(_, b)| b)
-                .collect();
-            let [block] = mine.as_slice() else {
-                row.problems.push(format!(
-                    "{} is in {} prompt documents, want 1",
-                    x.document,
-                    mine.len()
-                ));
-                continue;
-            };
-            let missing: Vec<&String> = x.contains.iter().filter(|c| !block.contains(*c)).collect();
-            if missing.is_empty() {
-                row.evidence_ok += 1;
-            } else {
-                let facts: Vec<&str> = block
-                    .lines()
-                    .filter(|l| l.starts_with("Occurrences") || l.starts_with("Excerpt"))
-                    .collect();
-                row.problems.push(format!(
-                    "{} evidence lacks {missing:?} (has {facts:?})",
-                    x.document
-                ));
-            }
-        }
-    }
-
-    // Citations.
-    let answer = resp["answer"].as_str().unwrap_or_default();
-    let report = validate_citations(answer, ids.len(), &obs_ids);
-    assert_eq!(
-        resp["citationWarnings"],
-        serde_json::to_value(&report.warnings).unwrap(),
-        "{}: citationWarnings disagree with validate_citations",
-        q.id
-    );
-    let warned: Vec<&str> = report
-        .warnings
-        .iter()
-        .map(|w| w.citation.as_str())
-        .collect();
-    let negatives = &q.answer.expect_citation_warnings;
-    let unexpected = warned
-        .iter()
-        .filter(|w| !negatives.iter().any(|n| n == *w))
-        .count();
-    row.citations_valid = report.cited();
-    row.citations_total = report.cited() + unexpected;
-    if unexpected > 0 {
-        row.problems
-            .push(format!("unresolved citations {warned:?}"));
-    }
-    if models == Models::Fake {
-        row.negatives_total = negatives.len();
-        row.negatives_flagged = negatives
-            .iter()
-            .filter(|n| warned.contains(&n.as_str()))
-            .count();
-        // Intended document citations must point at the intended document.
-        let cited: Vec<&str> = report
-            .documents
-            .iter()
-            .map(|n| ids[n - 1].as_str())
-            .collect();
-        for id in &q.answer.cite_documents {
-            if !ids.contains(id) {
-                continue; // a retrieval miss, already counted in recall
-            }
-            row.intended_total += 1;
-            if cited.contains(&id.as_str()) {
-                row.intended_ok += 1;
-            } else {
-                row.problems.push(format!("{id} not cited"));
-            }
-        }
-        let unintended: Vec<&&str> = cited
-            .iter()
-            .filter(|c| !q.answer.cite_documents.iter().any(|d| d == *c))
-            .collect();
-        if !unintended.is_empty() {
-            row.intended_total += unintended.len();
-            row.problems
-                .push(format!("cited unintended {unintended:?}"));
-        }
-        for o in &q.answer.cite_observations {
-            row.intended_total += 1;
-            if report.observations.iter().any(|x| x == o) {
-                row.intended_ok += 1;
-            }
-        }
-    }
-    row
-}
-
-/// The source each stored document is listed as: a log pattern's day documents share
-/// `Metadata.pattern_id` and are one source; any other document is its own.
-fn source_groups(
-    parents: &BTreeMap<&str, &rag_core::domain::RagDocument>,
-) -> BTreeMap<String, String> {
-    parents
-        .iter()
-        .map(|(id, d)| {
-            let group = d.metadata.get("pattern_id").and_then(Value::as_str);
-            (id.to_string(), group.unwrap_or(id).to_string())
-        })
-        .collect()
-}
-
 fn assert_thresholds(rows: &[Row], t: Thresholds, models: Models) {
-    let a = aggregate(rows);
-    let mut failures = vec![];
-    let mut check = |name: &str, got: f64, min: f64| {
-        if got + 1e-9 < min {
-            failures.push(format!("{name} {got:.3} < {min:.2}"));
-        }
-    };
-    check("recall@k", a.recall_at_k, t.recall_at_k);
-    check("precision@R", a.precision_at_r, t.precision_at_r);
-    check(
-        "distractor exclusion",
-        a.distractor_exclusion,
-        t.distractor_exclusion,
-    );
-    check("scope accuracy", a.scope_accuracy, t.scope_accuracy);
-    check(
-        "citation validity",
-        a.citation_validity,
-        t.citation_validity,
-    );
-    check(
-        "observation recall",
-        a.observation_recall,
-        t.observation_recall,
-    );
-    if models == Models::Fake {
-        check(
-            "citation accuracy",
-            a.citation_accuracy,
-            t.citation_accuracy,
-        );
-        check(
-            "negative controls flagged",
-            a.negative_controls_flagged,
-            t.negative_controls_flagged,
-        );
-        check(
-            "evidence accuracy",
-            a.evidence_accuracy,
-            t.evidence_accuracy,
-        );
-    }
+    let failures = questions::threshold_failures(rows, &t, models.answers());
     assert!(
         failures.is_empty(),
         "incident questions below threshold (run with -- --nocapture for the report): {failures:?}"

@@ -8,6 +8,18 @@ Includes a **one-shot Datadog indexer**, **RAG API**, and **CLI** with automatic
 For how the pieces fit together, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 To build, configure, run, deploy or test Tails, see [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
 
+**Testing:** `cargo test` runs the unit tests and the in-process pipeline tests (fake
+Datadog, fake OpenAI, in-memory Qdrant). CI also runs them against a real Qdrant, and an
+[end-to-end run](docs/DEVELOPMENT.md#end-to-end-tests) (`scripts/e2e.sh`) of the built
+indexer, API and CLI against real Qdrant and real embeddings from
+text-embeddings-inference, with Datadog and the chat model faked.
+
+**Self-hosted embeddings:** set `OPENAI_EMBEDDING_BASE_URL` (and, if needed,
+`OPENAI_EMBEDDING_API_KEY`) to send embeddings to another OpenAI-compatible server, such as
+text-embeddings-inference, while chat stays on `OPENAI_BASE_URL`. Models trained with an
+instruction, such as bge or e5, get it through `OPENAI_EMBEDDING_QUERY_PREFIX` and
+`OPENAI_EMBEDDING_DOCUMENT_PREFIX` (see [DEVELOPMENT.md](docs/DEVELOPMENT.md)).
+
 ---
 
 ## Quickstart

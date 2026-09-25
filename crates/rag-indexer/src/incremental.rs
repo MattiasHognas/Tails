@@ -40,8 +40,9 @@ const LOOKUP_BATCH_SIZE: usize = 256;
 
 /// Turns chunk texts into vectors.
 pub trait Embedder {
-    /// Name of the embedding model; part of every content hash.
-    fn model(&self) -> &str;
+    /// What the vectors depend on besides the text (the model, and any document prefix);
+    /// part of every content hash, so changing it re-embeds everything.
+    fn model(&self) -> std::borrow::Cow<'_, str>;
     /// One vector per text, in input order.
     async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>>;
 }
@@ -69,12 +70,12 @@ pub trait PointStore {
 }
 
 impl Embedder for OpenAiClient {
-    fn model(&self) -> &str {
-        &self.embedding_model
+    fn model(&self) -> std::borrow::Cow<'_, str> {
+        self.document_embedding_id().into()
     }
 
     async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
-        Ok(OpenAiClient::embed_batch(self, texts).await?)
+        Ok(self.embed_documents(texts).await?)
     }
 }
 
@@ -300,7 +301,7 @@ impl<E: Embedder, S: PointStore> IncrementalSink<E, S> {
             .map(|(doc_index, doc)| Plan {
                 doc_index,
                 chunks: chunk(size, overlap, doc),
-                hash: content_hash(doc, size, overlap, self.embedder.model()),
+                hash: content_hash(doc, size, overlap, &self.embedder.model()),
                 unchanged: false,
                 has_surplus: false,
             })
@@ -413,8 +414,8 @@ pub mod fakes {
     }
 
     impl Embedder for FakeEmbedder {
-        fn model(&self) -> &str {
-            &self.model
+        fn model(&self) -> std::borrow::Cow<'_, str> {
+            self.model.as_str().into()
         }
 
         async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {

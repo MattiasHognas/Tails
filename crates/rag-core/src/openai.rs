@@ -3,11 +3,29 @@ use crate::resilience::{HttpConfig, RetryPolicy, send_with_retry};
 use anyhow::Result;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
+const EMBEDDINGS_PATH: &str = "/v1/embeddings";
+
+/// An OpenAI-compatible API: chat completions at `base_url`, embeddings at
+/// `embedding_base_url` (the same server unless configured otherwise, e.g. a
+/// self-hosted embedding server such as text-embeddings-inference).
 #[derive(Debug, Clone)]
 pub struct OpenAiClient {
     pub api_key: String,
     pub base_url: String,
+    /// Where `/v1/embeddings` is sent (`OPENAI_EMBEDDING_BASE_URL`).
+    pub embedding_base_url: String,
+    /// Bearer key for the embeddings endpoint (`OPENAI_EMBEDDING_API_KEY`).
+    pub embedding_api_key: String,
     pub embedding_model: String,
+    /// Put in front of every search query before it is embedded
+    /// (`OPENAI_EMBEDDING_QUERY_PREFIX`). Some models are trained with one, such as bge
+    /// ("Represent this sentence for searching relevant passages: ") or e5 ("query: ").
+    /// Empty for models that need none, like OpenAI's.
+    pub embedding_query_prefix: String,
+    /// Put in front of every indexed text before it is embedded
+    /// (`OPENAI_EMBEDDING_DOCUMENT_PREFIX`), for models that expect one, such as e5
+    /// ("passage: ") or nomic-embed ("search_document: "). Empty by default.
+    pub embedding_document_prefix: String,
     pub chat_model: String,
     pub http: reqwest::Client,
     pub retry: RetryPolicy,
@@ -40,16 +58,30 @@ impl OpenAiClient {
         chat_model: String,
     ) -> Self {
         Self {
+            embedding_api_key: api_key.clone(),
+            embedding_base_url: base_url.clone(),
             api_key,
             base_url,
             embedding_model,
+            embedding_query_prefix: String::new(),
+            embedding_document_prefix: String::new(),
             chat_model,
             http: HttpConfig::default().build_client(),
             retry: RetryPolicy::default(),
         }
     }
 
+    /// `OPENAI_API_KEY` (required), `OPENAI_BASE_URL`, `OPENAI_EMBEDDING_MODEL`,
+    /// `OPENAI_CHAT_MODEL`, and for embeddings served elsewhere
+    /// `OPENAI_EMBEDDING_BASE_URL` and `OPENAI_EMBEDDING_API_KEY`, which fall back to
+    /// `OPENAI_BASE_URL` and `OPENAI_API_KEY` when unset or blank.
     pub fn new_from_env() -> Result<Self> {
+        let set = |name: &str| {
+            std::env::var(name)
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        };
         let mut client = Self::new(
             std::env::var("OPENAI_API_KEY")?,
             std::env::var("OPENAI_BASE_URL").unwrap_or_else(|_| "https://api.openai.com".into()),
@@ -57,6 +89,22 @@ impl OpenAiClient {
                 .unwrap_or_else(|_| "text-embedding-3-small".into()),
             std::env::var("OPENAI_CHAT_MODEL").unwrap_or_else(|_| "o4-mini".into()),
         );
+        if let Some(url) = set("OPENAI_EMBEDDING_BASE_URL") {
+            client.embedding_base_url = url;
+        }
+        if let Some(key) = set("OPENAI_EMBEDDING_API_KEY") {
+            client.embedding_api_key = key;
+        }
+        // Prefixes are used as given: their trailing space or colon matters. A value of
+        // only whitespace counts as unset.
+        let prefix = |name: &str| {
+            std::env::var(name)
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+                .unwrap_or_default()
+        };
+        client.embedding_query_prefix = prefix("OPENAI_EMBEDDING_QUERY_PREFIX");
+        client.embedding_document_prefix = prefix("OPENAI_EMBEDDING_DOCUMENT_PREFIX");
         client.http = HttpConfig::from_env().build_client();
         client.retry = RetryPolicy::from_env();
         Ok(client)
@@ -70,10 +118,15 @@ impl OpenAiClient {
         path: &str,
         body: &B,
     ) -> Result<T, RagError> {
-        let url = format!("{}{}", self.base_url, path);
+        let (base, key) = if path == EMBEDDINGS_PATH {
+            (&self.embedding_base_url, &self.embedding_api_key)
+        } else {
+            (&self.base_url, &self.api_key)
+        };
+        let url = format!("{base}{path}");
         let what = format!("openai {path}");
         let r = send_with_retry(&self.retry, &what, || {
-            self.http.post(&url).bearer_auth(&self.api_key).json(body)
+            self.http.post(&url).bearer_auth(key).json(body)
         })
         .await
         .map_err(|f| RagError::upstream(stage, f))?;
@@ -90,6 +143,36 @@ impl OpenAiClient {
                 stage,
                 UpstreamError::InvalidResponse("empty chat completion".into()),
             )),
+        }
+    }
+
+    /// Embeds search queries, each with [`Self::embedding_query_prefix`] in front, in
+    /// one request (the single-input form for one query).
+    pub async fn embed_queries(&self, queries: &[String]) -> Result<Vec<Vec<f32>>, RagError> {
+        let texts = with_prefix(&self.embedding_query_prefix, queries);
+        match texts.as_slice() {
+            [one] => Ok(vec![self.embed(one).await?]),
+            many => self.embed_batch(many).await,
+        }
+    }
+
+    /// Embeds indexed texts, each with [`Self::embedding_document_prefix`] in front.
+    pub async fn embed_documents(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, RagError> {
+        self.embed_batch(&with_prefix(&self.embedding_document_prefix, texts))
+            .await
+    }
+
+    /// What the stored vectors depend on besides the text: the model and, when set, the
+    /// document prefix. Part of every content hash, so changing either re-embeds the
+    /// index; without a prefix it is the model name, as before.
+    pub fn document_embedding_id(&self) -> String {
+        if self.embedding_document_prefix.is_empty() {
+            self.embedding_model.clone()
+        } else {
+            format!(
+                "{} (document prefix {:?})",
+                self.embedding_model, self.embedding_document_prefix
+            )
         }
     }
 
@@ -112,7 +195,7 @@ impl OpenAiClient {
         let v: Resp = self
             .post_json(
                 Stage::Embedding,
-                "/v1/embeddings",
+                EMBEDDINGS_PATH,
                 &Req {
                     input: text,
                     model: &self.embedding_model,
@@ -154,7 +237,7 @@ impl OpenAiClient {
         let v: Resp = self
             .post_json(
                 Stage::Embedding,
-                "/v1/embeddings",
+                EMBEDDINGS_PATH,
                 &Req {
                     input: texts,
                     model: &self.embedding_model,
@@ -253,6 +336,11 @@ impl OpenAiClient {
     }
 }
 
+/// `texts` with `prefix` in front of each (unchanged when `prefix` is empty).
+fn with_prefix(prefix: &str, texts: &[String]) -> Vec<String> {
+    texts.iter().map(|t| format!("{prefix}{t}")).collect()
+}
+
 /// Splits `texts` into consecutive index ranges for [`OpenAiClient::embed_batch`]: each
 /// range holds at most `max_inputs` texts and at most `max_chars` characters in total (a
 /// rough stand-in for the per-request token limit). A single text longer than `max_chars`
@@ -289,8 +377,12 @@ mod tests {
     fn mock_client(base_url: String, retry: RetryPolicy) -> OpenAiClient {
         OpenAiClient {
             api_key: "test_key".to_string(),
+            embedding_api_key: "test_key".to_string(),
+            embedding_base_url: base_url.clone(),
             base_url,
             embedding_model: "test-model".to_string(),
+            embedding_query_prefix: String::new(),
+            embedding_document_prefix: String::new(),
             chat_model: "test-chat".to_string(),
             http: reqwest::Client::new(),
             retry,
@@ -455,6 +547,8 @@ mod tests {
             std::env::remove_var("OPENAI_BASE_URL");
             std::env::remove_var("OPENAI_EMBEDDING_MODEL");
             std::env::remove_var("OPENAI_CHAT_MODEL");
+            std::env::remove_var("OPENAI_EMBEDDING_BASE_URL");
+            std::env::remove_var("OPENAI_EMBEDDING_API_KEY");
             std::env::set_var("OPENAI_API_KEY", "test_key");
         }
 
@@ -463,6 +557,9 @@ mod tests {
         assert_eq!(client.base_url, "https://api.openai.com");
         assert_eq!(client.embedding_model, "text-embedding-3-small");
         assert_eq!(client.chat_model, "o4-mini");
+        // Embeddings use the same endpoint and key unless configured separately.
+        assert_eq!(client.embedding_base_url, "https://api.openai.com");
+        assert_eq!(client.embedding_api_key, "test_key");
 
         unsafe {
             std::env::remove_var("OPENAI_API_KEY");
@@ -485,6 +582,8 @@ mod tests {
         assert_eq!(client.base_url, "https://custom.openai.com");
         assert_eq!(client.embedding_model, "custom-embedding-model");
         assert_eq!(client.chat_model, "custom-chat-model");
+        assert_eq!(client.embedding_base_url, "https://custom.openai.com");
+        assert_eq!(client.embedding_api_key, "custom_key");
 
         // Cleanup
         unsafe {
@@ -493,6 +592,151 @@ mod tests {
             std::env::remove_var("OPENAI_EMBEDDING_MODEL");
             std::env::remove_var("OPENAI_CHAT_MODEL");
         }
+    }
+
+    #[test]
+    fn new_from_env_reads_a_separate_embedding_endpoint_and_key() {
+        let _env_lock = lock_env();
+        let _guards = [
+            "OPENAI_API_KEY",
+            "OPENAI_BASE_URL",
+            "OPENAI_EMBEDDING_BASE_URL",
+            "OPENAI_EMBEDDING_API_KEY",
+        ]
+        .map(EnvVarGuard::preserve);
+
+        unsafe {
+            std::env::set_var("OPENAI_API_KEY", "chat_key");
+            std::env::set_var("OPENAI_BASE_URL", "https://chat.example");
+            std::env::set_var("OPENAI_EMBEDDING_BASE_URL", " http://tei:8080 ");
+            std::env::set_var("OPENAI_EMBEDDING_API_KEY", "embed_key");
+        }
+        let client = OpenAiClient::new_from_env().unwrap();
+        assert_eq!(client.base_url, "https://chat.example");
+        assert_eq!(client.api_key, "chat_key");
+        assert_eq!(client.embedding_base_url, "http://tei:8080");
+        assert_eq!(client.embedding_api_key, "embed_key");
+
+        // Blank values fall back like unset ones; the URL and key are independent.
+        unsafe {
+            std::env::set_var("OPENAI_EMBEDDING_BASE_URL", "http://tei:8080");
+            std::env::set_var("OPENAI_EMBEDDING_API_KEY", "  ");
+        }
+        let client = OpenAiClient::new_from_env().unwrap();
+        assert_eq!(client.embedding_base_url, "http://tei:8080");
+        assert_eq!(client.embedding_api_key, "chat_key");
+        unsafe {
+            std::env::set_var("OPENAI_EMBEDDING_BASE_URL", "");
+            std::env::set_var("OPENAI_EMBEDDING_API_KEY", "embed_key");
+        }
+        let client = OpenAiClient::new_from_env().unwrap();
+        assert_eq!(client.embedding_base_url, "https://chat.example");
+        assert_eq!(client.embedding_api_key, "embed_key");
+    }
+
+    #[test]
+    fn new_from_env_reads_embedding_prefixes_as_given() {
+        let _env_lock = lock_env();
+        let _guards = [
+            EnvVarGuard::preserve("OPENAI_API_KEY"),
+            EnvVarGuard::preserve("OPENAI_EMBEDDING_QUERY_PREFIX"),
+            EnvVarGuard::preserve("OPENAI_EMBEDDING_DOCUMENT_PREFIX"),
+        ];
+        unsafe {
+            std::env::set_var("OPENAI_API_KEY", "k");
+            std::env::remove_var("OPENAI_EMBEDDING_QUERY_PREFIX");
+            std::env::remove_var("OPENAI_EMBEDDING_DOCUMENT_PREFIX");
+        }
+        let client = OpenAiClient::new_from_env().unwrap();
+        assert_eq!(client.embedding_query_prefix, "", "no prefix by default");
+        assert_eq!(client.embedding_document_prefix, "");
+
+        // Kept exactly, including the trailing space; whitespace alone counts as unset.
+        unsafe {
+            std::env::set_var(
+                "OPENAI_EMBEDDING_QUERY_PREFIX",
+                "Represent this sentence for searching relevant passages: ",
+            );
+            std::env::set_var("OPENAI_EMBEDDING_DOCUMENT_PREFIX", "   ");
+        }
+        let client = OpenAiClient::new_from_env().unwrap();
+        assert_eq!(
+            client.embedding_query_prefix,
+            "Represent this sentence for searching relevant passages: "
+        );
+        assert_eq!(client.embedding_document_prefix, "");
+    }
+
+    #[tokio::test]
+    async fn queries_and_documents_are_embedded_with_their_prefixes() {
+        let server = MockServer::start().await;
+        let reply = |n: usize| {
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": (0..n).map(|i| serde_json::json!({"index": i, "embedding": [i as f32 + 1.0]})).collect::<Vec<_>>()
+            }))
+        };
+        // One query: the single-input form. Several: one batched request.
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .and(body_json(
+                serde_json::json!({"input": "query: why", "model": "test-model"}),
+            ))
+            .respond_with(reply(1))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .and(body_json(
+                serde_json::json!({"input": ["query: a", "query: b"], "model": "test-model"}),
+            ))
+            .respond_with(reply(2))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .and(body_json(
+                serde_json::json!({"input": ["passage: doc"], "model": "test-model"}),
+            ))
+            .respond_with(reply(1))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut c = client(&server);
+        c.embedding_query_prefix = "query: ".into();
+        c.embedding_document_prefix = "passage: ".into();
+        assert_eq!(
+            c.embed_queries(&texts(&["why"])).await.unwrap(),
+            [vec![1.0]]
+        );
+        assert_eq!(
+            c.embed_queries(&texts(&["a", "b"])).await.unwrap(),
+            [vec![1.0], vec![2.0]]
+        );
+        assert_eq!(
+            c.embed_documents(&texts(&["doc"])).await.unwrap(),
+            [vec![1.0]]
+        );
+    }
+
+    #[test]
+    fn the_document_prefix_is_part_of_the_embedding_identity() {
+        let mut c = mock_client("http://unused".into(), RetryPolicy::none());
+        // Without a prefix, the identity is the model name, so existing content hashes
+        // stay valid.
+        assert_eq!(c.document_embedding_id(), "test-model");
+        c.embedding_query_prefix = "query: ".into();
+        assert_eq!(
+            c.document_embedding_id(),
+            "test-model",
+            "queries aren't stored"
+        );
+        c.embedding_document_prefix = "passage: ".into();
+        assert_eq!(
+            c.document_embedding_id(),
+            "test-model (document prefix \"passage: \")"
+        );
     }
 
     #[test]
@@ -509,14 +753,38 @@ mod tests {
     }
 
     fn client(server: &MockServer) -> OpenAiClient {
-        OpenAiClient {
-            api_key: "test_key".to_string(),
-            base_url: server.uri(),
-            embedding_model: "test-model".to_string(),
-            chat_model: "test-chat".to_string(),
-            http: reqwest::Client::new(),
-            retry: RetryPolicy::none(),
-        }
+        mock_client(server.uri(), RetryPolicy::none())
+    }
+
+    #[tokio::test]
+    async fn embeddings_go_to_the_embedding_endpoint_with_its_key() {
+        let chat = MockServer::start().await;
+        let embeddings = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .and(header("authorization", "Bearer embed_key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"data": [{"index": 0, "embedding": [0.5, 0.25]}]}),
+            ))
+            .expect(2)
+            .mount(&embeddings)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(header("authorization", "Bearer test_key"))
+            .respond_with(chat_reply(serde_json::json!("hi")))
+            .expect(1)
+            .mount(&chat)
+            .await;
+        let mut c = client(&chat);
+        c.embedding_base_url = embeddings.uri();
+        c.embedding_api_key = "embed_key".into();
+        assert_eq!(c.embed("a").await.unwrap(), [0.5, 0.25]);
+        assert_eq!(
+            c.embed_batch(&texts(&["a"])).await.unwrap(),
+            [vec![0.5, 0.25]]
+        );
+        assert_eq!(c.chat_complete("s", "u").await.unwrap(), "hi");
     }
 
     fn chat_reply(content: serde_json::Value) -> ResponseTemplate {

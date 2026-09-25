@@ -1,8 +1,7 @@
 //! Shared harness: run the real indexer into a store, serve the real API router on
 //! the same store, and read back what was written.
 
-pub mod datadog;
-pub mod openai;
+pub use tails_fakes::{datadog, openai};
 pub mod qdrant;
 
 use crate::checkpoint::{self, Checkpoints, Window};
@@ -27,9 +26,7 @@ pub use datadog::Corpus;
 pub use openai::FakeOpenAi;
 pub use qdrant::Store;
 
-pub fn at(s: &str) -> DateTime<Utc> {
-    DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
-}
+pub use tails_fakes::questions::at;
 
 /// Every source's first run reaches back far enough for all fixtures and the corpus.
 fn config() -> IndexerConfig {

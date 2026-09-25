@@ -129,6 +129,9 @@ pub struct Script {
 #[derive(Clone, Default)]
 pub struct FakeOpenAi {
     pub script: Arc<Mutex<Script>>,
+    /// Answer `/v1/embeddings` with 404, for runs whose embeddings come from a real
+    /// model (the end-to-end run against text-embeddings-inference).
+    pub no_embeddings: bool,
 }
 
 fn chat(content: String) -> ResponseTemplate {
@@ -203,9 +206,29 @@ impl FakeOpenAi {
         )
     }
 
-    fn handle(&self, req: &Request) -> ResponseTemplate {
+    /// The question of a planner request (JSON-mode chat with the planner's system
+    /// prompt), whose user message is the question itself.
+    pub fn planner_question(req: &Request) -> Option<String> {
+        if req.url.path() != "/v1/chat/completions" {
+            return None;
+        }
+        let body: Value = serde_json::from_slice(&req.body).ok()?;
+        let system = body["messages"][0]["content"].as_str()?;
+        (body.get("response_format").is_some() && system.contains("planning assistant"))
+            .then(|| body["messages"][1]["content"].as_str().map(str::to_string))
+            .flatten()
+    }
+
+    /// The last answer prompt the fake answer model was given for `question`.
+    pub fn prompt(&self, question: &str) -> Option<String> {
+        self.script.lock().unwrap().prompts.get(question).cloned()
+    }
+
+    /// Answers one OpenAI request: `/v1/embeddings` or `/v1/chat/completions`.
+    pub fn handle(&self, req: &Request) -> ResponseTemplate {
         let body: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
         match req.url.path() {
+            "/v1/embeddings" if self.no_embeddings => ResponseTemplate::new(404),
             "/v1/embeddings" => {
                 let inputs: Vec<String> = match &body["input"] {
                     Value::String(s) => vec![s.clone()],

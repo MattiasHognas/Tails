@@ -1,0 +1,15 @@
+{
+  "description": "Thresholds of the end-to-end run (scripts/e2e.sh, the e2e CI job): the built binaries against real Qdrant and real embeddings from text-embeddings-inference, with canned plans and answers. Separate from 'thresholds' in questions.json, which hold for the fake bag-of-words embeddings of the in-process harness. Scope accuracy and flagged negative controls are also hard checks. See docs/DEVELOPMENT.md#end-to-end-tests. Measured in CI (TEI cpu-1.9.4, BAAI/bge-small-en-v1.5, 36 questions): precision@R 0.944 (q17 and q40 rank a distractor first), every other aggregate 1.000. The thresholds sit at the in-process ones: recall@k 0.95, precision@R 0.90, all others 1.00. Embeddings from TEI on CPU are deterministic, so a drop is a real change, not noise.",
+  "embeddingModel": "BAAI/bge-small-en-v1.5",
+  "thresholds": {
+    "recallAtK": 0.95,
+    "precisionAtR": 0.9,
+    "distractorExclusion": 1.0,
+    "scopeAccuracy": 1.0,
+    "citationValidity": 1.0,
+    "citationAccuracy": 1.0,
+    "observationRecall": 1.0,
+    "negativeControlsFlagged": 1.0,
+    "evidenceAccuracy": 1.0
+  }
+}

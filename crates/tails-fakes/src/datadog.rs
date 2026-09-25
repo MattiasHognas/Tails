@@ -14,7 +14,7 @@ use std::sync::Arc;
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 /// The indexing query the adapter must send for logs.
-const LOG_INDEX_QUERY: &str = "status:error OR status:warn";
+pub const LOG_INDEX_QUERY: &str = "status:error OR status:warn";
 /// The indexing query the adapter must send for change events.
 const CHANGE_INDEX_QUERY: &str = rag_core::change_events::DEFAULT_QUERY;
 
@@ -90,7 +90,12 @@ fn read_json(path: PathBuf) -> Value {
 impl Corpus {
     /// Every recorded response in `rag-core/tests/fixtures/datadog`.
     pub fn fixtures() -> Self {
-        let f = |name: &str| read_json(fixture_dir().join(name));
+        Self::fixtures_from(&fixture_dir())
+    }
+
+    /// Every recorded response in `dir` (a copy of `rag-core/tests/fixtures/datadog`).
+    pub fn fixtures_from(dir: &std::path::Path) -> Self {
+        let f = |name: &str| read_json(dir.join(name));
         let array = |v: &Value| v.as_array().cloned().unwrap_or_default();
         let incidents = ["incidents_search_page1.json", "incidents_search_page2.json"]
             .iter()
@@ -242,10 +247,15 @@ fn ts(v: &Value) -> Option<DateTime<Utc>> {
         .map(|d| d.with_timezone(&Utc))
 }
 
+/// The indexing endpoints of the fake Datadog API over one corpus.
 #[derive(Clone)]
-struct IndexApi(Arc<Corpus>);
+pub struct IndexApi(Arc<Corpus>);
 
 impl IndexApi {
+    pub fn new(corpus: Corpus) -> Self {
+        Self(Arc::new(corpus))
+    }
+
     fn handle(&self, req: &Request) -> Result<ResponseTemplate, String> {
         if req.headers.get("DD-API-KEY").is_none()
             || req.headers.get("DD-APPLICATION-KEY").is_none()
@@ -421,7 +431,7 @@ impl Respond for IndexApi {
 pub async fn serve(corpus: Corpus) -> (MockServer, Datadog) {
     let server = MockServer::start().await;
     Mock::given(wiremock::matchers::any())
-        .respond_with(IndexApi(Arc::new(corpus)))
+        .respond_with(IndexApi::new(corpus))
         .mount(&server)
         .await;
     let dd = client(&server);
@@ -468,8 +478,16 @@ impl Live {
     }
 }
 
+/// The live-evidence endpoints of the fake Datadog API (`/api/v1/query` and log
+/// searches) over one question's [`Live`] data.
 #[derive(Clone)]
-struct LiveApi(Arc<Live>);
+pub struct LiveApi(Arc<Live>);
+
+impl LiveApi {
+    pub fn new(live: Live) -> Self {
+        Self(Arc::new(live))
+    }
+}
 
 impl Respond for LiveApi {
     fn respond(&self, req: &Request) -> ResponseTemplate {
@@ -520,7 +538,7 @@ impl Respond for LiveApi {
 pub async fn serve_live(live: Live) -> MockServer {
     let server = MockServer::start().await;
     Mock::given(wiremock::matchers::any())
-        .respond_with(LiveApi(Arc::new(live)))
+        .respond_with(LiveApi::new(live))
         .mount(&server)
         .await;
     server

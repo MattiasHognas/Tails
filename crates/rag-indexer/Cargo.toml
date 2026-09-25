@@ -18,5 +18,7 @@ chrono = { version = "0.4.45", features = ["serde"] }
 [dev-dependencies]
 # src/pipeline_tests runs this crate's writer against the API's reader.
 rag-api = { path = "../rag-api" }
+# The fake Datadog and OpenAI servers and the incident question set model.
+tails-fakes = { path = "../tails-fakes" }
 reqwest = { version = "0.13.4", default-features = false, features = ["native-tls", "json"] }
 wiremock = "0.6.5"
