@@ -19,7 +19,7 @@ use rag_core::{
     openai::OpenAiClient,
     planner::{self, Clock, PlanContext, QueryPlan, SystemClock, Window},
     qdrant::Qdrant,
-    rag_service::{StageTimeouts, answer_candidates, retrieve},
+    rag_service::{AskWindow, StageTimeouts, answer_candidates, logged_in_window, retrieve},
     resilience::{HttpConfig, RetryPolicy, env_duration_ms, run_stage},
     retrieval::{ExplicitScope, RetrievalScope, normalize_filters},
 };
@@ -466,6 +466,13 @@ async fn ask(
             &st.limits.stages,
         )
         .await?;
+        // Log pattern days are counted in the asked window, in the asker's timezone.
+        let window = AskWindow {
+            from: scope.from_utc,
+            to: scope.to_utc,
+            tz: ctx.tz,
+        };
+        let hits = logged_in_window(hits, &window);
 
         let timeline = live_timeline(&st, &req, &plan, &scope, &hits).await;
         // The LLM is only called with at least one hit or live observation.
@@ -478,6 +485,7 @@ async fn ask(
             top_k,
             &req.question,
             live_context.as_deref(),
+            &window,
             &st.limits.stages,
         )
         .await?;

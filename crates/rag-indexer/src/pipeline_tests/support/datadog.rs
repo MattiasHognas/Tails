@@ -83,7 +83,7 @@ impl Corpus {
         }
     }
 
-    /// The ID of the log pattern document that holds Datadog log `raw_id` of this corpus,
+    /// The ID of the log pattern day document that holds Datadog log `raw_id` of this corpus,
     /// computed with the adapter's own parsing and grouping.
     pub fn log_doc_id(&self, raw_id: &str) -> Option<String> {
         let log = self.logs.iter().find(|l| l["id"] == raw_id)?;
@@ -92,7 +92,7 @@ impl Corpus {
     }
 
     /// `id` with a `log_<raw id>` reference to a corpus log replaced by the ID of the
-    /// pattern document that holds it; anything else is returned unchanged.
+    /// pattern day document that holds it; anything else is returned unchanged.
     pub fn resolve(&self, id: &str) -> String {
         id.strip_prefix("log_")
             .and_then(|raw| self.log_doc_id(raw))

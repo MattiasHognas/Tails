@@ -1,48 +1,56 @@
-//! Error/warning logs grouped by message pattern.
+//! Error/warning logs grouped by message pattern and UTC day.
 //!
 //! During an incident Datadog returns thousands of near-identical error logs. Indexing
 //! each as its own document costs an embedding call per log and floods the top-K with
 //! copies of one message, so the indexer groups them instead: one document per
-//! (service, environment, status, [`normalize_message`] pattern), carrying the count,
-//! first and last time seen, a few sample messages and log IDs, and per-minute counts.
+//! (service, environment, status, [`normalize_message`] pattern, UTC day), carrying that
+//! day's count, first and last log, a few sample messages and log IDs, and logs per UTC
+//! hour. Per-day documents keep a pattern logged on Monday and Friday out of a question
+//! about Wednesday, and let the answer count exactly the hours of the asked window
+//! ([`occurrences`]). The days of one pattern share [`LogPattern::pattern_id`], so the
+//! answer lists them as one source.
 //!
 //! # Incremental runs
 //!
-//! Document IDs are stable per pattern ([`LogPattern::doc_id`]), so every run updates
-//! the same point. Runs fetch overlapping windows (`INDEXER_OVERLAP_MINUTES`), starting
-//! at a whole minute ([`fetch_start`]). A pattern's stored document keeps the per-minute
-//! counts of the window that last wrote it; the next run subtracts the stored minutes it
-//! fetched again and adds what it counted itself ([`LogPattern::merge_stored`]):
+//! Document IDs are stable per pattern and day ([`LogPattern::doc_id`]), so every run
+//! updates the same points. Runs fetch overlapping windows (`INDEXER_OVERLAP_MINUTES`),
+//! starting at a whole minute ([`fetch_start`]), and a fetch can reach into the previous
+//! UTC day. Each day's document is merged with its stored state separately
+//! ([`LogPattern::merge_stored`]), with `F` the fetch start:
 //!
-//! `count = stored.count - stored minutes at or after the fetch start + fetched count`
+//! - hours of the day that end at or before `F` keep their stored counts;
+//! - hours that start at or after `F` were fetched in full, so the fetched counts replace
+//!   the stored ones;
+//! - the hour that contains `F` keeps its stored logs before `F`: its stored count minus
+//!   the stored per-minute counts at or after `F`, plus the fetched count.
 //!
-//! Logs in the overlap are therefore counted once, logs that reached Datadog late (inside
-//! the overlap) are added, and re-running the same window (for example after a failed
-//! checkpoint save) changes nothing. Checkpoints only move forward, so later runs never
-//! start before a stored document's minutes. The exception is a checkpoint that moves
-//! back (a deleted checkpoint file or a larger overlap): the stored count before the
-//! stored minutes cannot be split, so logs between the new fetch start and the stored
-//! minutes may be counted twice, unless the fetch reaches back to the pattern's first
-//! log, in which case it is recounted from scratch.
+//! The per-minute counts are the only finer state kept: those of the fetch that last
+//! wrote the document, within its day, so that the hour containing the next fetch's start
+//! can be split. Checkpoints only move forward, so a later fetch never starts before
+//! them. Logs in the overlap are therefore counted once, logs that reached Datadog late
+//! (inside the overlap) are added, re-running a window changes nothing, and a fetch that
+//! starts before a day (or before its first stored log) recounts that day from scratch.
+//! The exception is a checkpoint moved back (a deleted checkpoint file or a larger
+//! overlap) to a minute before the stored per-minute counts and not on a whole hour: logs
+//! of that one hour between the fetch start and the stored minutes may be counted twice.
 
 use crate::chunk::stable_id;
 use crate::domain::{RagDocument, SourceKind};
 use crate::text::truncate_bytes;
-use chrono::{DateTime, Duration, DurationRound, SecondsFormat, Utc};
+use chrono::{DateTime, Duration, DurationRound, NaiveDate, SecondsFormat, Timelike, Utc};
+use chrono_tz::Tz;
 use serde_json::{Map, Value, json};
 use std::collections::{BTreeMap, HashSet};
 
 /// Longest pattern, in chars; longer messages are cut and end in `…`.
 pub const PATTERN_MAX_CHARS: usize = 160;
-/// Most distinct sample messages kept per pattern.
+/// Most distinct sample messages kept per pattern and day.
 pub const MAX_SAMPLES: usize = 3;
 /// Longest sample message, in bytes (cut at a char boundary).
 pub const SAMPLE_MAX_BYTES: usize = 4000;
-/// Most sample log IDs kept per pattern (the most recent ones).
+/// Most sample log IDs kept per pattern and day (the most recent ones).
 pub const MAX_SAMPLE_IDS: usize = 5;
-/// Most per-minute counts kept per pattern (the most recent ones): a day.
-pub const MAX_MINUTE_BUCKETS: usize = 1440;
-/// Prefix of pattern document IDs.
+/// Prefix of pattern IDs and of pattern document IDs.
 pub const DOC_ID_PREFIX: &str = "logpattern_";
 /// Characters of the pattern shown in a document title.
 const TITLE_PATTERN_CHARS: usize = 80;
@@ -51,13 +59,22 @@ const TITLE_PATTERN_CHARS: usize = 80;
 pub mod keys {
     pub const STATUS: &str = "status";
     pub const PATTERN: &str = "pattern";
+    /// The pattern across days ([`super::LogPattern::pattern_id`]); the reranker lists
+    /// the days of one pattern as one source.
+    pub const PATTERN_ID: &str = "pattern_id";
+    /// The UTC day, `YYYY-MM-DD`.
+    pub const DAY: &str = "day";
     pub const COUNT: &str = "count";
-    /// RFC 3339; `Timestamp` holds the last time seen. The retrieval filter reads this
-    /// key to keep patterns that started before a window and were still seen after it.
+    /// RFC 3339, the day's first log; `Timestamp` holds its last. The retrieval filter
+    /// reads this key to keep a day whose logs started before a window and went on after
+    /// it.
     pub const FIRST_SEEN: &str = "first_seen";
     pub const LAST_SEEN: &str = "last_seen";
     pub const SAMPLES: &str = "samples";
     pub const SAMPLE_LOG_IDS: &str = "sample_log_ids";
+    /// 24 counts, one per UTC hour of the day.
+    pub const HOUR_COUNTS: &str = "hour_counts";
+    /// Merge state only: per-minute counts of the fetch that last wrote the document.
     pub const MINUTE_COUNTS: &str = "minute_counts";
 }
 
@@ -175,21 +192,25 @@ pub struct LogEvent {
     pub message: String,
 }
 
-/// The state of one pattern document.
+/// The state of one pattern document: one pattern on one UTC day.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LogPattern {
     pub service: String,
     pub environment: String,
     pub status: String,
     pub pattern: String,
-    pub count: u64,
+    /// The UTC day of every log counted here.
+    pub day: NaiveDate,
     pub first_seen: DateTime<Utc>,
     pub last_seen: DateTime<Utc>,
     /// Distinct raw messages (cut to [`SAMPLE_MAX_BYTES`]), oldest first.
     pub samples: Vec<String>,
     /// The most recent log IDs, oldest first.
     pub sample_ids: Vec<String>,
-    /// Logs per minute (keyed by the minute's start) of the window that wrote this state.
+    /// Logs per UTC hour of `day`.
+    pub hour_counts: [u64; 24],
+    /// Logs per minute (keyed by the minute's start) of the fetch that wrote this state,
+    /// within `day`; only used to merge the next overlapping fetch.
     pub minute_counts: BTreeMap<DateTime<Utc>, u64>,
 }
 
@@ -201,6 +222,11 @@ fn parse_time(v: &Value) -> Option<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(v.as_str()?)
         .ok()
         .map(|t| t.with_timezone(&Utc))
+}
+
+/// Start of UTC hour `hour` of `day`.
+fn hour_start(day: NaiveDate, hour: usize) -> DateTime<Utc> {
+    day.and_hms_opt(0, 0, 0).expect("midnight exists").and_utc() + Duration::hours(hour as i64)
 }
 
 /// `items` without repeats, keeping first occurrences in order.
@@ -219,37 +245,40 @@ fn last_n(mut items: Vec<String>, n: usize) -> Vec<String> {
     items
 }
 
-/// Groups `events` by (service, environment, status, pattern). Events with an ID seen
-/// before are counted once. The result is sorted by document ID.
+/// Groups `events` by (service, environment, status, pattern, UTC day). Events with an
+/// ID seen before are counted once. The result is sorted by document ID.
 pub fn group(events: &[LogEvent]) -> Vec<LogPattern> {
     let mut sorted: Vec<&LogEvent> = events.iter().collect();
     sorted.sort_by(|a, b| a.timestamp.cmp(&b.timestamp).then(a.id.cmp(&b.id)));
     let mut seen_ids = HashSet::new();
-    let mut groups: BTreeMap<(String, String, String, String), LogPattern> = BTreeMap::new();
+    let mut groups: BTreeMap<(String, String, String, String, NaiveDate), LogPattern> =
+        BTreeMap::new();
     for e in sorted {
         if !e.id.is_empty() && !seen_ids.insert(e.id.as_str()) {
             continue;
         }
         let pattern = normalize_message(&e.message);
+        let day = e.timestamp.date_naive();
         let key = (
             e.service.clone(),
             e.environment.clone(),
             e.status.clone(),
             pattern.clone(),
+            day,
         );
         let g = groups.entry(key).or_insert_with(|| LogPattern {
             service: e.service.clone(),
             environment: e.environment.clone(),
             status: e.status.clone(),
             pattern,
-            count: 0,
+            day,
             first_seen: e.timestamp,
             last_seen: e.timestamp,
             samples: vec![],
             sample_ids: vec![],
+            hour_counts: [0; 24],
             minute_counts: BTreeMap::new(),
         });
-        g.count += 1;
         g.first_seen = g.first_seen.min(e.timestamp);
         g.last_seen = g.last_seen.max(e.timestamp);
         let sample = truncate_bytes(&e.message, SAMPLE_MAX_BYTES);
@@ -262,24 +291,22 @@ pub fn group(events: &[LogEvent]) -> Vec<LogPattern> {
                 g.sample_ids.remove(0);
             }
         }
+        g.hour_counts[e.timestamp.hour() as usize] += 1;
         *g.minute_counts.entry(fetch_start(e.timestamp)).or_default() += 1;
     }
-    let mut out: Vec<LogPattern> = groups
-        .into_values()
-        .map(|mut g| {
-            while g.minute_counts.len() > MAX_MINUTE_BUCKETS {
-                g.minute_counts.pop_first();
-            }
-            g
-        })
-        .collect();
+    let mut out: Vec<LogPattern> = groups.into_values().collect();
     out.sort_by_key(LogPattern::doc_id);
     out
 }
 
 impl LogPattern {
-    /// Stable per (service, environment, status, pattern), so runs update one point.
-    pub fn doc_id(&self) -> String {
+    /// Logs of the day.
+    pub fn count(&self) -> u64 {
+        self.hour_counts.iter().sum()
+    }
+
+    /// The pattern across days: stable per (service, environment, status, pattern).
+    pub fn pattern_id(&self) -> String {
         format!(
             "{DOC_ID_PREFIX}{}",
             stable_id(&[
@@ -289,6 +316,12 @@ impl LogPattern {
                 &self.pattern
             ])
         )
+    }
+
+    /// Stable per pattern and UTC day, so runs update one point per day:
+    /// `<pattern_id>_<YYYY-MM-DD>`.
+    pub fn doc_id(&self) -> String {
+        format!("{}_{}", self.pattern_id(), self.day)
     }
 
     /// Datadog log search for this pattern's service, environment and status.
@@ -307,7 +340,7 @@ impl LogPattern {
 
     /// The document for this state. `app_base` is the Datadog web app, e.g.
     /// `https://app.datadoghq.eu`; the source links to a log search for the pattern's
-    /// service, environment and status from its first to its last log.
+    /// service, environment and status from the day's first to its last log.
     pub fn to_document(&self, app_base: &str) -> RagDocument {
         let short: String = if self.pattern.chars().count() > TITLE_PATTERN_CHARS {
             let mut s: String = self.pattern.chars().take(TITLE_PATTERN_CHARS).collect();
@@ -328,9 +361,11 @@ impl LogPattern {
             format!(" {}", self.status)
         };
         let mut text = format!(
-            "Pattern: {}\nOccurrences: {}{} log(s), first seen {}, last seen {}\n\nSamples:\n{}",
+            "Pattern: {}\nOccurrences on {} (UTC): {}{} log(s), first seen {}, last seen {}\n\n\
+             Samples:\n{}",
             self.pattern,
-            self.count,
+            self.day,
+            self.count(),
             status,
             rfc3339(self.first_seen),
             rfc3339(self.last_seen),
@@ -356,11 +391,14 @@ impl LogPattern {
         let mut metadata = Map::new();
         metadata.insert(keys::STATUS.into(), json!(self.status));
         metadata.insert(keys::PATTERN.into(), json!(self.pattern));
-        metadata.insert(keys::COUNT.into(), json!(self.count));
+        metadata.insert(keys::PATTERN_ID.into(), json!(self.pattern_id()));
+        metadata.insert(keys::DAY.into(), json!(self.day.to_string()));
+        metadata.insert(keys::COUNT.into(), json!(self.count()));
         metadata.insert(keys::FIRST_SEEN.into(), json!(rfc3339(self.first_seen)));
         metadata.insert(keys::LAST_SEEN.into(), json!(rfc3339(self.last_seen)));
         metadata.insert(keys::SAMPLES.into(), json!(self.samples));
         metadata.insert(keys::SAMPLE_LOG_IDS.into(), json!(self.sample_ids));
+        metadata.insert(keys::HOUR_COUNTS.into(), json!(self.hour_counts));
         metadata.insert(keys::MINUTE_COUNTS.into(), Value::Object(minute_counts));
         RagDocument {
             id: self.doc_id(),
@@ -376,7 +414,7 @@ impl LogPattern {
     }
 
     /// Reads the state back from a pattern document's metadata; `None` for anything
-    /// else (for example a log point written before grouping).
+    /// else.
     pub fn from_metadata(
         service: &str,
         environment: &str,
@@ -389,6 +427,12 @@ impl LogPattern {
                 .map(|v| v.as_str().map(str::to_string))
                 .collect()
         };
+        let hours: Vec<u64> = md
+            .get(keys::HOUR_COUNTS)?
+            .as_array()?
+            .iter()
+            .map(Value::as_u64)
+            .collect::<Option<_>>()?;
         let minute_counts = md
             .get(keys::MINUTE_COUNTS)?
             .as_object()?
@@ -400,35 +444,49 @@ impl LogPattern {
             environment: environment.to_string(),
             status: md.get(keys::STATUS)?.as_str()?.to_string(),
             pattern: md.get(keys::PATTERN)?.as_str()?.to_string(),
-            count: md.get(keys::COUNT)?.as_u64()?,
+            day: md.get(keys::DAY)?.as_str()?.parse().ok()?,
             first_seen: parse_time(md.get(keys::FIRST_SEEN)?)?,
             last_seen: parse_time(md.get(keys::LAST_SEEN)?)?,
             samples: strings(keys::SAMPLES)?,
             sample_ids: strings(keys::SAMPLE_LOG_IDS)?,
+            hour_counts: hours.try_into().ok()?,
             minute_counts,
         })
     }
 
     /// Combines this state, counted from a fetch that started at `fetch_start`, with the
-    /// `stored` state of the same pattern written by an earlier run (see the module
-    /// docs). Logs the stored state counted at or after `fetch_start` were fetched again
-    /// and are only counted here.
+    /// `stored` state of the same pattern and day written by an earlier run (see the
+    /// module docs). Logs the stored state counted at or after `fetch_start` were fetched
+    /// again and are only counted here.
     pub fn merge_stored(self, stored: &LogPattern, fetch_start: DateTime<Utc>) -> LogPattern {
-        let recounted: u64 = stored
-            .minute_counts
-            .range(fetch_start..)
-            .map(|(_, c)| c)
-            .sum();
-        let before = if fetch_start <= stored.first_seen {
-            0
-        } else {
-            stored.count.saturating_sub(recounted)
-        };
-        if before == 0 {
+        if stored.day != self.day || fetch_start <= stored.first_seen {
             return self;
         }
+        let mut kept = [0u64; 24];
+        for (h, kept) in kept.iter_mut().enumerate() {
+            let (start, end) = (hour_start(self.day, h), hour_start(self.day, h + 1));
+            *kept = if end <= fetch_start {
+                stored.hour_counts[h]
+            } else if start >= fetch_start {
+                0
+            } else {
+                let refetched: u64 = stored
+                    .minute_counts
+                    .range(fetch_start..end)
+                    .map(|(_, c)| c)
+                    .sum();
+                stored.hour_counts[h].saturating_sub(refetched)
+            };
+        }
+        if kept.iter().all(|c| *c == 0) {
+            return self;
+        }
+        let mut hour_counts = self.hour_counts;
+        for (h, c) in hour_counts.iter_mut().enumerate() {
+            *c += kept[h];
+        }
         LogPattern {
-            count: before + self.count,
+            hour_counts,
             first_seen: stored.first_seen.min(self.first_seen),
             last_seen: stored.last_seen.max(self.last_seen),
             samples: dedup(stored.samples.iter().chain(&self.samples).cloned())
@@ -441,6 +499,24 @@ impl LogPattern {
             ),
             ..self
         }
+    }
+
+    /// Logs per UTC hour (the hour's start and its count) that may fall in
+    /// `[from, to)`: hours whose logs, known to lie between the day's first and last log,
+    /// overlap the window. An hour cut by a window bound counts in full.
+    pub fn hours_in(
+        &self,
+        from: Option<DateTime<Utc>>,
+        to: Option<DateTime<Utc>>,
+    ) -> impl Iterator<Item = (DateTime<Utc>, u64)> + '_ {
+        (0..24).filter_map(move |h| {
+            let count = self.hour_counts[h];
+            let start = hour_start(self.day, h).max(self.first_seen);
+            let last =
+                (hour_start(self.day, h + 1) - Duration::milliseconds(1)).min(self.last_seen);
+            let inside = from.is_none_or(|f| last >= f) && to.is_none_or(|t| start < t);
+            (count > 0 && inside).then(|| (hour_start(self.day, h), count))
+        })
     }
 }
 
@@ -468,6 +544,53 @@ pub fn merge_document(
     };
     new.merge_stored(&old, fetch_start)
         .to_document(app_base(&doc))
+}
+
+/// The pattern state of a retrieved log pattern document (or one of its chunks).
+pub fn from_document(doc: &RagDocument) -> Option<LogPattern> {
+    if doc.kind != SourceKind::Logs {
+        return None;
+    }
+    LogPattern::from_metadata(&doc.service, &doc.environment, &doc.metadata)
+}
+
+/// How often one pattern occurred, from the states of its retrieved days, for the
+/// answer prompt. With a window (`from`/`to`, either may be open) it counts the hours
+/// that overlap the window ([`LogPattern::hours_in`]); without one, every hour of the
+/// retrieved days. Counts are summed per calendar day in `tz` (an hour belongs to the
+/// day it starts in), e.g. `Occurrences in the question's window: 165 (Fri 2026-02-06:
+/// 120 · Mon 2026-02-09: 45; days in Europe/Helsinki, hour precision)`.
+pub fn occurrences(
+    days: &[LogPattern],
+    from: Option<DateTime<Utc>>,
+    to: Option<DateTime<Utc>>,
+    tz: Tz,
+) -> String {
+    let mut per_day: BTreeMap<NaiveDate, u64> = BTreeMap::new();
+    for d in days {
+        for (start, count) in d.hours_in(from, to) {
+            *per_day
+                .entry(start.with_timezone(&tz).date_naive())
+                .or_default() += count;
+        }
+    }
+    let total: u64 = per_day.values().sum();
+    let what = if from.is_some() || to.is_some() {
+        "in the question's window"
+    } else {
+        "on the retrieved days"
+    };
+    if total == 0 {
+        return format!("Occurrences {what}: 0");
+    }
+    let breakdown: Vec<String> = per_day
+        .iter()
+        .map(|(day, count)| format!("{}: {count}", day.format("%a %Y-%m-%d")))
+        .collect();
+    format!(
+        "Occurrences {what}: {total} ({}; days in {tz}, hour precision)",
+        breakdown.join(" · ")
+    )
 }
 
 #[cfg(test)]
@@ -554,7 +677,7 @@ mod tests {
     }
 
     #[test]
-    fn groups_by_scope_status_and_pattern() {
+    fn groups_by_scope_status_pattern_and_utc_day() {
         let mut other_env = event("e1", "2026-03-11T10:00:05Z", "timeout after 5ms");
         other_env.environment = "staging".into();
         let mut warn = event("w1", "2026-03-11T10:00:06Z", "timeout after 5ms");
@@ -562,33 +685,48 @@ mod tests {
         let events = [
             event("b", "2026-03-11T10:01:30.500Z", "timeout after 20ms"),
             event("a", "2026-03-11T10:00:01Z", "timeout after 10ms"),
-            event("c", "2026-03-11T10:01:59Z", "timeout after 10ms"),
+            event("c", "2026-03-11T11:01:59Z", "timeout after 10ms"),
             // A repeat of an ID (pagination overlap) is counted once.
             event("a", "2026-03-11T10:00:01Z", "timeout after 10ms"),
             event("x", "2026-03-11T10:02:00Z", "disk full"),
+            // Just after midnight UTC: the same pattern on the next day.
+            event("d", "2026-03-12T00:00:00Z", "timeout after 30ms"),
             other_env,
             warn,
         ];
         let groups = group(&events);
-        assert_eq!(groups.len(), 4);
-        let g = groups
+        assert_eq!(groups.len(), 5);
+        let prod_errors: Vec<&LogPattern> = groups
             .iter()
-            .find(|g| {
+            .filter(|g| {
                 g.pattern == "timeout after #ms" && g.status == "error" && g.environment == "prod"
             })
-            .unwrap();
-        assert_eq!(g.count, 3);
+            .collect();
+        let [g, next] = prod_errors.as_slice() else {
+            panic!("{prod_errors:?}")
+        };
+        assert_eq!(g.day, "2026-03-11".parse::<NaiveDate>().unwrap());
+        assert_eq!(g.count(), 3);
         assert_eq!(g.first_seen, ts("2026-03-11T10:00:01Z"));
-        assert_eq!(g.last_seen, ts("2026-03-11T10:01:59Z"));
+        assert_eq!(g.last_seen, ts("2026-03-11T11:01:59Z"));
         assert_eq!(g.samples, ["timeout after 10ms", "timeout after 20ms"]);
         assert_eq!(g.sample_ids, ["a", "b", "c"]);
+        let mut hours = [0; 24];
+        hours[10] = 2;
+        hours[11] = 1;
+        assert_eq!(g.hour_counts, hours);
         assert_eq!(
             g.minute_counts,
             BTreeMap::from([
                 (ts("2026-03-11T10:00:00Z"), 1),
-                (ts("2026-03-11T10:01:00Z"), 2)
+                (ts("2026-03-11T10:01:00Z"), 1),
+                (ts("2026-03-11T11:01:00Z"), 1)
             ])
         );
+        assert_eq!(next.day, "2026-03-12".parse::<NaiveDate>().unwrap());
+        assert_eq!((next.count(), next.hour_counts[0]), (1, 1));
+        assert_eq!(next.pattern_id(), g.pattern_id());
+        assert_ne!(next.doc_id(), g.doc_id());
         // Sorted by (stable) document ID.
         let ids: Vec<String> = groups.iter().map(LogPattern::doc_id).collect();
         let mut sorted = ids.clone();
@@ -597,12 +735,22 @@ mod tests {
     }
 
     #[test]
-    fn document_ids_are_stable_per_pattern() {
-        let a = &group(&[event("a", "2026-03-11T10:00:00Z", "timeout after 10ms")])[0];
-        let b = &group(&[event("zz", "2026-03-12T18:30:00Z", "timeout after 99999ms")])[0];
+    fn ids_are_stable_per_pattern_and_day() {
+        let a = &group(&[event("a", "2026-03-11T00:00:00Z", "timeout after 10ms")])[0];
+        let b = &group(&[event(
+            "zz",
+            "2026-03-11T23:59:59.999Z",
+            "timeout after 99999ms",
+        )])[0];
         assert_eq!(a.doc_id(), b.doc_id());
-        assert!(a.doc_id().starts_with(DOC_ID_PREFIX));
-        assert_eq!(a.doc_id().len(), DOC_ID_PREFIX.len() + 32);
+        let prefix = format!("{DOC_ID_PREFIX}{}", "0".repeat(32));
+        assert_eq!(a.pattern_id().len(), prefix.len());
+        assert!(a.pattern_id().starts_with(DOC_ID_PREFIX));
+        assert_eq!(a.doc_id(), format!("{}_2026-03-11", a.pattern_id()));
+        // Another day: another document of the same pattern.
+        let c = &group(&[event("c", "2026-03-12T00:00:00Z", "timeout after 10ms")])[0];
+        assert_eq!(c.pattern_id(), a.pattern_id());
+        assert_eq!(c.doc_id(), format!("{}_2026-03-12", a.pattern_id()));
         for edit in [
             |e: &mut LogEvent| e.service = "payments".into(),
             |e: &mut LogEvent| e.environment = "staging".into(),
@@ -611,7 +759,7 @@ mod tests {
         ] {
             let mut e = event("a", "2026-03-11T10:00:00Z", "timeout after 10ms");
             edit(&mut e);
-            assert_ne!(group(&[e])[0].doc_id(), a.doc_id());
+            assert_ne!(group(&[e])[0].pattern_id(), a.pattern_id());
         }
     }
 
@@ -629,7 +777,7 @@ mod tests {
             .collect();
         events.push(event("tail", "2026-03-11T11:00:00Z", "å 7"));
         let groups = group(&events);
-        let g = groups.iter().find(|g| g.count == 20).unwrap();
+        let g = groups.iter().find(|g| g.count() == 20).unwrap();
         assert_eq!(g.samples.len(), 1, "cut samples are equal");
         assert!(g.samples[0].len() <= SAMPLE_MAX_BYTES);
         assert!(long.starts_with(&g.samples[0]));
@@ -639,121 +787,288 @@ mod tests {
     }
 
     #[test]
-    fn document_carries_counts_times_samples_and_a_search_link() {
+    fn document_carries_the_day_its_hours_samples_and_a_search_link() {
         let events = [
             event("a", "2026-03-11T10:00:01Z", "timeout after 10ms"),
-            event("b", "2026-03-11T10:05:00.250Z", "timeout after 20ms"),
+            event("b", "2026-03-11T12:05:00.250Z", "timeout after 20ms"),
         ];
-        let doc = group(&events)[0].to_document(APP);
+        let g = &group(&events)[0];
+        let doc = g.to_document(APP);
+        assert_eq!(doc.id, g.doc_id());
         assert_eq!(doc.kind, SourceKind::Logs);
         assert_eq!(doc.title, "Log: checkout - error - timeout after #ms");
-        assert_eq!(doc.timestamp.as_deref(), Some("2026-03-11T10:05:00.250Z"));
+        assert_eq!(doc.timestamp.as_deref(), Some("2026-03-11T12:05:00.250Z"));
         assert_eq!(
             doc.text,
-            "Pattern: timeout after #ms\nOccurrences: 2 error log(s), first seen \
-             2026-03-11T10:00:01.000Z, last seen 2026-03-11T10:05:00.250Z\n\nSamples:\n\
-             timeout after 10ms\n\ntimeout after 20ms\n\nSample log IDs: a, b"
+            "Pattern: timeout after #ms\nOccurrences on 2026-03-11 (UTC): 2 error log(s), \
+             first seen 2026-03-11T10:00:01.000Z, last seen 2026-03-11T12:05:00.250Z\n\n\
+             Samples:\ntimeout after 10ms\n\ntimeout after 20ms\n\nSample log IDs: a, b"
         );
+        // A log search limited to the day's first..last log.
         assert_eq!(
             doc.source_uri,
             "https://app.datadoghq.eu/logs?query=service%3Acheckout%20env%3Aprod%20status%3Aerror\
-             &from_ts=1773223201000&to_ts=1773223500251&live=false"
+             &from_ts=1773223201000&to_ts=1773230700251&live=false"
         );
+        assert_eq!(doc.metadata["day"], "2026-03-11");
+        assert_eq!(doc.metadata["pattern_id"], g.pattern_id());
         assert_eq!(doc.metadata["first_seen"], "2026-03-11T10:00:01.000Z");
         assert_eq!(doc.metadata["count"], 2);
         assert_eq!(
+            doc.metadata["hour_counts"],
+            json!([
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+            ])
+        );
+        assert_eq!(
             doc.metadata["minute_counts"],
-            json!({"2026-03-11T10:00:00Z": 1, "2026-03-11T10:05:00Z": 1})
+            json!({"2026-03-11T10:00:00Z": 1, "2026-03-11T12:05:00Z": 1})
         );
         // The state reads back from the metadata unchanged.
         let back = LogPattern::from_metadata("checkout", "prod", &doc.metadata).unwrap();
-        assert_eq!(back, group(&events)[0]);
+        assert_eq!(&back, g);
+        assert_eq!(from_document(&doc).as_ref(), Some(g));
         assert!(LogPattern::from_metadata("checkout", "prod", &Map::new()).is_none());
+        let mut short = doc.metadata.clone();
+        short.insert("hour_counts".into(), json!([1, 2]));
+        assert!(LogPattern::from_metadata("checkout", "prod", &short).is_none());
     }
 
-    /// Run N fetches [10:00, 10:30]; run N+1 re-fetches from 10:20 (the overlap) to 10:45
-    /// and also sees a log that reached Datadog late at 10:25.
+    fn cache_miss(id: &str, at: &str) -> LogEvent {
+        event(id, at, &format!("cache miss for key {}", id.len() * 4711))
+    }
+
+    /// The stored state of `events` merged with a fetch of `fresh` from `start`.
+    fn merged(stored: &LogPattern, fresh: &[LogEvent], start: &str) -> LogPattern {
+        let fresh = &group(fresh)[0];
+        let doc = merge_document(
+            fresh.to_document(APP),
+            &stored.to_document(APP).metadata,
+            ts(start),
+        );
+        from_document(&doc).unwrap()
+    }
+
+    /// Run N fetches [10:00, 10:30]; run N+1 re-fetches from 10:20 (the overlap, inside
+    /// the 10 o'clock hour) to 10:45 and also sees a log that reached Datadog late.
     #[test]
     fn overlapping_runs_count_every_log_once() {
-        let msg = |i: u32| format!("cache miss for key {i}");
         let run_n = [
-            event("1", "2026-03-11T10:05:00Z", &msg(1)),
-            event("2", "2026-03-11T10:15:00Z", &msg(2)),
-            event("3", "2026-03-11T10:21:10Z", &msg(3)),
-            event("4", "2026-03-11T10:29:59Z", &msg(4)),
+            cache_miss("1", "2026-03-11T09:05:00Z"),
+            cache_miss("2", "2026-03-11T10:15:00Z"),
+            cache_miss("3", "2026-03-11T10:21:10Z"),
+            cache_miss("4", "2026-03-11T10:29:59Z"),
         ];
-        let stored = group(&run_n)[0].to_document(APP);
+        let stored = group(&run_n)[0].clone();
 
         let start = fetch_start(ts("2026-03-11T10:20:30Z"));
         assert_eq!(start, ts("2026-03-11T10:20:00Z"));
         let run_n1 = [
-            event("3", "2026-03-11T10:21:10Z", &msg(3)),
-            event("late", "2026-03-11T10:25:00Z", &msg(5)),
-            event("4", "2026-03-11T10:29:59Z", &msg(4)),
-            event("6", "2026-03-11T10:44:00Z", &msg(6)),
+            cache_miss("3", "2026-03-11T10:21:10Z"),
+            cache_miss("late", "2026-03-11T10:25:00Z"),
+            cache_miss("4", "2026-03-11T10:29:59Z"),
+            cache_miss("6", "2026-03-11T11:44:00Z"),
         ];
-        let fresh = group(&run_n1)[0].to_document(APP);
-        assert_eq!(fresh.id, stored.id, "one point per pattern");
-        let merged = merge_document(fresh.clone(), &stored.metadata, start);
-        let m = LogPattern::from_metadata("checkout", "prod", &merged.metadata).unwrap();
-        assert_eq!(m.count, 6, "1, 2 from run N; 3, late, 4, 6 from run N+1");
-        assert_eq!(m.first_seen, ts("2026-03-11T10:05:00Z"));
-        assert_eq!(m.last_seen, ts("2026-03-11T10:44:00Z"));
         assert_eq!(
-            merged.timestamp.as_deref(),
-            Some("2026-03-11T10:44:00.000Z")
+            group(&run_n1)[0].doc_id(),
+            stored.doc_id(),
+            "one point per day"
         );
+        let m = merged(&stored, &run_n1, "2026-03-11T10:20:00Z");
+        assert_eq!(m.count(), 6, "1, 2 from run N; 3, late, 4, 6 from run N+1");
+        assert_eq!(
+            (m.hour_counts[9], m.hour_counts[10], m.hour_counts[11]),
+            (1, 4, 1)
+        );
+        assert_eq!(m.first_seen, ts("2026-03-11T09:05:00Z"));
+        assert_eq!(m.last_seen, ts("2026-03-11T11:44:00Z"));
         assert_eq!(m.sample_ids, ["2", "3", "4", "late", "6"]);
-        assert_eq!(m.samples, [msg(1), msg(2), msg(3)]);
-        assert!(merged.text.contains("Occurrences: 6 error log(s)"));
-        assert!(merged.source_uri.contains("&from_ts=1773223500000&"));
+        let doc = m.to_document(APP);
+        assert_eq!(doc.timestamp.as_deref(), Some("2026-03-11T11:44:00.000Z"));
+        assert!(
+            doc.text
+                .contains("Occurrences on 2026-03-11 (UTC): 6 error log(s)")
+        );
+        assert!(doc.source_uri.contains("&from_ts=1773219900000&"));
+        // Only the fetch's own minutes are kept.
+        assert_eq!(m.minute_counts.len(), 4);
 
         // Re-running the same window (e.g. after a failed checkpoint save) is a no-op.
-        let again = merge_document(fresh.clone(), &merged.metadata, start);
-        assert_eq!(
-            serde_json::to_value(&again).unwrap(),
-            serde_json::to_value(&merged).unwrap()
-        );
+        assert_eq!(merged(&m, &run_n1, "2026-03-11T10:20:00Z"), m);
         // The next run with nothing new in its window keeps the total.
-        let next_start = ts("2026-03-11T10:35:00Z");
-        let only_6 = group(&[event("6", "2026-03-11T10:44:00Z", &msg(6))])[0].to_document(APP);
-        let next = merge_document(only_6, &merged.metadata, next_start);
-        assert_eq!(next.metadata["count"], 6);
-        assert_eq!(next.metadata["first_seen"], "2026-03-11T10:05:00.000Z");
+        let next = merged(
+            &m,
+            &[cache_miss("6", "2026-03-11T11:44:00Z")],
+            "2026-03-11T11:35:00Z",
+        );
+        assert_eq!(next.count(), 6);
+        assert_eq!(next.first_seen, ts("2026-03-11T09:05:00Z"));
 
         // A fetch reaching back before the first stored log recounts from scratch.
-        let full = group(&[run_n.as_slice(), run_n1.as_slice()].concat())[0].to_document(APP);
-        let recount = merge_document(full.clone(), &merged.metadata, ts("2026-03-11T10:00:00Z"));
-        assert_eq!(recount.metadata["count"], 6);
-        assert_eq!(
-            serde_json::to_value(&recount).unwrap(),
-            serde_json::to_value(&full).unwrap()
-        );
+        let all = [run_n.as_slice(), run_n1.as_slice()].concat();
+        let recount = merged(&m, &all, "2026-03-11T09:00:00Z");
+        assert_eq!(recount, group(&all)[0]);
+        assert_eq!(recount.count(), 6);
+        // A checkpoint moved back to a whole hour is still exact: whole hours are replaced.
+        let back = merged(&next, &all[1..], "2026-03-11T10:00:00Z");
+        assert_eq!(back.count(), 6);
+    }
+
+    /// Run N fetched 23:20..23:50 on 11 March; run N+1 fetches 23:40..00:30 and sees a
+    /// late log before midnight and new logs after it: each day's document is merged on
+    /// its own, and the new day is counted from scratch.
+    #[test]
+    fn a_fetch_across_midnight_updates_both_days() {
+        let run_n = [
+            cache_miss("a", "2026-03-11T22:10:00Z"),
+            cache_miss("b", "2026-03-11T23:30:00Z"),
+            cache_miss("c", "2026-03-11T23:45:00Z"),
+        ];
+        let stored = group(&run_n)[0].clone();
+        let run_n1 = [
+            cache_miss("c", "2026-03-11T23:45:00Z"),
+            cache_miss("late", "2026-03-11T23:49:00Z"),
+            cache_miss("d", "2026-03-12T00:05:00Z"),
+            cache_miss("e", "2026-03-12T00:20:00Z"),
+        ];
+        let fetched = group(&run_n1);
+        assert_eq!(fetched.len(), 2);
+        let [before, after] = [&fetched[0], &fetched[1]].map(|g| {
+            let doc = g.to_document(APP);
+            // The new day has no stored point yet; the old day merges with its own.
+            let stored_md = (g.day == stored.day).then(|| stored.to_document(APP).metadata);
+            let doc = match stored_md {
+                Some(md) => merge_document(doc, &md, ts("2026-03-11T23:40:00Z")),
+                None => doc,
+            };
+            from_document(&doc).unwrap()
+        });
+        let (old, new) = if before.day == stored.day {
+            (before, after)
+        } else {
+            (after, before)
+        };
+        assert_eq!(old.count(), 4, "a, b from run N; c, late from run N+1");
+        assert_eq!((old.hour_counts[22], old.hour_counts[23]), (1, 3));
+        assert_eq!(old.last_seen, ts("2026-03-11T23:49:00Z"));
+        assert_eq!(new.count(), 2);
+        assert_eq!(new.first_seen, ts("2026-03-12T00:05:00Z"));
+        assert_eq!(new.pattern_id(), old.pattern_id());
+
+        // The following run starts at 00:15 and merges only into the new day; a stored
+        // day that the fetch starts before is recounted.
+        let run_n2 = [
+            cache_miss("e", "2026-03-12T00:20:00Z"),
+            cache_miss("f", "2026-03-12T01:00:00Z"),
+        ];
+        let newer = merged(&new, &run_n2, "2026-03-12T00:15:00Z");
+        assert_eq!(newer.count(), 3);
+        let recount = merged(&new, &run_n1[2..], "2026-03-11T23:40:00Z");
+        assert_eq!(recount, new);
     }
 
     #[test]
-    fn non_pattern_documents_are_not_merged() {
+    fn documents_that_are_not_pattern_days_are_not_merged() {
         let fresh = group(&[event("a", "2026-03-11T10:00:00Z", "x 1")])[0].to_document(APP);
-        let legacy = Map::from_iter([("status".to_string(), json!("error"))]);
-        let merged = merge_document(fresh.clone(), &legacy, ts("2026-03-11T10:00:00Z"));
+        let other = Map::from_iter([("status".to_string(), json!("error"))]);
+        let merged = merge_document(fresh.clone(), &other, ts("2026-03-11T10:00:00Z"));
         assert_eq!(merged.text, fresh.text);
+        // Another day's state never merges into this day.
+        let other_day = group(&[event("b", "2026-03-10T10:00:00Z", "x 2")])[0].to_document(APP);
+        let merged = merge_document(
+            fresh.clone(),
+            &other_day.metadata,
+            ts("2026-03-11T10:30:00Z"),
+        );
+        assert_eq!(merged.metadata["count"], 1);
     }
 
-    #[test]
-    fn minute_counts_are_capped_to_the_most_recent() {
-        let start = ts("2026-03-10T00:00:00Z");
-        let events: Vec<LogEvent> = (0..MAX_MINUTE_BUCKETS as i64 + 10)
+    fn burst(at: &str, n: usize, every_secs: i64) -> Vec<LogEvent> {
+        (0..n)
             .map(|i| LogEvent {
-                timestamp: start + Duration::minutes(i),
-                ..event(&format!("{i}"), "2026-03-10T00:00:00Z", "tick")
+                timestamp: ts(at) + Duration::seconds(every_secs * i as i64),
+                ..event(
+                    &format!("{at}-{i}"),
+                    at,
+                    "inventory sync failed after 502ms",
+                )
             })
-            .collect();
-        let g = &group(&events)[0];
-        assert_eq!(g.count, MAX_MINUTE_BUCKETS as u64 + 10);
-        assert_eq!(g.minute_counts.len(), MAX_MINUTE_BUCKETS);
+            .collect()
+    }
+
+    /// Asked in Helsinki (UTC+2) for Friday..Monday: the window starts at 22:00 UTC on
+    /// Thursday. Thursday's UTC day holds 40 logs in the morning (outside) and 20 after
+    /// 22:00 (Friday in Helsinki); counting whole UTC days would add the 40 and put the
+    /// 20 on Thursday.
+    #[test]
+    fn window_counts_use_hours_and_the_askers_days() {
+        let events = [
+            burst("2026-02-05T08:00:00Z", 40, 60),
+            burst("2026-02-05T22:10:00Z", 20, 120),
+            burst("2026-02-06T09:00:00Z", 100, 30),
+            burst("2026-02-09T07:00:00Z", 45, 60),
+        ]
+        .concat();
+        let days = group(&events);
+        assert_eq!(days.len(), 3);
+        let helsinki: Tz = "Europe/Helsinki".parse().unwrap();
+        let (from, to) = (ts("2026-02-05T22:00:00Z"), ts("2026-02-09T22:00:00Z"));
         assert_eq!(
-            g.minute_counts.keys().next(),
-            Some(&(start + Duration::minutes(10)))
+            occurrences(&days, Some(from), Some(to), helsinki),
+            "Occurrences in the question's window: 165 (Fri 2026-02-06: 120 · Mon 2026-02-09: 45; \
+             days in Europe/Helsinki, hour precision)"
         );
+        // The same window from UTC: Friday starts at midnight UTC.
+        assert_eq!(
+            occurrences(
+                &days,
+                Some(ts("2026-02-06T00:00:00Z")),
+                Some(ts("2026-02-10T00:00:00Z")),
+                Tz::UTC
+            ),
+            "Occurrences in the question's window: 145 (Fri 2026-02-06: 100 · Mon 2026-02-09: 45; \
+             days in UTC, hour precision)"
+        );
+        // No window: every retrieved day, per day in the asker's zone.
+        assert_eq!(
+            occurrences(&days, None, None, helsinki),
+            "Occurrences on the retrieved days: 205 (Thu 2026-02-05: 40 · Fri 2026-02-06: 120 · \
+             Mon 2026-02-09: 45; days in Europe/Helsinki, hour precision)"
+        );
+        // An open-ended window and a half-hour zone: an hour belongs to the local day it
+        // starts in (22:00 UTC is 03:30 on Friday in Kolkata).
+        let kolkata: Tz = "Asia/Kolkata".parse().unwrap();
+        assert_eq!(
+            occurrences(&days, Some(from), None, kolkata),
+            "Occurrences in the question's window: 165 (Fri 2026-02-06: 120 · Mon 2026-02-09: 45; \
+             days in Asia/Kolkata, hour precision)"
+        );
+    }
+
+    /// An hour cut by the window counts in full, but hours before the day's first or
+    /// after its last log never count.
+    #[test]
+    fn hours_in_a_window_are_bounded_by_the_first_and_last_log() {
+        let g = &group(&[
+            event("a", "2026-03-11T09:10:00Z", "x 1"),
+            event("b", "2026-03-11T09:50:00Z", "x 2"),
+            event("c", "2026-03-11T13:00:00Z", "x 3"),
+        ])[0];
+        let hours = |from: &str, to: &str| -> Vec<(DateTime<Utc>, u64)> {
+            g.hours_in(Some(ts(from)), Some(ts(to))).collect()
+        };
+        assert_eq!(
+            hours("2026-03-11T09:30:00Z", "2026-03-11T10:00:00Z"),
+            [(ts("2026-03-11T09:00:00Z"), 2)]
+        );
+        // Between the logs: nothing, although the day's span overlaps the window.
+        assert!(hours("2026-03-11T10:00:00Z", "2026-03-11T12:00:00Z").is_empty());
+        // Half-open: a window ending at the first log misses it.
+        assert!(hours("2026-03-11T08:00:00Z", "2026-03-11T09:10:00Z").is_empty());
+        assert_eq!(
+            hours("2026-03-11T13:00:00Z", "2026-03-11T13:00:01Z"),
+            [(ts("2026-03-11T13:00:00Z"), 1)]
+        );
+        assert_eq!(g.hours_in(None, None).count(), 2);
     }
 }

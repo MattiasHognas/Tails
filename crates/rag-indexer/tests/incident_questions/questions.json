@@ -1,6 +1,6 @@
 {
-  "version": 2,
-  "description": "Incident questions for the /ask quality harness (crates/rag-indexer/src/pipeline_tests/quality.rs). Each question is answered by the real pipeline over corpus.json plus the recorded fixtures, with deterministic embeddings, a canned planner reply ('plan') and a canned answer model that cites 'answer'. Logs are indexed grouped by message pattern; 'log_<id>' names the pattern document that holds Datadog log <id>. See docs/DEVELOPMENT.md#incident-question-set for the metrics and how to add questions or change thresholds.",
+  "version": 3,
+  "description": "Incident questions for the /ask quality harness (crates/rag-indexer/src/pipeline_tests/quality.rs). Each question is answered by the real pipeline over corpus.json plus the recorded fixtures, with deterministic embeddings, a canned planner reply ('plan') and a canned answer model that cites 'answer'. Logs are indexed grouped by message pattern and UTC day; 'log_<id>' names the log pattern that holds Datadog log <id>, which is one source whichever of its days are retrieved. 'evidence' lists facts the answer prompt must state about a source, such as a pattern's count in the question's window. See docs/DEVELOPMENT.md#incident-question-set for the metrics and how to add questions or change thresholds.",
   "defaults": {"now": "2026-03-12T09:00:00Z", "timezone": "Europe/Stockholm"},
   "thresholds": {
     "recallAtK": 0.95,
@@ -10,7 +10,8 @@
     "citationValidity": 1.0,
     "citationAccuracy": 1.0,
     "observationRecall": 1.0,
-    "negativeControlsFlagged": 1.0
+    "negativeControlsFlagged": 1.0,
+    "evidenceAccuracy": 1.0
   },
   "questions": [
     {
@@ -278,6 +279,63 @@
         "mustRetrieve": ["monitor_3001"]
       },
       "answer": {"citeDocuments": ["monitor_3001"]}
+    },
+    {
+      "id": "q20-checkout-wrong-day",
+      "question": "What errors did checkout have on Wednesday?",
+      "note": "A Redis 'connection refused' pattern was logged on Monday and Friday only. One document spanning Monday..Friday overlapped Wednesday and was reported as a Wednesday error; per-day documents do not.",
+      "now": "2026-02-20T16:00:00Z",
+      "plan": {"intent": "semanticLogSearch", "service": "checkout", "environment": "prod", "filters": ["kind:logs"],
+               "window": {"fromUtc": "2026-02-17T23:00:00Z", "toUtc": "2026-02-18T23:00:00Z"}},
+      "expect": {
+        "scope": {"service": "checkout", "environment": "prod", "fromUtc": "2026-02-17T23:00:00Z", "toUtc": "2026-02-18T23:00:00Z", "kinds": ["logs"]},
+        "mustRetrieve": ["log_co-pay-wed"],
+        "mustNotRetrieve": ["log_co-redis-mon-0"]
+      },
+      "answer": {"citeDocuments": ["log_co-pay-wed"]}
+    },
+    {
+      "id": "q21-cache-timeouts-yesterday",
+      "question": "How many cache timeouts did checkout have yesterday?",
+      "note": "300 cache timeouts yesterday and 3990 in the week before. The model must be given the count for yesterday, not the pattern's total.",
+      "now": "2026-01-20T08:00:00Z",
+      "plan": {"intent": "semanticLogSearch", "service": "checkout", "environment": "prod", "filters": ["kind:logs"],
+               "rewrittenQuery": "checkout cache timeout redis"},
+      "expect": {
+        "scope": {"service": "checkout", "environment": "prod", "fromUtc": "2026-01-18T23:00:00Z", "toUtc": "2026-01-19T23:00:00Z", "kinds": ["logs"]},
+        "mustRetrieve": ["log_co-cache-y-0"],
+        "evidence": [{"document": "log_co-cache-y-0", "contains": ["Occurrences in the question's window: 300 (Mon 2026-01-19: 300;"]}]
+      },
+      "answer": {"citeDocuments": ["log_co-cache-y-0"]}
+    },
+    {
+      "id": "q22-recurring-pattern-one-source",
+      "question": "Which checkout errors kept coming back between Monday and Friday?",
+      "note": "One pattern logged on each of five days in the window: one source with a count per day.",
+      "now": "2026-01-31T10:00:00Z",
+      "plan": {"intent": "semanticLogSearch", "service": "checkout", "environment": "prod", "filters": ["kind:logs"],
+               "window": {"fromUtc": "2026-01-25T23:00:00Z", "toUtc": "2026-01-30T23:00:00Z"}},
+      "expect": {
+        "scope": {"service": "checkout", "environment": "prod", "fromUtc": "2026-01-25T23:00:00Z", "toUtc": "2026-01-30T23:00:00Z", "kinds": ["logs"]},
+        "mustRetrieve": ["log_co-tax-mon-0"],
+        "evidence": [{"document": "log_co-tax-mon-0", "contains": ["Occurrences in the question's window: 67 (Mon 2026-01-26: 12 · Tue 2026-01-27: 15 · Wed 2026-01-28: 9 · Thu 2026-01-29: 20 · Fri 2026-01-30: 11;"]}]
+      },
+      "answer": {"citeDocuments": ["log_co-tax-mon-0"]}
+    },
+    {
+      "id": "q23-range-across-timezone",
+      "question": "What errors did checkout have between Friday and Monday?",
+      "note": "Asked in Helsinki (UTC+2). The pattern was logged Thursday morning UTC (outside the window), late Thursday UTC (already Friday in Helsinki), Friday and Monday. Counting whole UTC days would add the Thursday morning logs and put the late ones on Thursday.",
+      "now": "2026-02-10T08:00:00Z",
+      "timezone": "Europe/Helsinki",
+      "plan": {"intent": "semanticLogSearch", "service": "checkout", "environment": "prod", "filters": ["kind:logs"],
+               "window": {"fromUtc": "2026-02-05T22:00:00Z", "toUtc": "2026-02-09T22:00:00Z"}},
+      "expect": {
+        "scope": {"service": "checkout", "environment": "prod", "fromUtc": "2026-02-05T22:00:00Z", "toUtc": "2026-02-09T22:00:00Z", "kinds": ["logs"]},
+        "mustRetrieve": ["log_co-inv-fri-0"],
+        "evidence": [{"document": "log_co-inv-fri-0", "contains": ["Occurrences in the question's window: 165 (Fri 2026-02-06: 120 · Mon 2026-02-09: 45; days in Europe/Helsinki"]}]
+      },
+      "answer": {"citeDocuments": ["log_co-inv-fri-0"]}
     }
   ]
 }

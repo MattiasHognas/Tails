@@ -12,11 +12,13 @@
 //!   events just before the window and at its (exclusive) end are not;
 //! - `Service`/`Environment` casing vs the lowercased planner and explicit values
 //!   (`Auth-API` from Datadog, `AUTH-API` from the planner, `Checkout` from a caller);
-//! - `Metadata.chunk_of` vs the reranker's grouping: a multi-chunk log pattern is one
-//!   source;
-//! - log patterns: logs are stored grouped by pattern; `Metadata.first_seen` is RFC 3339
-//!   and a pattern whose span overlaps the window is retrieved although its `Timestamp`
-//!   (last log) is after it;
+//! - `Metadata.chunk_of` and `Metadata.pattern_id` vs the reranker's grouping: a
+//!   multi-chunk log pattern is one source, and so are the days of one pattern;
+//! - log patterns: logs are stored grouped by pattern and UTC day; `Metadata.first_seen`
+//!   is RFC 3339, and a day whose first log is before a window and last after it is
+//!   retrieved although its `Timestamp` (last log) is after the window, while a day with
+//!   no log in the window's hours is not; the prompt counts a pattern per day in the
+//!   asker's timezone;
 //! - point IDs: every point ID is the UUIDv5 of its logical chunk ID;
 //! - bookkeeping keys (`ContentHash`, `ChunkCount`, `SyncId`) are written but never
 //!   reach `RagDocument` or `sources`; a second run leaves unchanged documents alone;
@@ -84,9 +86,16 @@ fn crafted() -> Corpus {
             log("co-in-2", "checkout", "prod", "2026-03-11T10:16:00.000Z", "db connection pool exhausted: 48/50 in use"),
             log("co-before", "checkout", "prod", "2026-03-10T22:59:59.000Z", "payment callback rejected"),
             log("co-at-end", "checkout", "prod", "2026-03-11T23:00:00.000Z", "cart cache flush failed"),
-            // First seen before the window, last seen after it.
-            log("co-span-1", "checkout", "prod", "2026-03-10T20:00:00.000Z", "inventory lookup slow"),
-            log("co-span-2", "checkout", "prod", "2026-03-12T08:00:00.000Z", "inventory lookup slow"),
+            // One UTC day: first log before a 10:00..12:00 window, last log after it.
+            log("co-span-1", "checkout", "prod", "2026-03-11T09:30:00.000Z", "inventory lookup slow"),
+            log("co-span-2", "checkout", "prod", "2026-03-11T10:45:00.000Z", "inventory lookup slow"),
+            log("co-span-3", "checkout", "prod", "2026-03-11T12:30:00.000Z", "inventory lookup slow"),
+            // Its span overlaps that window, but no log falls in the window's hours.
+            log("co-gap-1", "checkout", "prod", "2026-03-11T09:00:00.000Z", "search index stale"),
+            log("co-gap-2", "checkout", "prod", "2026-03-11T13:00:00.000Z", "search index stale"),
+            // Two UTC days of one pattern, both yesterday in Stockholm.
+            log("co-night-1", "checkout", "prod", "2026-03-10T23:30:00.000Z", "payment webhook retry exhausted"),
+            log("co-night-2", "checkout", "prod", "2026-03-11T00:30:00.000Z", "payment webhook retry exhausted"),
             log("co-staging", "checkout", "staging", "2026-03-11T10:20:00.000Z", "db connection pool exhausted: 10/10 in use"),
             log("long", "payments", "prod", "2026-03-11T12:00:00.000Z", &long_message("första")),
             log("long-2", "payments", "prod", "2026-03-11T12:05:00.000Z", &long_message("andra")),
@@ -180,8 +189,9 @@ async fn check_stored_points(store: &Store, expected: &BTreeMap<String, RagDocum
             ts.is_null() || ts.as_str().and_then(rag_core::planner::parse_utc).is_some(),
             "{id}: Timestamp {ts}"
         );
-        // Logs are pattern documents: the filter reads `Metadata.first_seen`, and the
-        // last log is the `Timestamp`.
+        // Logs are pattern day documents: the filter reads `Metadata.first_seen`, the
+        // day's last log is the `Timestamp`, both on the document's UTC day, and the
+        // reader parses the hourly counts it counts windows with.
         if want.kind == SourceKind::Logs {
             assert!(
                 id.starts_with(rag_core::log_patterns::DOC_ID_PREFIX),
@@ -194,6 +204,14 @@ async fn check_stored_points(store: &Store, expected: &BTreeMap<String, RagDocum
             let last = ts.as_str().and_then(rag_core::planner::parse_utc);
             assert!(first.is_some() && first <= last, "{id}: {md}");
             assert_eq!(md["last_seen"], *ts, "{id}");
+            let day = md["day"].as_str().unwrap();
+            for t in [first, last] {
+                assert_eq!(t.unwrap().date_naive().to_string(), day, "{id}");
+            }
+            assert!(id.contains(&format!("_{day}#c")), "{id}");
+            let state = rag_core::log_patterns::from_document(&s.doc).expect(id);
+            assert_eq!(json!(state.count()), md["count"], "{id}");
+            assert_eq!(state.pattern_id(), md["pattern_id"].as_str().unwrap());
         }
         // Service/Environment are stored in the form the scope matches.
         for key in ["Service", "Environment"] {
@@ -210,6 +228,7 @@ fn check_sources(resp: &Value, stored: &BTreeMap<String, support::StoredChunk>, 
     let numbered = support::openai::prompt_numbers(prompt);
     assert_eq!(numbered.len(), sources.len(), "prompt documents vs sources");
     let mut seen = BTreeSet::new();
+    let mut groups = BTreeSet::new();
     for (i, s) in sources.iter().enumerate() {
         let keys: BTreeSet<&str> = s.as_object().unwrap().keys().map(String::as_str).collect();
         assert_eq!(
@@ -234,6 +253,10 @@ fn check_sources(resp: &Value, stored: &BTreeMap<String, support::StoredChunk>, 
             .find(|c| c.doc.parent_id() == id)
             .unwrap_or_else(|| panic!("source {id} is not a stored document"))
             .doc;
+        assert!(
+            groups.insert(doc.group_id().to_string()),
+            "{id}: its pattern is listed twice in sources"
+        );
         assert_eq!(s["uri"], doc.source_uri);
         assert_eq!(s["title"], doc.title);
         assert_eq!(s["kind"], doc.kind.name());
@@ -244,14 +267,24 @@ fn check_sources(resp: &Value, stored: &BTreeMap<String, support::StoredChunk>, 
     }
 }
 
-fn uri_of(stored: &BTreeMap<String, support::StoredChunk>, parent: &str) -> String {
+/// The source a stored document is listed as ([`RagDocument::group_id`]).
+fn group_of(stored: &BTreeMap<String, support::StoredChunk>, parent: &str) -> String {
     stored
         .values()
         .find(|c| c.doc.parent_id() == parent)
         .unwrap_or_else(|| panic!("{parent} not stored"))
         .doc
-        .source_uri
-        .clone()
+        .group_id()
+        .to_string()
+}
+
+/// Source links of the stored documents listed as `group`.
+fn uris_of(stored: &BTreeMap<String, support::StoredChunk>, group: &str) -> Vec<String> {
+    stored
+        .values()
+        .filter(|c| c.doc.group_id() == group)
+        .map(|c| c.doc.source_uri.clone())
+        .collect()
 }
 
 struct Case {
@@ -264,6 +297,8 @@ struct Case {
     must_not: &'static [&'static str],
     /// Every source must satisfy this.
     each: fn(&Value) -> bool,
+    /// (log, text): the prompt block of the pattern holding the log contains the text.
+    evidence: &'static [(&'static str, &'static str)],
 }
 
 fn cases() -> Vec<Case> {
@@ -276,9 +311,10 @@ fn cases() -> Vec<Case> {
             must: &["incident_inc-auth", "log_auth-1"],
             must_not: &[],
             each: |s| s["service"] == "auth-api" && s["environment"] == "prod",
+            evidence: &[],
         },
-        // Half-open window on RFC 3339 timestamps; timeless kinds still pass; a pattern
-        // spanning the window is found by its first and last log.
+        // Half-open window on RFC 3339 timestamps; timeless kinds still pass; two UTC
+        // days of one pattern are one source, counted per local day.
         Case {
             question: "checkout errors yesterday",
             plan: json!({"intent": "semanticLogSearch", "service": "checkout", "environment": "prod"}),
@@ -286,6 +322,7 @@ fn cases() -> Vec<Case> {
             must: &[
                 "log_co-in",
                 "log_co-span-1",
+                "log_co-night-1",
                 "monitor_7001",
                 "slo_slo-checkout",
             ],
@@ -296,6 +333,25 @@ fn cases() -> Vec<Case> {
                 "monitor_7002",
             ],
             each: |s| s["service"] == "checkout" && s["environment"] == "prod",
+            evidence: &[(
+                "log_co-night-1",
+                "Occurrences in the question's window: 2 (Wed 2026-03-11: 2; days in Europe/Stockholm",
+            )],
+        },
+        // A day whose first and last log are outside a short window but which logged
+        // inside it is found through `Metadata.first_seen`; a day that logged only before
+        // and after the window is dropped.
+        Case {
+            question: "checkout errors between 10 and 12",
+            plan: json!({"intent": "semanticLogSearch", "service": "checkout", "environment": "prod"}),
+            request: json!({"from_utc": "2026-03-11T10:00:00Z", "to_utc": "2026-03-11T12:00:00Z", "kinds": ["logs"]}),
+            must: &["log_co-in", "log_co-span-1"],
+            must_not: &["log_co-gap-1", "log_co-night-2", "log_co-before"],
+            each: |s| s["kind"] == "logs",
+            evidence: &[(
+                "log_co-span-1",
+                "Occurrences in the question's window: 1 (Wed 2026-03-11: 1; days in Europe/Stockholm",
+            )],
         },
         // `Kind` = "sLO" on both sides.
         Case {
@@ -305,6 +361,7 @@ fn cases() -> Vec<Case> {
             must: &["slo_slo-checkout", "slo_c2ce7fb6030c5c0b8035d1ce94dec12c"],
             must_not: &[],
             each: |s| s["kind"] == "slo",
+            evidence: &[],
         },
         // Explicit scope wins and is normalized like stored values.
         Case {
@@ -314,6 +371,7 @@ fn cases() -> Vec<Case> {
             must: &["monitor_7002", "log_co-staging"],
             must_not: &["monitor_7001", "log_co-in"],
             each: |s| s["service"] == "checkout" && s["environment"] == "staging",
+            evidence: &[],
         },
         // Metric catalog entries carry the indexing time and are timeless.
         Case {
@@ -323,6 +381,7 @@ fn cases() -> Vec<Case> {
             must: &["metric_checkout_orders_completed", "metric_system_cpu_idle"],
             must_not: &[],
             each: |s| s["kind"] == "metrics",
+            evidence: &[],
         },
         // A pattern spanning several chunks is one source.
         Case {
@@ -332,6 +391,7 @@ fn cases() -> Vec<Case> {
             must: &["log_long"],
             must_not: &[],
             each: |s| s["service"] == "payments",
+            evidence: &[],
         },
     ]
 }
@@ -357,7 +417,12 @@ async fn run_contract(store: Store) {
     // Logs of one pattern are one document with their count; different messages,
     // environments and services are not.
     assert_eq!(id("log_co-in"), id("log_co-in-2"));
-    assert_eq!(id("log_co-span-1"), id("log_co-span-2"));
+    assert_eq!(id("log_co-span-1"), id("log_co-span-3"));
+    // One document per UTC day, one pattern ID across days.
+    assert_ne!(id("log_co-night-1"), id("log_co-night-2"));
+    let pattern_id =
+        |raw: &str| expected[&format!("{}#c0", id(raw))].metadata["pattern_id"].clone();
+    assert_eq!(pattern_id("log_co-night-1"), pattern_id("log_co-night-2"));
     assert_eq!(id("log_long"), id("log_long-2"));
     let grouped = &expected[&format!("{}#c0", id("log_co-in"))];
     assert_eq!(grouped.metadata["count"], 2);
@@ -366,10 +431,10 @@ async fn run_contract(store: Store) {
         json!(["co-in", "co-in-2"])
     );
     let spanning = &expected[&format!("{}#c0", id("log_co-span-1"))];
-    assert_eq!(spanning.metadata["first_seen"], "2026-03-10T20:00:00.000Z");
+    assert_eq!(spanning.metadata["first_seen"], "2026-03-11T09:30:00.000Z");
     assert_eq!(
         spanning.timestamp.as_deref(),
-        Some("2026-03-12T08:00:00.000Z")
+        Some("2026-03-11T12:30:00.000Z")
     );
     for (a, b) in [
         ("log_co-in", "log_co-staging"),
@@ -389,7 +454,11 @@ async fn run_contract(store: Store) {
             script.answers.insert(
                 case.question.into(),
                 support::openai::AnswerScript {
-                    cite_uris: case.must.iter().map(|m| uri_of(&stored, &id(m))).collect(),
+                    cite_uris: case
+                        .must
+                        .iter()
+                        .map(|m| uris_of(&stored, &group_of(&stored, &id(m))))
+                        .collect(),
                     cite_observations: vec![],
                     extra: "Also [DOC #42] and [obs-1].".into(),
                 },
@@ -400,16 +469,24 @@ async fn run_contract(store: Store) {
             .unwrap()
             .extend(case.request.as_object().unwrap().clone());
         let resp = support::ask(&base, &req).await;
-        let ids = support::source_ids(&resp);
+        // Sources as the groups they list (a log pattern's days are one source).
+        let ids: Vec<String> = support::source_ids(&resp)
+            .iter()
+            .map(|i| group_of(&stored, i))
+            .collect();
         let ctx = format!("{}: sources {ids:?}", case.question);
 
-        let must: Vec<String> = case.must.iter().map(|m| id(m)).collect();
+        let must: Vec<String> = case
+            .must
+            .iter()
+            .map(|m| group_of(&stored, &id(m)))
+            .collect();
         for (m, raw) in must.iter().zip(case.must) {
             assert!(ids.contains(m), "{ctx}: missing {raw} ({m})");
         }
         for raw in case.must_not {
             assert!(
-                !ids.contains(&id(raw)),
+                !ids.contains(&group_of(&stored, &id(raw))),
                 "{ctx}: {raw} leaked through the filter"
             );
         }
@@ -418,6 +495,16 @@ async fn run_contract(store: Store) {
         }
         let prompt = fake.script.lock().unwrap().prompts[case.question].clone();
         check_sources(&resp, &stored, &prompt);
+        let blocks = support::openai::prompt_blocks(&prompt);
+        for (raw, text) in case.evidence {
+            let group = group_of(&stored, &id(raw));
+            let n = ids.iter().position(|g| *g == group).unwrap() + 1;
+            let (_, block) = blocks.iter().find(|(b, _)| *b == n).unwrap();
+            assert!(
+                block.contains(text),
+                "{ctx}: {raw} block lacks {text:?}:\n{block}"
+            );
+        }
 
         // Every intended citation resolves to the intended document; the unknown ones
         // are reported, not silently accepted.

@@ -80,6 +80,16 @@ impl RagDocument {
             .and_then(|v| v.as_str())
             .unwrap_or(&self.id)
     }
+
+    /// The source a retrieved chunk is listed as: the log pattern of a log pattern day
+    /// (`metadata.pattern_id`, see [`crate::log_patterns`]), so the days of one pattern
+    /// are one source; otherwise [`Self::parent_id`].
+    pub fn group_id(&self) -> &str {
+        self.metadata
+            .get(crate::log_patterns::keys::PATTERN_ID)
+            .and_then(|v| v.as_str())
+            .unwrap_or_else(|| self.parent_id())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

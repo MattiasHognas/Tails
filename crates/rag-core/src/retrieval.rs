@@ -12,7 +12,7 @@ use crate::planner::{QueryPlan, Window, format_utc, normalize_filter, parse_utc}
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 
-/// Payload key of a log pattern's first log (RFC 3339).
+/// Payload key of the first log of a log pattern day (RFC 3339).
 const FIRST_SEEN_KEY: &str = "Metadata.first_seen";
 
 /// Kinds that describe configuration or state rather than events. Their `Timestamp`,
@@ -122,10 +122,12 @@ impl RetrievalScope {
     /// payload (Qdrant's datetime range; no numeric field or payload index is required).
     /// It is wrapped in a `should` so that documents without a timestamp and
     /// [`TIMELESS_KINDS`] still match: a monitor or SLO is relevant evidence for
-    /// "yesterday" even though it is not an event from yesterday. Log pattern documents
-    /// (see [`crate::log_patterns`]) are stamped with their last log and also match when
-    /// their first log (`Metadata.first_seen`) is before the window's end and their last
-    /// is at or after its start.
+    /// "yesterday" even though it is not an event from yesterday. A log pattern document
+    /// covers one pattern on one UTC day (see [`crate::log_patterns`]) and is stamped with
+    /// that day's last log; it matches when the day's `[Metadata.first_seen, Timestamp]`
+    /// overlaps the window, so a day whose logs started before a short window and went on
+    /// after it is kept. Whether such a day logged inside the window is decided per hour
+    /// when the answer is built.
     pub fn to_qdrant_filter(&self) -> Option<Value> {
         let mut must = vec![];
         if let Some(svc) = &self.service {
@@ -150,9 +152,8 @@ impl RetrievalScope {
                 .iter()
                 .map(SourceKind::payload_value)
                 .collect();
-            // A log pattern spans `[first_seen, Timestamp]` (its last log): it belongs to
-            // the window when that span overlaps it, even if the pattern was still seen
-            // after the window ended.
+            // A log pattern day spans `[first_seen, Timestamp]` (its last log): it belongs
+            // to the window when that span overlaps it.
             let mut pattern =
                 vec![json!({"key": "Kind", "match": {"value": SourceKind::Logs.payload_value()}})];
             if let Some(from) = self.from_utc {
@@ -291,10 +292,10 @@ mod tests {
         );
     }
 
-    /// A pattern that started before the window's end and was last seen at or after its
-    /// start overlaps it; with an open start only the first log counts.
+    /// A pattern day whose first log is before the window's end and whose last is at or
+    /// after its start overlaps it; with an open start only the first log counts.
     #[test]
-    fn log_patterns_match_when_their_span_overlaps_the_window() {
+    fn log_pattern_days_match_when_their_span_overlaps_the_window() {
         let scope = RetrievalScope {
             to_utc: Some(ts("2026-09-23T22:00:00Z")),
             ..Default::default()
