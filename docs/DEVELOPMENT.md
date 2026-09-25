@@ -577,9 +577,7 @@ E2E_COMPARE="dbsf:off rrf:on dbsf:on" E2E_DOCKER=qdrant,tei scripts/e2e.sh
 
 An `rrf` entry can add RRF's parameters as `:k=<RAG_RRF_K>` and
 `:w=<dense>,<keyword>` (`RAG_RRF_WEIGHTS`), e.g.
-`E2E_COMPARE="rrf:off:k=60 rrf:off:w=1,2 rrf:on:k=10:w=2,1"`. The measurements over
-several embedding models are in
-[experiments/fusion-containers.md](experiments/fusion-containers.md).
+`E2E_COMPARE="rrf:off:k=60 rrf:off:w=1,2 rrf:on:k=10:w=2,1"`.
 
 For a question whose must-retrieve documents are not all ranked first, `tails-e2e`
 also prints ("explain") the top documents of dense and keyword search alone, the fused

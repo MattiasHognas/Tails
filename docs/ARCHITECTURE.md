@@ -370,8 +370,8 @@ with `--json`) on stderr and exits with status 1.
     per prefetch list is sent): a list of weight `w` scores rank `r` as
     `1 / ((r + 1) / w + k − 1)`, so at weight 2 its second point counts like the first
     of an unweighted list. The larger `k`, the less a weight changes the top ranks.
-    Both were measured and left at their defaults (`k` = 2, equal weights); see
-    [the fusion experiment](experiments/fusion-containers.md).
+    Both were measured and left at their defaults (`k` = 2, equal weights; pull
+    request #57).
   - `dbsf`: distribution-based score fusion (`{"fusion": "dbsf"}`). Qdrant maps each
     list's raw scores to `(s − (μ − 3σ)) / 6σ`, μ and σ the list's mean and *sample*
     standard deviation, and sums them over the lists. Not clipped: a point more than 3σ
@@ -384,9 +384,8 @@ with `--json`) on stderr and exits with status 1.
     and `RAG_RRF_WEIGHTS` are refused with `dbsf`.
 
   RRF stays the default because DBSF was not better everywhere when measured
-  (pull request #56, and against six embedding models in
-  [fusion-containers.md](experiments/fusion-containers.md)): with real embeddings (e2e, `bge-small-en-v1.5`) it ranks the
-  outage incident first for "the root cause of the last checkout outage" (precision@R
+  (pull request #56, and against six embedding models in pull request #57): with real
+  embeddings (e2e, `bge-small-en-v1.5`) it ranks the outage incident first for "the root cause of the last checkout outage" (precision@R
   0.944 → 0.972), but with the in-process harness's bag-of-words embeddings it lets a
   distractor into the sources of another question: DBSF compresses the tail of a dense
   list whose scores barely differ into a narrow band, so kind priors and MMR's diversity
