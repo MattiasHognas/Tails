@@ -25,6 +25,15 @@ OPENAI_BASE_URL=https://api.openai.com   # any OpenAI-compatible server
 # (--max-client-batch-size), so keep INDEXER_EMBED_BATCH_SIZE at or below it.
 OPENAI_EMBEDDING_BASE_URL=
 OPENAI_EMBEDDING_API_KEY=
+# Instruction some embedding models are trained with, put in front of each text as given
+# (keep its trailing space). Unset or blank: none, right for OpenAI's models. Examples:
+#   bge (v1.5)    query:    "Represent this sentence for searching relevant passages: "
+#   e5            query: "query: "            document: "passage: "
+#   nomic-embed   query: "search_query: "     document: "search_document: "
+# The query prefix is only used by the API; the document prefix only by the indexer, and
+# changing it re-embeds everything (it is part of the content hash).
+OPENAI_EMBEDDING_QUERY_PREFIX=
+OPENAI_EMBEDDING_DOCUMENT_PREFIX=
 
 # Qdrant (the indexer creates the collection: named dense + sparse vectors)
 QDRANT_ENDPOINT=http://qdrant:6333
@@ -513,7 +522,8 @@ QDRANT_ENDPOINT=http://localhost:6333 TEI_URL=http://localhost:8080 scripts/e2e.
 E2E_EMBEDDINGS=fake QDRANT_ENDPOINT=http://localhost:6333 scripts/e2e.sh
 ```
 
-Other variables: `TEI_IMAGE`, `TEI_MODEL`, `TEI_MODEL_REVISION`, `TEI_DATA` (model
+Other variables: `TEI_IMAGE`, `TEI_MODEL`, `TEI_MODEL_REVISION`, `TEI_QUERY_PREFIX` (the
+model's query instruction, bge's by default; empty for a model without one), `TEI_DATA` (model
 cache), `FAKES_ADDR` (default `127.0.0.1:8900`), `API_ADDR` (where the started `rag-api`
 listens via `RAG_API_ADDR`, default `127.0.0.1:5191`), `E2E_SKIP_BUILD=1`, `E2E_KEEP=1`
 (keep the collection and the logs). Both addresses must be free.

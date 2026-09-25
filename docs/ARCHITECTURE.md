@@ -489,8 +489,10 @@ longer belong to a document are removed. Per source, after the fetch:
 
 1. **Hash.** Each document is chunked and gets a content hash (SHA-256) over all of its
    fields (text, title, URI, kind, timestamp, service, environment, metadata), the chunk
-   size and overlap, the embedding model (`OPENAI_EMBEDDING_MODEL`) and a layout version.
-   Changing the chunking, the model or what is embedded therefore changes every hash.
+   size and overlap, the embedding model (`OPENAI_EMBEDDING_MODEL`, with the document prefix
+   `OPENAI_EMBEDDING_DOCUMENT_PREFIX` when set) and a layout version. Changing the chunking,
+   the model, the document prefix or what is embedded therefore changes every hash. The
+   query prefix (`OPENAI_EMBEDDING_QUERY_PREFIX`) only affects searches, not stored points.
 2. **Look up.** The stored `ContentHash` and `ChunkCount` of chunk points `#c0` to
    `#c{n}` of every document (`n` = its new chunk count) are read in batches of 256 by
    point ID (`POST /collections/{c}/points` with `ids`).

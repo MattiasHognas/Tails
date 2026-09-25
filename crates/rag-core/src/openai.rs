@@ -17,6 +17,15 @@ pub struct OpenAiClient {
     /// Bearer key for the embeddings endpoint (`OPENAI_EMBEDDING_API_KEY`).
     pub embedding_api_key: String,
     pub embedding_model: String,
+    /// Put in front of every search query before it is embedded
+    /// (`OPENAI_EMBEDDING_QUERY_PREFIX`). Some models are trained with one, such as bge
+    /// ("Represent this sentence for searching relevant passages: ") or e5 ("query: ").
+    /// Empty for models that need none, like OpenAI's.
+    pub embedding_query_prefix: String,
+    /// Put in front of every indexed text before it is embedded
+    /// (`OPENAI_EMBEDDING_DOCUMENT_PREFIX`), for models that expect one, such as e5
+    /// ("passage: ") or nomic-embed ("search_document: "). Empty by default.
+    pub embedding_document_prefix: String,
     pub chat_model: String,
     pub http: reqwest::Client,
     pub retry: RetryPolicy,
@@ -54,6 +63,8 @@ impl OpenAiClient {
             api_key,
             base_url,
             embedding_model,
+            embedding_query_prefix: String::new(),
+            embedding_document_prefix: String::new(),
             chat_model,
             http: HttpConfig::default().build_client(),
             retry: RetryPolicy::default(),
@@ -84,6 +95,16 @@ impl OpenAiClient {
         if let Some(key) = set("OPENAI_EMBEDDING_API_KEY") {
             client.embedding_api_key = key;
         }
+        // Prefixes are used as given: their trailing space or colon matters. A value of
+        // only whitespace counts as unset.
+        let prefix = |name: &str| {
+            std::env::var(name)
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+                .unwrap_or_default()
+        };
+        client.embedding_query_prefix = prefix("OPENAI_EMBEDDING_QUERY_PREFIX");
+        client.embedding_document_prefix = prefix("OPENAI_EMBEDDING_DOCUMENT_PREFIX");
         client.http = HttpConfig::from_env().build_client();
         client.retry = RetryPolicy::from_env();
         Ok(client)
@@ -122,6 +143,36 @@ impl OpenAiClient {
                 stage,
                 UpstreamError::InvalidResponse("empty chat completion".into()),
             )),
+        }
+    }
+
+    /// Embeds search queries, each with [`Self::embedding_query_prefix`] in front, in
+    /// one request (the single-input form for one query).
+    pub async fn embed_queries(&self, queries: &[String]) -> Result<Vec<Vec<f32>>, RagError> {
+        let texts = with_prefix(&self.embedding_query_prefix, queries);
+        match texts.as_slice() {
+            [one] => Ok(vec![self.embed(one).await?]),
+            many => self.embed_batch(many).await,
+        }
+    }
+
+    /// Embeds indexed texts, each with [`Self::embedding_document_prefix`] in front.
+    pub async fn embed_documents(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, RagError> {
+        self.embed_batch(&with_prefix(&self.embedding_document_prefix, texts))
+            .await
+    }
+
+    /// What the stored vectors depend on besides the text: the model and, when set, the
+    /// document prefix. Part of every content hash, so changing either re-embeds the
+    /// index; without a prefix it is the model name, as before.
+    pub fn document_embedding_id(&self) -> String {
+        if self.embedding_document_prefix.is_empty() {
+            self.embedding_model.clone()
+        } else {
+            format!(
+                "{} (document prefix {:?})",
+                self.embedding_model, self.embedding_document_prefix
+            )
         }
     }
 
@@ -285,6 +336,11 @@ impl OpenAiClient {
     }
 }
 
+/// `texts` with `prefix` in front of each (unchanged when `prefix` is empty).
+fn with_prefix(prefix: &str, texts: &[String]) -> Vec<String> {
+    texts.iter().map(|t| format!("{prefix}{t}")).collect()
+}
+
 /// Splits `texts` into consecutive index ranges for [`OpenAiClient::embed_batch`]: each
 /// range holds at most `max_inputs` texts and at most `max_chars` characters in total (a
 /// rough stand-in for the per-request token limit). A single text longer than `max_chars`
@@ -325,6 +381,8 @@ mod tests {
             embedding_base_url: base_url.clone(),
             base_url,
             embedding_model: "test-model".to_string(),
+            embedding_query_prefix: String::new(),
+            embedding_document_prefix: String::new(),
             chat_model: "test-chat".to_string(),
             http: reqwest::Client::new(),
             retry,
@@ -574,6 +632,111 @@ mod tests {
         let client = OpenAiClient::new_from_env().unwrap();
         assert_eq!(client.embedding_base_url, "https://chat.example");
         assert_eq!(client.embedding_api_key, "embed_key");
+    }
+
+    #[test]
+    fn new_from_env_reads_embedding_prefixes_as_given() {
+        let _env_lock = lock_env();
+        let _guards = [
+            EnvVarGuard::preserve("OPENAI_API_KEY"),
+            EnvVarGuard::preserve("OPENAI_EMBEDDING_QUERY_PREFIX"),
+            EnvVarGuard::preserve("OPENAI_EMBEDDING_DOCUMENT_PREFIX"),
+        ];
+        unsafe {
+            std::env::set_var("OPENAI_API_KEY", "k");
+            std::env::remove_var("OPENAI_EMBEDDING_QUERY_PREFIX");
+            std::env::remove_var("OPENAI_EMBEDDING_DOCUMENT_PREFIX");
+        }
+        let client = OpenAiClient::new_from_env().unwrap();
+        assert_eq!(client.embedding_query_prefix, "", "no prefix by default");
+        assert_eq!(client.embedding_document_prefix, "");
+
+        // Kept exactly, including the trailing space; whitespace alone counts as unset.
+        unsafe {
+            std::env::set_var(
+                "OPENAI_EMBEDDING_QUERY_PREFIX",
+                "Represent this sentence for searching relevant passages: ",
+            );
+            std::env::set_var("OPENAI_EMBEDDING_DOCUMENT_PREFIX", "   ");
+        }
+        let client = OpenAiClient::new_from_env().unwrap();
+        assert_eq!(
+            client.embedding_query_prefix,
+            "Represent this sentence for searching relevant passages: "
+        );
+        assert_eq!(client.embedding_document_prefix, "");
+    }
+
+    #[tokio::test]
+    async fn queries_and_documents_are_embedded_with_their_prefixes() {
+        let server = MockServer::start().await;
+        let reply = |n: usize| {
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": (0..n).map(|i| serde_json::json!({"index": i, "embedding": [i as f32 + 1.0]})).collect::<Vec<_>>()
+            }))
+        };
+        // One query: the single-input form. Several: one batched request.
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .and(body_json(
+                serde_json::json!({"input": "query: why", "model": "test-model"}),
+            ))
+            .respond_with(reply(1))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .and(body_json(
+                serde_json::json!({"input": ["query: a", "query: b"], "model": "test-model"}),
+            ))
+            .respond_with(reply(2))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .and(body_json(
+                serde_json::json!({"input": ["passage: doc"], "model": "test-model"}),
+            ))
+            .respond_with(reply(1))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut c = client(&server);
+        c.embedding_query_prefix = "query: ".into();
+        c.embedding_document_prefix = "passage: ".into();
+        assert_eq!(
+            c.embed_queries(&texts(&["why"])).await.unwrap(),
+            [vec![1.0]]
+        );
+        assert_eq!(
+            c.embed_queries(&texts(&["a", "b"])).await.unwrap(),
+            [vec![1.0], vec![2.0]]
+        );
+        assert_eq!(
+            c.embed_documents(&texts(&["doc"])).await.unwrap(),
+            [vec![1.0]]
+        );
+    }
+
+    #[test]
+    fn the_document_prefix_is_part_of_the_embedding_identity() {
+        let mut c = mock_client("http://unused".into(), RetryPolicy::none());
+        // Without a prefix, the identity is the model name, so existing content hashes
+        // stay valid.
+        assert_eq!(c.document_embedding_id(), "test-model");
+        c.embedding_query_prefix = "query: ".into();
+        assert_eq!(
+            c.document_embedding_id(),
+            "test-model",
+            "queries aren't stored"
+        );
+        c.embedding_document_prefix = "passage: ".into();
+        assert_eq!(
+            c.document_embedding_id(),
+            "test-model (document prefix \"passage: \")"
+        );
     }
 
     #[test]

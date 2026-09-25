@@ -101,6 +101,9 @@ jobs:
     env:
       TEI_IMAGE: ghcr.io/huggingface/text-embeddings-inference:cpu-1.9.4
       TEI_MODEL: BAAI/bge-small-en-v1.5
+      # bge is trained to embed search queries with this instruction in front (documents
+      # without one); scripts/e2e.sh passes it as OPENAI_EMBEDDING_QUERY_PREFIX.
+      TEI_QUERY_PREFIX: "Represent this sentence for searching relevant passages: "
       # The model's Hugging Face commit, so a new upload can't change the embeddings the
       # e2e thresholds were measured with. scripts/e2e.sh checks TEI loaded exactly this.
       TEI_MODEL_REVISION: 5c38ec7c405ec4b44b94cc5a9bb96e735b38267a

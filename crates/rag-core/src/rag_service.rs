@@ -407,12 +407,9 @@ pub async fn retrieve(
     search_limit: usize,
     timeouts: &StageTimeouts,
 ) -> Result<Vec<Hit>, RagError> {
-    let embed = async {
-        match queries {
-            [one] => Ok(vec![oa.embed(one).await?]),
-            many => oa.embed_batch(many).await,
-        }
-    };
+    // Dense search embeds the queries with the model's query prefix, if any; keyword
+    // search tokenizes them as asked.
+    let embed = oa.embed_queries(queries);
     let dense = run_stage(Stage::Embedding, timeouts.embedding, embed).await?;
     let searches: Vec<SearchQuery> = queries
         .iter()

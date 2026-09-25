@@ -16,7 +16,9 @@ text-embeddings-inference, with Datadog and the chat model faked.
 
 **Self-hosted embeddings:** set `OPENAI_EMBEDDING_BASE_URL` (and, if needed,
 `OPENAI_EMBEDDING_API_KEY`) to send embeddings to another OpenAI-compatible server, such as
-text-embeddings-inference, while chat stays on `OPENAI_BASE_URL`.
+text-embeddings-inference, while chat stays on `OPENAI_BASE_URL`. Models trained with an
+instruction, such as bge or e5, get it through `OPENAI_EMBEDDING_QUERY_PREFIX` and
+`OPENAI_EMBEDDING_DOCUMENT_PREFIX` (see [DEVELOPMENT.md](docs/DEVELOPMENT.md)).
 
 ---
 

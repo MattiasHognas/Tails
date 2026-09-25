@@ -21,6 +21,8 @@
 #   TEI_URL          [http://127.0.0.1:8080]
 #   TEI_IMAGE        [ghcr.io/huggingface/text-embeddings-inference:cpu-1.9.4]
 #   TEI_MODEL        [BAAI/bge-small-en-v1.5]
+#   TEI_QUERY_PREFIX the model's query instruction (OPENAI_EMBEDDING_QUERY_PREFIX)
+#                    [bge's "Represent this sentence for searching relevant passages: "]
 #   TEI_MODEL_REVISION  the model's Hugging Face commit; TEI must report it [5c38ec7c405ec4b44b94cc5a9bb96e735b38267a]
 #   TEI_DATA         model cache mounted into the TEI container [~/.cache/tails-e2e/tei]
 #   FAKES_ADDR       [127.0.0.1:8900]
@@ -38,6 +40,7 @@ QDRANT_URL="${QDRANT_ENDPOINT:-http://127.0.0.1:6333}"
 TEI_URL="${TEI_URL:-http://127.0.0.1:8080}"
 TEI_IMAGE="${TEI_IMAGE:-ghcr.io/huggingface/text-embeddings-inference:cpu-1.9.4}"
 TEI_MODEL="${TEI_MODEL:-BAAI/bge-small-en-v1.5}"
+TEI_QUERY_PREFIX="${TEI_QUERY_PREFIX-Represent this sentence for searching relevant passages: }"
 TEI_MODEL_REVISION="${TEI_MODEL_REVISION-5c38ec7c405ec4b44b94cc5a9bb96e735b38267a}"
 TEI_DATA="${TEI_DATA:-$HOME/.cache/tails-e2e/tei}"
 FAKES_ADDR="${FAKES_ADDR:-127.0.0.1:8900}"
@@ -129,11 +132,13 @@ case "$E2E_EMBEDDINGS" in
     fi
     EMBEDDING_URL="$TEI_URL"
     EMBEDDING_MODEL="$TEI_MODEL"
+    QUERY_PREFIX="$TEI_QUERY_PREFIX"
     FAKES_FLAGS=()
     ;;
   fake)
     EMBEDDING_URL="$FAKES_URL"
     EMBEDDING_MODEL="fake-bow-1024"
+    QUERY_PREFIX=""
     FAKES_FLAGS=(--embeddings)
     ;;
   *) echo "E2E_EMBEDDINGS must be tei or fake" >&2; exit 1 ;;
@@ -151,6 +156,8 @@ export OPENAI_BASE_URL="$FAKES_URL"
 export OPENAI_CHAT_MODEL=fake-chat
 export OPENAI_EMBEDDING_BASE_URL="$EMBEDDING_URL"
 export OPENAI_EMBEDDING_MODEL="$EMBEDDING_MODEL"
+export OPENAI_EMBEDDING_QUERY_PREFIX="$QUERY_PREFIX"
+unset OPENAI_EMBEDDING_DOCUMENT_PREFIX
 export QDRANT_ENDPOINT="$QDRANT_URL"
 export QDRANT_COLLECTION="$COLLECTION"
 export DD_API_KEY=e2e DD_APP_KEY=e2e DD_SITE=datadoghq.eu
