@@ -22,7 +22,8 @@ enum Cmd {
         #[arg(long)]
         service: Option<String>,
         /// Restrict evidence to a source kind (repeatable): logs, metrics, monitor,
-        /// incident, dashboard, slo, git
+        /// incident, dashboard, slo, git, catalog (service catalog), change (deploys and
+        /// config changes)
         #[arg(long = "kind")]
         kinds: Vec<String>,
         /// IANA timezone for relative times like "yesterday" (default: local zone)

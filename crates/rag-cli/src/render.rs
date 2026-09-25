@@ -128,7 +128,7 @@ pub fn render_ask(resp: &Value, opts: &RenderOptions) -> String {
     if !sources.is_empty() {
         opts.heading(&mut out, "Sources");
         for s in sources {
-            let mut details = vec![text(&s["kind"])];
+            let mut details = vec![kind_label(&text(&s["kind"]))];
             if let Some(ts) = s["timestamp"].as_str() {
                 details.push(local_time(ts, opts.tz));
             }
@@ -430,6 +430,16 @@ fn list(v: &Value) -> Vec<Value> {
     v.as_array().cloned().unwrap_or_default()
 }
 
+/// How a source's kind reads in the Sources list; the filter names `catalog` and
+/// `change` alone would be unclear there.
+fn kind_label(kind: &str) -> String {
+    match kind {
+        "catalog" => "service catalog".to_string(),
+        "change" => "change event".to_string(),
+        other => other.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -483,6 +493,32 @@ mod tests {
     fn position(out: &str, needle: &str) -> usize {
         out.find(needle)
             .unwrap_or_else(|| panic!("{needle:?} missing from:\n{out}"))
+    }
+
+    #[test]
+    fn catalog_and_change_sources_are_labelled() {
+        let resp = json!({
+            "answer": "Team shop owns checkout [DOC #1]; 2.14.0 was deployed at 13:55 [DOC #2].",
+            "evidence": "found",
+            "sources": [
+                {"n": 1, "title": "Service: checkout", "kind": "catalog", "timestamp": null,
+                 "service": "checkout", "environment": null,
+                 "uri": "https://app.datadoghq.eu/services?selectedService=checkout"},
+                {"n": 2, "title": "Deployed checkout 2.14.0 to prod", "kind": "change",
+                 "timestamp": "2026-03-05T12:55:00Z", "service": "checkout", "environment": "prod",
+                 "uri": "https://app.datadoghq.eu/event/explorer?event=dep-co-1"}
+            ],
+            "scope": {"service": "checkout", "environment": null, "fromUtc": null, "toUtc": null,
+                      "kinds": ["catalog", "change"]}
+        });
+        let out = render_ask(&resp, &plain(None));
+        assert!(out.contains(
+            "  [1] Service: checkout (service catalog) · https://app.datadoghq.eu/services?selectedService=checkout\n"
+        ), "{out}");
+        assert!(out.contains(
+            "  [2] Deployed checkout 2.14.0 to prod (change event, 2026-03-05 13:55) · https://app.datadoghq.eu/event/explorer?event=dep-co-1\n"
+        ), "{out}");
+        assert!(out.contains("  checkout · catalog, change\n"), "{out}");
     }
 
     #[test]

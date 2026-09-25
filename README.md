@@ -50,8 +50,15 @@ rag-cli ask "why did auth-api return 5xx errors yesterday?"
 # Pin what you already know. Explicit flags always win over inferred values.
 rag-cli ask "latency spikes after the deploy" --service auth-api --env prod
 
-# Only use certain evidence (repeatable): logs, metrics, monitor, incident, dashboard, slo, git
+# Only use certain evidence (repeatable): logs, metrics, monitor, incident, dashboard, slo, git,
+# catalog (service catalog: owners, on-call, runbooks, dependencies), change (deploys and config changes)
 rag-cli ask "what alerted overnight?" --kind monitor --kind incident
+
+# Ownership and runbooks come from the Datadog Software Catalog
+rag-cli ask "who owns checkout and where is its runbook?"
+
+# Deploys and configuration changes are indexed as change events
+rag-cli ask "what changed in checkout right before the errors started at 14:02?" --env prod
 
 # Resolve "yesterday", "last 2 hours", ... in a specific timezone (default: your system zone)
 rag-cli ask "errors in payments since yesterday" --tz Europe/Stockholm

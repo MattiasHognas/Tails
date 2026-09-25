@@ -1,3 +1,4 @@
+pub mod change_events;
 pub mod chunk;
 pub mod citations;
 pub mod datadog;
@@ -12,6 +13,7 @@ pub mod rag_service;
 pub mod reranker;
 pub mod resilience;
 pub mod retrieval;
+pub mod service_catalog;
 pub mod text;
 
 #[cfg(test)]

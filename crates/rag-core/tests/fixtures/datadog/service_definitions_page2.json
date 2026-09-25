@@ -1,0 +1,86 @@
+{
+  "data": [
+    {
+      "type": "service-definition",
+      "id": "0059bcab67b74e99cc832ca503019574",
+      "attributes": {
+        "meta": {
+          "last-modified-time": "2023-03-02T12:21:20Z",
+          "github-html-url": "",
+          "ingestion-source": "api",
+          "origin": "dd_terraform",
+          "origin-detail": "",
+          "warnings": [
+            {
+              "keyword-location": "/properties/contacts/items/$ref/allOf/1/then/properties/contact/pattern",
+              "instance-location": "/contacts/0/contact",
+              "message": "does not match pattern 'https://[a-zA-Z0-9_\\\\-]+.slack\\\\.com/archives/[a-zA-Z0-9_\\\\-]+'"
+            },
+            {
+              "keyword-location": "/properties/contacts/items/$ref/allOf/0/then/properties/contact/format",
+              "instance-location": "/contacts/1/contact",
+              "message": "'BBB' is not valid 'email'"
+            },
+            {
+              "keyword-location": "/properties/contacts/items/$ref/allOf/0/then/properties/contact/format",
+              "instance-location": "/contacts/2/contact",
+              "message": "'AAA' is not valid 'email'"
+            },
+            {
+              "keyword-location": "/properties/contacts/items/$ref/allOf/0/then/properties/contact/format",
+              "instance-location": "/contacts/3/contact",
+              "message": "'AAA' is not valid 'email'"
+            },
+            {
+              "keyword-location": "/properties/contacts/items/$ref/allOf/0/then/properties/contact/format",
+              "instance-location": "/contacts/4/contact",
+              "message": "'BBB' is not valid 'email'"
+            }
+          ],
+          "ingested-schema-version": "v2"
+        },
+        "schema": {
+          "schema-version": "v2",
+          "dd-service": "tf-testaccdatadogservicedefinition_order-local-1677759678",
+          "team": "",
+          "contacts": [
+            {
+              "name": "AA",
+              "type": "email",
+              "contact": "AAA"
+            },
+            {
+              "name": "AA",
+              "type": "slack",
+              "contact": "AAA"
+            },
+            {
+              "name": "BB",
+              "type": "email",
+              "contact": "AAA"
+            },
+            {
+              "name": "AA",
+              "type": "email",
+              "contact": "BBB"
+            },
+            {
+              "name": "BB",
+              "type": "email",
+              "contact": "BBB"
+            }
+          ],
+          "links": [],
+          "repos": [],
+          "docs": [],
+          "tags": [
+            "aaa",
+            "bbb"
+          ],
+          "integrations": {},
+          "extensions": {}
+        }
+      }
+    }
+  ]
+}

@@ -7,7 +7,11 @@
 //!   `QdrantPayload` must decode every stored point to the document the adapters
 //!   produced ([`check_stored_points`]);
 //! - `Kind` values: the writer's value for every kind must be the filter's value, and
-//!   kind-restricted questions must return exactly that kind (`sLO` today);
+//!   kind-restricted questions must return exactly that kind (`sLO`, `serviceCatalog`
+//!   and `change` today);
+//! - service catalog entries: stored with the lowercased service, no environment and no
+//!   timestamp, so a window never excludes them; change events: stored with their event
+//!   time, service and environment from tags, so the window and scope apply;
 //! - `Timestamp` format vs the datetime `range`: in-window events are returned,
 //!   events just before the window and at its (exclusive) end are not;
 //! - `Service`/`Environment` casing vs the lowercased planner and explicit values
@@ -55,6 +59,15 @@ fn crafted() -> Corpus {
             "message": msg, "tags": [format!("env:{env}")]
         }})
     };
+    let change = |id: &str, service: &str, env: &str, ts: &str, title: &str| {
+        json!({"id": id, "type": "event", "attributes": {
+            "timestamp": ts, "message": format!("{title}: rollout finished"),
+            "tags": [format!("service:{service}"), format!("env:{env}"), "version:3.1.0",
+                     "source:argocd"],
+            "attributes": {"title": title, "service": "undefined",
+                           "author": {"name": "Åsa Öberg", "type": "user"}}
+        }})
+    };
     Corpus::from_json(&json!({
         "monitors": [
             {"id": 7001, "type": "query alert", "name": "Checkout – svarstid över 1,5 s ⏱",
@@ -99,6 +112,22 @@ fn crafted() -> Corpus {
             log("co-staging", "checkout", "staging", "2026-03-11T10:20:00.000Z", "db connection pool exhausted: 10/10 in use"),
             log("long", "payments", "prod", "2026-03-11T12:00:00.000Z", &long_message("första")),
             log("long-2", "payments", "prod", "2026-03-11T12:05:00.000Z", &long_message("andra")),
+        ],
+        "serviceDefinitions": [
+            {"id": "sd-checkout", "type": "service-definition", "attributes": {
+                "meta": {"last-modified-time": "2025-01-01T00:00:00Z"},
+                "schema": {"schema-version": "v2.2", "dd-service": "Checkout",
+                           "team": "shop", "tier": "tier-1",
+                           "description": "Kassan – tar emot beställningar 🛒",
+                           "links": [{"name": "Runbook", "type": "runbook",
+                                      "url": "https://wiki.example.com/checkout/runbook"}]}}}
+        ],
+        "events": [
+            change("dep-in", "Checkout", "PROD", "2026-03-11T10:00:00.000Z", "Deploy checkout 3.1.0"),
+            change("dep-before", "checkout", "prod", "2026-03-10T22:59:59.000Z", "Deploy checkout 3.0.9"),
+            change("dep-at-end", "checkout", "prod", "2026-03-11T23:00:00.000Z", "Deploy checkout 3.1.1"),
+            change("dep-staging", "checkout", "staging", "2026-03-11T10:00:00.000Z", "Deploy checkout 3.1.0 to staging"),
+            change("dep-payments", "payments", "prod", "2026-03-11T10:00:00.000Z", "Deploy payments with checkout callback"),
         ]
     }))
 }
@@ -157,7 +186,10 @@ async fn check_stored_points(store: &Store, expected: &BTreeMap<String, RagDocum
         .into();
         if !matches!(
             want.kind,
-            SourceKind::Monitor | SourceKind::Dashboard | SourceKind::SLO
+            SourceKind::Monitor
+                | SourceKind::Dashboard
+                | SourceKind::SLO
+                | SourceKind::ServiceCatalog
         ) {
             allowed.remove(SYNC_ID_KEY);
         }
@@ -212,6 +244,20 @@ async fn check_stored_points(store: &Store, expected: &BTreeMap<String, RagDocum
             let state = rag_core::log_patterns::from_document(&s.doc).expect(id);
             assert_eq!(json!(state.count()), md["count"], "{id}");
             assert_eq!(state.pattern_id(), md["pattern_id"].as_str().unwrap());
+        }
+        // Catalog entries are undated and belong to no environment; change events are
+        // dated events.
+        match want.kind {
+            SourceKind::ServiceCatalog => {
+                assert!(ts.is_null(), "{id}: {ts}");
+                assert_eq!(s.raw["Environment"], "", "{id}");
+                assert!(
+                    !s.raw[SYNC_ID_KEY].is_null(),
+                    "{id}: full sync marks points"
+                );
+            }
+            SourceKind::Change => assert!(!ts.is_null(), "{id}"),
+            _ => {}
         }
         // Service/Environment are stored in the form the scope matches.
         for key in ["Service", "Environment"] {
@@ -381,6 +427,37 @@ fn cases() -> Vec<Case> {
             must: &["metric_checkout_orders_completed", "metric_system_cpu_idle"],
             must_not: &[],
             each: |s| s["kind"] == "metrics",
+            evidence: &[],
+        },
+        // `Kind` = "serviceCatalog"; the entry passes any time window and the planner's
+        // `CHECKOUT` meets the definition's `Checkout`.
+        Case {
+            question: "who owns checkout and where is its runbook?",
+            plan: json!({"service": "CHECKOUT", "filters": ["kind:catalog"]}),
+            request: json!({"from_utc": "2026-03-11T00:00:00Z", "to_utc": "2026-03-11T01:00:00Z"}),
+            must: &["catalog_checkout"],
+            must_not: &[],
+            each: |s| {
+                s["kind"] == "catalog" && s["service"] == "checkout" && s["environment"].is_null()
+            },
+            evidence: &[],
+        },
+        // `Kind` = "change"; the window is half-open on the event time, service and
+        // environment come from the event's tags.
+        Case {
+            question: "which checkout deploys happened yesterday?",
+            plan: json!({"service": "checkout", "environment": "prod", "filters": ["kind:deploys"]}),
+            request: json!({}),
+            must: &["change_dep-in"],
+            must_not: &[
+                "change_dep-before",
+                "change_dep-at-end",
+                "change_dep-staging",
+                "change_dep-payments",
+            ],
+            each: |s| {
+                s["kind"] == "change" && s["service"] == "checkout" && s["environment"] == "prod"
+            },
             evidence: &[],
         },
         // A pattern spanning several chunks is one source.

@@ -18,12 +18,14 @@ const FIRST_SEEN_KEY: &str = "Metadata.first_seen";
 /// Kinds that describe configuration or state rather than events. Their `Timestamp`,
 /// when set at all, is a creation date (monitors, dashboards, SLOs) or the time the
 /// indexer last saw the metric active (metric catalog entries), so a time window never
-/// excludes them.
-pub const TIMELESS_KINDS: [SourceKind; 4] = [
+/// excludes them. Service catalog entries (owners, runbooks, dependencies) describe a
+/// service, not an event, and are undated. Change events are events: a window applies.
+pub const TIMELESS_KINDS: [SourceKind; 5] = [
     SourceKind::Metrics,
     SourceKind::Monitor,
     SourceKind::Dashboard,
     SourceKind::SLO,
+    SourceKind::ServiceCatalog,
 ];
 
 /// Values the caller set explicitly on the request. These are already validated.
@@ -255,6 +257,38 @@ mod tests {
         assert_eq!(scope.environment.as_deref(), Some("dev"));
     }
 
+    /// The catalog is timeless (a window never excludes it); change events are not.
+    #[test]
+    fn catalog_and_change_kinds_filter_by_payload_value() {
+        let plan = QueryPlan {
+            filters: vec!["kind:catalog".into(), "kind:deploys".into()],
+            ..Default::default()
+        };
+        let scope = RetrievalScope::resolve(&ExplicitScope::default(), &plan);
+        assert_eq!(
+            scope.kinds,
+            vec![SourceKind::ServiceCatalog, SourceKind::Change]
+        );
+        assert_eq!(scope.to_json()["kinds"], json!(["catalog", "change"]));
+        let scope = RetrievalScope {
+            from_utc: Some(ts("2026-03-05T12:00:00Z")),
+            ..scope
+        };
+        let filter = scope.to_qdrant_filter().unwrap();
+        assert_eq!(
+            filter["must"][0],
+            json!({"key": "Kind", "match": {"any": ["serviceCatalog", "change"]}})
+        );
+        let timeless = &filter["must"][1]["should"][2]["match"]["any"];
+        assert!(
+            timeless
+                .as_array()
+                .unwrap()
+                .contains(&json!("serviceCatalog"))
+        );
+        assert!(!timeless.as_array().unwrap().contains(&json!("change")));
+    }
+
     #[test]
     fn empty_scope_has_no_filter() {
         assert_eq!(RetrievalScope::default().to_qdrant_filter(), None);
@@ -281,7 +315,7 @@ mod tests {
                         "lt": "2026-09-23T22:00:00Z"
                     }},
                     {"is_empty": {"key": "Timestamp"}},
-                    {"key": "Kind", "match": {"any": ["metrics", "monitor", "dashboard", "sLO"]}},
+                    {"key": "Kind", "match": {"any": ["metrics", "monitor", "dashboard", "sLO", "serviceCatalog"]}},
                     {"must": [
                         {"key": "Kind", "match": {"value": "logs"}},
                         {"key": "Timestamp", "range": {"gte": "2026-09-22T22:00:00Z"}},
