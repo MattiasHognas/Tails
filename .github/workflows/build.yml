@@ -101,6 +101,9 @@ jobs:
     env:
       TEI_IMAGE: ghcr.io/huggingface/text-embeddings-inference:cpu-1.9.4
       TEI_MODEL: BAAI/bge-small-en-v1.5
+      # The model's Hugging Face commit, so a new upload can't change the embeddings the
+      # e2e thresholds were measured with. scripts/e2e.sh checks TEI loaded exactly this.
+      TEI_MODEL_REVISION: 5c38ec7c405ec4b44b94cc5a9bb96e735b38267a
       TEI_DATA: ${{ github.workspace }}/.tei-data
 
     steps:
@@ -112,13 +115,13 @@ jobs:
       uses: actions/cache@v6
       with:
         path: .tei-data
-        key: tei-cpu-1.9.4-bge-small-en-v1.5-v1
+        key: tei-cpu-1.9.4-bge-small-en-v1.5-${{ env.TEI_MODEL_REVISION }}
 
     # Started early: the image pull and model load overlap the build.
     - name: Start text-embeddings-inference
       run: >-
         docker run -d --name tei -p 8080:80 -v "$TEI_DATA:/data"
-        -e MODEL_ID="$TEI_MODEL" "$TEI_IMAGE"
+        -e MODEL_ID="$TEI_MODEL" -e REVISION="$TEI_MODEL_REVISION" "$TEI_IMAGE"
 
     - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@stable

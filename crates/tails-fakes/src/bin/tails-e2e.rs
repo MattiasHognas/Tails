@@ -44,7 +44,8 @@ struct Args {
     /// The rag-cli binary.
     #[arg(long)]
     cli_bin: PathBuf,
-    /// Where the started rag-api listens (it binds 0.0.0.0:5191).
+    /// Where the started rag-api listens: it is started with `RAG_API_ADDR` set to this
+    /// URL's host and port.
     #[arg(long, default_value = "http://127.0.0.1:5191")]
     api_base: String,
     /// The tails-fakes server, for the answer prompts it recorded.
@@ -136,6 +137,7 @@ async fn start_api(args: &Args, now: &str) -> Result<Child> {
         .open(&args.api_log)?;
     let mut child = Command::new(&args.api_bin)
         .env("RAG_TEST_FIXED_NOW", now)
+        .env("RAG_API_ADDR", &addr)
         .stdout(log.try_clone()?)
         .stderr(log)
         .kill_on_drop(true)

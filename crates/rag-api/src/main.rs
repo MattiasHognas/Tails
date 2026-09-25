@@ -1,6 +1,5 @@
 use anyhow::Result;
 use rag_api::AppState;
-use std::net::SocketAddr;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[tokio::main]
@@ -12,7 +11,7 @@ async fn main() -> Result<()> {
 
     let state = AppState::from_env()?;
 
-    let addr: SocketAddr = "0.0.0.0:5191".parse().unwrap();
+    let addr = rag_api::listen_addr(std::env::var(rag_api::LISTEN_ADDR_VAR).ok().as_deref())?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("listening on {}", addr);
     rag_api::serve(listener, state).await?;

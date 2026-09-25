@@ -64,6 +64,24 @@ impl AppState {
 /// in a deployment: every relative time and recency weight would be computed from it.
 pub const FIXED_NOW_VAR: &str = "RAG_TEST_FIXED_NOW";
 
+/// The address `rag-api` listens on, as `host:port` (for example `127.0.0.1:8080`).
+pub const LISTEN_ADDR_VAR: &str = "RAG_API_ADDR";
+
+/// The default listen address: every interface, port 5191.
+pub const DEFAULT_LISTEN_ADDR: &str = "0.0.0.0:5191";
+
+/// The address to listen on: [`LISTEN_ADDR_VAR`] when set and not blank, else
+/// [`DEFAULT_LISTEN_ADDR`]. An invalid value is an error rather than a silent default.
+pub fn listen_addr(value: Option<&str>) -> Result<std::net::SocketAddr> {
+    let value = value
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .unwrap_or(DEFAULT_LISTEN_ADDR);
+    value
+        .parse()
+        .map_err(|_| anyhow::anyhow!("{LISTEN_ADDR_VAR} is not a host:port address: {value:?}"))
+}
+
 /// The system clock, or a [`FixedClock`] at `fixed_now` (the value of
 /// [`FIXED_NOW_VAR`]) when it is set and not blank.
 fn clock_from(fixed_now: Option<&str>) -> Result<Arc<dyn Clock>> {
@@ -546,6 +564,25 @@ async fn ask(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn listen_addr_defaults_to_port_5191_and_rejects_invalid_values() {
+        for unset in [None, Some(""), Some("  ")] {
+            assert_eq!(listen_addr(unset).unwrap().to_string(), "0.0.0.0:5191");
+        }
+        assert_eq!(
+            listen_addr(Some(" 127.0.0.1:8080 ")).unwrap().to_string(),
+            "127.0.0.1:8080"
+        );
+        assert_eq!(
+            listen_addr(Some("[::1]:9000")).unwrap().to_string(),
+            "[::1]:9000"
+        );
+        for bad in ["5191", "localhost", "127.0.0.1:port", "127.0.0.1:70000"] {
+            let err = listen_addr(Some(bad)).unwrap_err().to_string();
+            assert!(err.contains("RAG_API_ADDR"), "{err}");
+        }
+    }
 
     #[test]
     fn clock_is_the_system_clock_unless_a_fixed_now_is_set() {

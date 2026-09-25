@@ -21,11 +21,13 @@
 #   TEI_URL          [http://127.0.0.1:8080]
 #   TEI_IMAGE        [ghcr.io/huggingface/text-embeddings-inference:cpu-1.9.4]
 #   TEI_MODEL        [BAAI/bge-small-en-v1.5]
+#   TEI_MODEL_REVISION  the model's Hugging Face commit; TEI must report it [5c38ec7c405ec4b44b94cc5a9bb96e735b38267a]
 #   TEI_DATA         model cache mounted into the TEI container [~/.cache/tails-e2e/tei]
 #   FAKES_ADDR       [127.0.0.1:8900]
+#   API_ADDR         where rag-api listens (RAG_API_ADDR) [127.0.0.1:5191]
 #   E2E_SKIP_BUILD   1: use the existing release binaries
 #   E2E_KEEP         1: keep the collection and the work directory
-# rag-api listens on 0.0.0.0:5191, which must be free.
+# API_ADDR and FAKES_ADDR must be free.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -36,9 +38,11 @@ QDRANT_URL="${QDRANT_ENDPOINT:-http://127.0.0.1:6333}"
 TEI_URL="${TEI_URL:-http://127.0.0.1:8080}"
 TEI_IMAGE="${TEI_IMAGE:-ghcr.io/huggingface/text-embeddings-inference:cpu-1.9.4}"
 TEI_MODEL="${TEI_MODEL:-BAAI/bge-small-en-v1.5}"
+TEI_MODEL_REVISION="${TEI_MODEL_REVISION-5c38ec7c405ec4b44b94cc5a9bb96e735b38267a}"
 TEI_DATA="${TEI_DATA:-$HOME/.cache/tails-e2e/tei}"
 FAKES_ADDR="${FAKES_ADDR:-127.0.0.1:8900}"
 FAKES_URL="http://$FAKES_ADDR"
+API_ADDR="${API_ADDR:-127.0.0.1:5191}"
 COLLECTION="tails_e2e_$(date +%s)_$$"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/tails-e2e.XXXXXX")"
 PIDS=()
@@ -105,7 +109,8 @@ if [[ "$E2E_EMBEDDINGS" == tei && ",$E2E_DOCKER," == *",tei,"* ]]; then
   log "Starting text-embeddings-inference (docker, $TEI_MODEL)"
   mkdir -p "$TEI_DATA"
   docker run -d --name "tails-e2e-tei-$$" -p "$(port_of "$TEI_URL"):80" \
-    -v "$TEI_DATA:/data" -e MODEL_ID="$TEI_MODEL" "$TEI_IMAGE" >/dev/null
+    -v "$TEI_DATA:/data" -e MODEL_ID="$TEI_MODEL" -e REVISION="$TEI_MODEL_REVISION" \
+    "$TEI_IMAGE" >/dev/null
   CONTAINERS+=("tails-e2e-tei-$$")
 fi
 
@@ -114,6 +119,14 @@ case "$E2E_EMBEDDINGS" in
   tei)
     # The first start downloads the model into TEI_DATA.
     wait_for "text-embeddings-inference" "$TEI_URL/health" 600
+    # The thresholds were measured with one model revision; refuse to run on another.
+    TEI_INFO="$(curl -fsS "$TEI_URL/info")"
+    TEI_SHA="$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("model_sha") or "")' <<<"$TEI_INFO")"
+    echo "text-embeddings-inference serves $TEI_MODEL at revision ${TEI_SHA:-unknown}"
+    if [[ -n "$TEI_MODEL_REVISION" && "$TEI_SHA" != "$TEI_MODEL_REVISION" ]]; then
+      echo "expected revision $TEI_MODEL_REVISION (TEI_MODEL_REVISION); set it to the new commit and re-measure the thresholds" >&2
+      exit 1
+    fi
     EMBEDDING_URL="$TEI_URL"
     EMBEDDING_MODEL="$TEI_MODEL"
     FAKES_FLAGS=()
@@ -165,5 +178,5 @@ grep -E "Indexed |created Qdrant collection" "$WORK/rag-indexer.log" | sed -E 's
 
 log "Asking the incident questions through rag-cli"
 "$TARGET/tails-e2e" --api-bin "$TARGET/rag-api" --cli-bin "$TARGET/rag-cli" \
-  --fakes "$FAKES_URL" --api-log "$WORK/rag-api.log"
+  --api-base "http://$API_ADDR" --fakes "$FAKES_URL" --api-log "$WORK/rag-api.log"
 STATUS=0

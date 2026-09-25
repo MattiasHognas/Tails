@@ -80,6 +80,9 @@ RAG_LIVE_MAX_METRICS=5               # metric queries per question
 RAG_LIVE_MAX_LOG_EVENTS=1000         # error/warn logs fetched per service
 RAG_LIVE_MAX_WINDOW_HOURS=168        # longer windows are not queried live
 
+# Where the API listens, as host:port (default 0.0.0.0:5191)
+RAG_API_ADDR=0.0.0.0:5191
+
 # Test-only (API): fixes "now" at this RFC 3339 time, so the end-to-end tests can ask
 # "yesterday" questions about a recorded corpus. Never set it in a deployment.
 RAG_TEST_FIXED_NOW=
@@ -510,9 +513,18 @@ QDRANT_ENDPOINT=http://localhost:6333 TEI_URL=http://localhost:8080 scripts/e2e.
 E2E_EMBEDDINGS=fake QDRANT_ENDPOINT=http://localhost:6333 scripts/e2e.sh
 ```
 
-Other variables: `TEI_IMAGE`, `TEI_MODEL`, `TEI_DATA` (model cache), `FAKES_ADDR`
-(default `127.0.0.1:8900`), `E2E_SKIP_BUILD=1`, `E2E_KEEP=1` (keep the collection and the
-logs). `rag-api` listens on port 5191, which must be free. In CI, the job starts TEI with
+Other variables: `TEI_IMAGE`, `TEI_MODEL`, `TEI_MODEL_REVISION`, `TEI_DATA` (model
+cache), `FAKES_ADDR` (default `127.0.0.1:8900`), `API_ADDR` (where the started `rag-api`
+listens via `RAG_API_ADDR`, default `127.0.0.1:5191`), `E2E_SKIP_BUILD=1`, `E2E_KEEP=1`
+(keep the collection and the logs). Both addresses must be free.
+
+The model is pinned to a Hugging Face commit (`TEI_MODEL_REVISION`, passed to TEI as
+`REVISION`), because the e2e thresholds were measured with it and a new upload of the same
+model name could change the embeddings. The script reads the revision TEI actually loaded
+from its `/info` endpoint and stops if it differs. To move to a new revision, update
+`TEI_MODEL_REVISION` in `build.yml` (and the script's default), run the job, and set the
+thresholds in `e2e_thresholds.json` from its report. Set `TEI_MODEL_REVISION=` (empty)
+to run a local model without the check. In CI, the job starts TEI with
 `docker run` after restoring the model cache (a service container would start before the
 cache is restored); indexing runs one embedding batch of at most 32 texts at a time, so
 TEI on CPU embeds the same inputs the same way on every run.
