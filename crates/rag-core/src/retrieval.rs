@@ -18,7 +18,8 @@ const FIRST_SEEN_KEY: &str = "Metadata.first_seen";
 /// Kinds that describe configuration or state rather than events. Their `Timestamp`,
 /// when set at all, is a creation date (monitors, dashboards, SLOs) or the time the
 /// indexer last saw the metric active (metric catalog entries), so a time window never
-/// excludes them.
+/// excludes them and the reranker never rewards their timestamp as recent
+/// ([`crate::reranker::recency_weight`]).
 pub const TIMELESS_KINDS: [SourceKind; 4] = [
     SourceKind::Metrics,
     SourceKind::Monitor,

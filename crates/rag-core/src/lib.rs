@@ -14,6 +14,7 @@ pub mod rag_service;
 pub mod reranker;
 pub mod resilience;
 pub mod retrieval;
+pub mod sparse;
 pub mod text;
 
 #[cfg(test)]

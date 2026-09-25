@@ -1,12 +1,13 @@
 use anyhow::{Context, Result};
 use rag_core::{
     chunk::{chunk, chunk_id, content_hash},
-    domain::{RagDocument, SourceKind},
+    domain::{Hit, RagDocument, SourceKind},
     qdrant::{
-        QPoint, Qdrant, SYNC_ID_KEY, StoredPointState, point_id, surplus_chunks_filter,
-        unsynced_filter,
+        QPoint, Qdrant, SYNC_ID_KEY, SearchQuery, StoredPointState, point_id,
+        surplus_chunks_filter, unsynced_filter,
     },
     retrieval::RetrievalScope,
+    sparse::query_vector,
 };
 use serde_json::json;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -27,25 +28,128 @@ async fn qdrant_roundtrip() -> Result<()> {
         .timeout(Duration::from_secs(15))
         .build()?;
     let collection_url = format!("{}/collections/{}", qdrant.endpoint, qdrant.collection);
-    qdrant
-        .http
-        .put(&collection_url)
-        .json(&json!({"vectors": {"size": 3, "distance": "Cosine"}}))
-        .send()
-        .await?
-        .error_for_status()?;
+    let mut old = qdrant.clone();
+    old.collection = format!("{}_old", qdrant.collection);
+    let old_url = format!("{}/collections/{}", old.endpoint, old.collection);
 
     // Clean up even when a request or assertion fails.
     let test_qdrant = qdrant.clone();
     let outcome = tokio::spawn(async move {
+        check_collection_setup(&test_qdrant, &old).await?;
         check_roundtrip(&test_qdrant).await?;
         check_scope_filter(&test_qdrant).await?;
+        check_hybrid_search(&test_qdrant).await?;
         check_incremental_indexing_calls(&test_qdrant).await
     })
     .await;
     let cleanup = qdrant.http.delete(&collection_url).send().await;
+    let _ = qdrant.http.delete(&old_url).send().await;
     outcome.context("Qdrant round-trip assertion failed")??;
     cleanup?.error_for_status()?;
+    Ok(())
+}
+
+/// The indexer's collection setup: a missing collection is reported and created with
+/// named dense + sparse vectors, which then pass the check; a collection with the old
+/// single unnamed vector is refused.
+async fn check_collection_setup(qdrant: &Qdrant, old: &Qdrant) -> Result<()> {
+    assert!(!qdrant.check_collection().await?);
+    qdrant.create_collection(3).await?;
+    assert!(qdrant.check_collection().await?);
+
+    let old_url = format!("{}/collections/{}", old.endpoint, old.collection);
+    old.http
+        .put(&old_url)
+        .json(&json!({"vectors": {"size": 3, "distance": "Cosine"}}))
+        .send()
+        .await?
+        .error_for_status()?;
+    let err = old.check_collection().await.unwrap_err();
+    assert!(err.to_string().contains("new"), "{err}");
+    Ok(())
+}
+
+/// A hybrid search with one query: its dense vector and the keyword vector of `text`.
+async fn search(
+    qdrant: &Qdrant,
+    dense: &[f32],
+    text: &str,
+    filter: Option<serde_json::Value>,
+) -> Result<Vec<Hit>> {
+    let query = SearchQuery {
+        dense: dense.to_vec(),
+        sparse: query_vector(text),
+    };
+    Ok(qdrant.hybrid_search(&[query], 100, filter).await?)
+}
+
+/// Keyword search finds an exact identifier the dense vector misses, both questions
+/// are fused in one query, and scores are normalized RRF.
+async fn check_hybrid_search(qdrant: &Qdrant) -> Result<()> {
+    let doc = |id: &str, text: &str| RagDocument {
+        id: id.into(),
+        title: id.into(),
+        text: text.into(),
+        source_uri: format!("https://example.com/{id}"),
+        kind: SourceKind::Logs,
+        timestamp: None,
+        service: "hybrid-svc".into(),
+        environment: "prod".into(),
+        metadata: serde_json::Map::new(),
+    };
+    let exact = doc("log_exact#c0", "upstream closed: ERR_CONN_RESET");
+    let similar = doc("log_similar#c0", "connection refused by upstream");
+    let other = doc("log_other#c0", "disk quota exceeded");
+    qdrant
+        .upsert(vec![
+            QPoint::from_document(&exact, vec![1.0, 0.0, 0.0]),
+            QPoint::from_document(&similar, vec![0.0, 1.0, 0.0]),
+            QPoint::from_document(&other, vec![0.0, 0.0, 1.0]),
+        ])
+        .await?;
+    let filter = json!({"must": [{"key": "Service", "match": {"value": "hybrid-svc"}}]});
+    let ranked = |hits: Vec<Hit>| -> Vec<(String, f32)> {
+        hits.into_iter().map(|h| (h.doc.id, h.score)).collect()
+    };
+
+    // Dense ranks similar, exact, other; only exact shares a keyword. Two lists, k = 2:
+    // exact 1/3 + 1/2 and similar 1/2, of the best possible 2 × 1/2.
+    let hits = search(
+        qdrant,
+        &[0.2, 1.0, 0.0],
+        "why ERR_CONN_RESET?",
+        Some(filter.clone()),
+    )
+    .await?;
+    let got = ranked(hits);
+    assert_eq!(got[0].0, "log_exact#c0", "{got:?}");
+    assert!((got[0].1 - 5.0 / 6.0).abs() < 1e-5, "{got:?}");
+    assert_eq!(got[1].0, "log_similar#c0", "{got:?}");
+    assert!((got[1].1 - 0.5).abs() < 1e-5, "{got:?}");
+    assert_eq!(got.len(), 3);
+
+    // The question and a rewrite in one query: four lists. `exact` is first by the
+    // question's dense and keyword searches and third by the rewrite's dense one;
+    // `other` the other way round (they tie, in any order); `similar` is second twice.
+    let queries = [
+        SearchQuery {
+            dense: vec![1.0, 0.2, 0.0],
+            sparse: query_vector("ERR_CONN_RESET"),
+        },
+        SearchQuery {
+            dense: vec![0.0, 0.1, 1.0],
+            sparse: query_vector("disk quota"),
+        },
+    ];
+    let got = ranked(qdrant.hybrid_search(&queries, 100, Some(filter)).await?);
+    let ids: Vec<&str> = got.iter().map(|(id, _)| id.as_str()).collect();
+    assert_eq!(ids.len(), 3, "{got:?}");
+    assert!(ids[..2].contains(&"log_exact#c0") && ids[..2].contains(&"log_other#c0"));
+    // exact: 1/2 + 1/2 + 1/4 = 1.25 and similar 1/3 + 1/3, of the best possible 4 × 1/2.
+    let exact_score = got.iter().find(|(id, _)| id == "log_exact#c0").unwrap().1;
+    assert!((exact_score - 1.25 / 2.0).abs() < 1e-5, "{got:?}");
+    assert_eq!(ids[2], "log_similar#c0");
+    assert!((got[2].1 - (2.0 / 3.0) / 2.0).abs() < 1e-5, "{got:?}");
     Ok(())
 }
 
@@ -89,9 +193,7 @@ async fn check_roundtrip(qdrant: &Qdrant) -> Result<()> {
         {"key": "Service", "match": {"value": "payments"}},
         {"key": "Environment", "match": {"value": "prod"}}
     ]});
-    let hits = qdrant
-        .search(vector.clone(), 100, Some(filter.clone()))
-        .await?;
+    let hits = search(qdrant, &vector, "timeout", Some(filter.clone())).await?;
     assert_eq!(
         hits.len(),
         chunks.len(),
@@ -112,7 +214,7 @@ async fn check_roundtrip(qdrant: &Qdrant) -> Result<()> {
     let updated = QPoint::from_document(&chunks[0], vector.clone());
     assert_eq!(updated.id, original_id);
     qdrant.upsert(vec![updated]).await?;
-    let hits = qdrant.search(vector, 100, Some(filter)).await?;
+    let hits = search(qdrant, &vector, "timeout", Some(filter)).await?;
     assert_eq!(hits.len(), chunks.len());
     let actual = &hits.iter().find(|h| h.doc.id == chunks[0].id).unwrap().doc;
     assert_eq!(
@@ -204,14 +306,12 @@ async fn check_scope_filter(qdrant: &Qdrant) -> Result<()> {
         to_utc: Some("2026-09-23T22:00:00Z".parse()?),
         kinds: vec![],
     };
-    let ids = |hits: Vec<rag_core::domain::Hit>| {
+    let ids = |hits: Vec<Hit>| {
         let mut ids: Vec<String> = hits.into_iter().map(|h| h.doc.id).collect();
         ids.sort();
         ids
     };
-    let hits = qdrant
-        .search(vector.clone(), 100, scope.to_qdrant_filter())
-        .await?;
+    let hits = search(qdrant, &vector, "log", scope.to_qdrant_filter()).await?;
     assert_eq!(
         ids(hits),
         [
@@ -226,7 +326,7 @@ async fn check_scope_filter(qdrant: &Qdrant) -> Result<()> {
     );
 
     scope.kinds = vec![SourceKind::Logs, SourceKind::SLO];
-    let hits = qdrant.search(vector, 100, scope.to_qdrant_filter()).await?;
+    let hits = search(qdrant, &vector, "log", scope.to_qdrant_filter()).await?;
     assert_eq!(ids(hits), ["pattern_ending_after", "slo"]);
     Ok(())
 }
@@ -362,13 +462,13 @@ async fn check_incremental_indexing_calls(qdrant: &Qdrant) -> Result<()> {
             .await?,
         0
     );
-    let kept = qdrant
-        .search(
-            vector,
-            100,
-            Some(json!({"must": [{"key": "Service", "match": {"value": "incremental-svc"}}]})),
-        )
-        .await?;
+    let kept = search(
+        qdrant,
+        &vector,
+        "monitor",
+        Some(json!({"must": [{"key": "Service", "match": {"value": "incremental-svc"}}]})),
+    )
+    .await?;
     let mut kept: Vec<_> = kept.into_iter().map(|h| h.doc.id).collect();
     kept.sort();
     assert_eq!(

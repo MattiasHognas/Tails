@@ -339,6 +339,73 @@
       "answer": {"citeDocuments": ["log_co-inv-fri-0"]}
     },
     {
+      "id": "q24-last-week-incident-vs-monitor",
+      "question": "Why did fulfillment print every shipping label twice?",
+      "note": "No window. The incident from a week ago answers the question and ranks first in every search; the fulfillment monitor matches only some of the words. Recency must not decide between an event and a timeless document: when dated evidence older than a day was halved and undated monitors were not, the monitor ranked first.",
+      "plan": {"intent": "rootCause", "service": "fulfillment", "environment": "prod"},
+      "expect": {
+        "scope": {"service": "fulfillment", "environment": "prod", "fromUtc": null, "toUtc": null, "kinds": []},
+        "mustRetrieve": ["incident_inc-fulfillment-labels"]
+      },
+      "answer": {"citeDocuments": ["incident_inc-fulfillment-labels"]}
+    },
+    {
+      "id": "q25-failing-right-now",
+      "question": "What is failing in notifications right now?",
+      "note": "No window. Two notification error patterns match about equally; the one from five days ago matches slightly better, the one from 20 minutes ago is what is failing now. Without any recency preference, or with every dated document at the same floor, the old one ranks first.",
+      "plan": {"intent": "semanticLogSearch", "service": "notifications", "environment": "prod", "rewrittenQuery": "notifications delivery failing errors"},
+      "expect": {
+        "scope": {"service": "notifications", "environment": "prod", "fromUtc": null, "toUtc": null, "kinds": []},
+        "mustRetrieve": ["log_ntf-email"]
+      },
+      "answer": {"citeDocuments": ["log_ntf-email"]}
+    },
+    {
+      "id": "q26-last-tuesday-in-window",
+      "question": "What went wrong with billing invoices last Tuesday?",
+      "note": "Window: Tuesday in Stockholm, two days before 'now'. The billing monitor repeats the question's words and ranks above the incident, but the incident is the event in the window. An in-window event is not penalised for its age and a timeless monitor is no evidence of what happened then; when dated evidence was decayed from the wall clock and undated monitors were not, the monitor ranked first.",
+      "plan": {"intent": "incidentSummary", "service": "billing", "environment": "prod",
+               "window": {"fromUtc": "2026-03-09T23:00:00Z", "toUtc": "2026-03-10T23:00:00Z"}},
+      "expect": {
+        "scope": {"service": "billing", "environment": "prod", "fromUtc": "2026-03-09T23:00:00Z", "toUtc": "2026-03-10T23:00:00Z", "kinds": []},
+        "mustRetrieve": ["incident_inc-billing-vat"]
+      },
+      "answer": {"citeDocuments": ["incident_inc-billing-vat"]}
+    },
+    {
+      "id": "q30-exact-error-code",
+      "question": "Why does edge-gateway log ERR_CONN_RESET when calling payments upstream?",
+      "note": "Six edge-gateway error patterns share the question's words. A timeout while calling payments upstream shares more of them than the ERR_CONN_RESET log, so dense search alone ranks it first; the keyword search matches the exact code, which only eg-reset contains.",
+      "plan": {"intent": "semanticLogSearch", "service": "edge-gateway", "environment": "prod", "filters": ["kind:logs"]},
+      "expect": {
+        "scope": {"service": "edge-gateway", "environment": "prod", "fromUtc": null, "toUtc": null, "kinds": ["logs"]},
+        "mustRetrieve": ["log_eg-reset"]
+      },
+      "answer": {"citeDocuments": ["log_eg-reset"]}
+    },
+    {
+      "id": "q31-exact-metric-name",
+      "question": "Which storefront monitor uses trace.http.request.errors?",
+      "note": "Four storefront monitors query trace.http.request.* metrics. The traffic monitor on trace.http.request.hits repeats 'storefront' and 'monitor', so dense search alone ranks it above the 5xx monitor; only monitor 1101 queries the exact metric name, which the keyword search matches as one token.",
+      "plan": {"intent": "monitorExplanation", "service": "storefront", "environment": "prod", "filters": ["kind:monitor"]},
+      "expect": {
+        "scope": {"service": "storefront", "environment": "prod", "fromUtc": null, "toUtc": null, "kinds": ["monitor"]},
+        "mustRetrieve": ["monitor_1101"]
+      },
+      "answer": {"citeDocuments": ["monitor_1101"]}
+    },
+    {
+      "id": "q32-rewrite-drops-exception",
+      "question": "Why does checkout-api throw PaymentDeclinedException on card retries?",
+      "note": "The planner's rewrite drops the exception name, and a generic retry failure log matches the rewrite best. Searching with the original question as well keeps the PaymentDeclinedException log first.",
+      "plan": {"intent": "rootCauseWindow", "service": "checkout-api", "environment": "prod", "rewrittenQuery": "checkout-api card payment retry failures"},
+      "expect": {
+        "scope": {"service": "checkout-api", "environment": "prod", "fromUtc": null, "toUtc": null, "kinds": []},
+        "mustRetrieve": ["log_ca-declined"]
+      },
+      "answer": {"citeDocuments": ["log_ca-declined"]}
+    },
+    {
       "id": "q40-checkout-outage-root-cause",
       "question": "What was the root cause of the last checkout outage?",
       "note": "Only the incident's root cause field says 'checkout outage'; its title does not. Before incident fields were indexed the other checkout incidents ranked first.",

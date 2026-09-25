@@ -20,6 +20,9 @@
 //!   no log in the window's hours is not; the prompt counts a pattern per day in the
 //!   asker's timezone;
 //! - point IDs: every point ID is the UUIDv5 of its logical chunk ID;
+//! - vector names and inputs: every point has the dense and the sparse vector under the
+//!   names the reader's hybrid query uses, the sparse one built from the same embedding
+//!   input (header + chunk) as the dense one ([`check_stored_vectors`]);
 //! - bookkeeping keys (`ContentHash`, `ChunkCount`, `SyncId`) are written but never
 //!   reach `RagDocument` or `sources`; a second run leaves unchanged documents alone;
 //! - `sources` point at stored documents, are numbered like the prompt, and every
@@ -32,9 +35,13 @@
 
 use super::support::{self, Corpus, FakeOpenAi, Store, at, openai::DIM};
 use rag_core::{
+    chunk::embedding_input,
     domain::{RagDocument, SourceKind},
-    qdrant::{CHUNK_COUNT_KEY, CONTENT_HASH_KEY, SYNC_ID_KEY, point_id},
+    qdrant::{
+        CHUNK_COUNT_KEY, CONTENT_HASH_KEY, DENSE_VECTOR, SPARSE_VECTOR, SYNC_ID_KEY, point_id,
+    },
     retrieval::RetrievalScope,
+    sparse::document_vector,
 };
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -253,6 +260,44 @@ async fn check_stored_points(store: &Store, expected: &BTreeMap<String, RagDocum
             let v = s.raw[key].as_str().unwrap();
             assert_eq!(v, v.trim().to_lowercase(), "{id}: {key} {v:?}");
         }
+    }
+}
+
+/// Every point has exactly the dense and sparse vectors the hybrid query searches: a
+/// `DIM`-sized dense vector and the sparse vector of the chunk's embedding input.
+async fn check_stored_vectors(store: &Store, expected: &BTreeMap<String, RagDocument>) {
+    let by_point: BTreeMap<String, &RagDocument> = expected
+        .values()
+        .map(|d| (point_id(&d.id).to_string(), d))
+        .collect();
+    let stored = store.vectors().await;
+    assert_eq!(stored.len(), expected.len());
+    for (pid, vectors) in stored {
+        let doc = by_point[&pid];
+        let names: BTreeSet<&str> = vectors
+            .as_object()
+            .unwrap_or_else(|| panic!("{}: unnamed vector {vectors}", doc.id))
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            names,
+            BTreeSet::from([DENSE_VECTOR, SPARSE_VECTOR]),
+            "{}",
+            doc.id
+        );
+        assert_eq!(vectors[DENSE_VECTOR].as_array().unwrap().len(), DIM);
+        let want = document_vector(&embedding_input(doc));
+        assert!(!want.is_empty(), "{}", doc.id);
+        let sparse = &vectors[SPARSE_VECTOR];
+        assert_eq!(sparse["indices"], json!(want.indices), "{}", doc.id);
+        let values: Vec<f32> = sparse["values"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_f64().unwrap() as f32)
+            .collect();
+        assert_eq!(values, want.values, "{}", doc.id);
     }
 }
 
@@ -507,6 +552,8 @@ async fn run_contract(store: Store) {
             .contains("- Misslyckade inloggningar: sum:auth.login.failures")
     );
     check_stored_points(&store, &expected).await;
+    check_stored_vectors(&store, &expected).await;
+    assert!(store.qdrant().check_collection().await.unwrap());
     let stored = support::stored_chunks(&store).await;
 
     let base = support::spawn_api(oa.clone(), &store, now, None).await;

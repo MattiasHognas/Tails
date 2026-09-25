@@ -1,9 +1,21 @@
+use crate::chunk::embedding_input;
 use crate::domain::{Hit, RagDocument, SourceKind};
 use crate::error::{RagError, Stage, UpstreamError};
 use crate::resilience::{HttpConfig, RetryPolicy, send_with_retry};
+use crate::sparse::{SparseVector, document_vector};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use uuid::Uuid;
+
+/// Name of the dense (embedding) vector of every point.
+pub const DENSE_VECTOR: &str = "dense";
+/// Name of the sparse keyword vector of every point (see [`crate::sparse`]).
+pub const SPARSE_VECTOR: &str = "sparse";
+/// `k` of reciprocal rank fusion: a point at 0-based rank `r` of a prefetch list scores
+/// `1 / (k + r)`. 2 is Qdrant's default, sent explicitly so the fused score (and its
+/// normalization in [`Qdrant::hybrid_search`]) cannot change with a Qdrant upgrade.
+pub const RRF_K: u32 = 2;
 
 #[derive(Debug, Clone)]
 pub struct Qdrant {
@@ -16,8 +28,96 @@ pub struct Qdrant {
 #[derive(Debug, Clone, Serialize)]
 pub struct QPoint {
     pub id: Uuid,
-    pub vector: Vec<f32>,
+    pub vector: PointVectors,
     pub payload: QdrantPayload,
+}
+
+/// The named vectors of a point. The field names are [`DENSE_VECTOR`] and
+/// [`SPARSE_VECTOR`], the names [`collection_config`] creates and
+/// [`Qdrant::hybrid_search`] queries.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PointVectors {
+    pub dense: Vec<f32>,
+    pub sparse: SparseVector,
+}
+
+/// Body of `PUT /collections/{c}`: a cosine dense vector of `dim` dimensions and a
+/// sparse vector whose IDF Qdrant computes over the collection.
+pub fn collection_config(dim: usize) -> serde_json::Value {
+    json!({
+        "vectors": {DENSE_VECTOR: {"size": dim, "distance": "Cosine"}},
+        "sparse_vectors": {SPARSE_VECTOR: {"modifier": "idf"}}
+    })
+}
+
+/// Checks the `config.params` of an existing collection against [`collection_config`]
+/// (any dimension). The error says what differs.
+pub fn check_collection_params(params: &serde_json::Value) -> Result<(), String> {
+    let dense = &params["vectors"][DENSE_VECTOR];
+    if !dense.is_object() {
+        return Err(format!(
+            "no named dense vector `{DENSE_VECTOR}` (vectors: {})",
+            params["vectors"]
+        ));
+    }
+    if dense["distance"] != "Cosine" {
+        return Err(format!(
+            "dense vector `{DENSE_VECTOR}` uses distance {}, not Cosine",
+            dense["distance"]
+        ));
+    }
+    let sparse = &params["sparse_vectors"][SPARSE_VECTOR];
+    if !sparse.is_object() {
+        return Err(format!("no sparse vector `{SPARSE_VECTOR}`"));
+    }
+    if sparse["modifier"] != "idf" {
+        return Err(format!(
+            "sparse vector `{SPARSE_VECTOR}` has modifier {}, not idf",
+            sparse["modifier"]
+        ));
+    }
+    Ok(())
+}
+
+/// One way of asking a question: its embedding and its keyword vector
+/// ([`crate::sparse::query_vector`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SearchQuery {
+    pub dense: Vec<f32>,
+    pub sparse: SparseVector,
+}
+
+/// Body of the hybrid `POST /collections/{c}/points/query` and the number of prefetch
+/// lists it fuses: per query a dense and (unless it has no tokens) a sparse prefetch,
+/// each restricted by `filter` and returning up to `limit` points, fused with reciprocal
+/// rank fusion ([`RRF_K`]).
+pub fn hybrid_query_body(
+    queries: &[SearchQuery],
+    limit: usize,
+    filter: Option<&serde_json::Value>,
+) -> (serde_json::Value, usize) {
+    let prefetch_of = |query: serde_json::Value, using: &str| {
+        let mut p = json!({"query": query, "using": using, "limit": limit});
+        if let Some(f) = filter {
+            p["filter"] = f.clone();
+        }
+        p
+    };
+    let mut prefetch = vec![];
+    for q in queries {
+        prefetch.push(prefetch_of(json!(q.dense), DENSE_VECTOR));
+        if !q.sparse.is_empty() {
+            prefetch.push(prefetch_of(json!(q.sparse), SPARSE_VECTOR));
+        }
+    }
+    let lists = prefetch.len();
+    let body = json!({
+        "prefetch": prefetch,
+        "query": {"rrf": {"k": RRF_K}},
+        "limit": limit,
+        "with_payload": true,
+    });
+    (body, lists)
 }
 
 /// Storage schema shared by ingestion and retrieval. PascalCase keys match
@@ -92,10 +192,16 @@ impl From<QdrantPayload> for RagDocument {
 impl QPoint {
     /// A chunk keeps the same point ID across retries and content updates.
     /// Preserve the logical chunk ID and chunk_of metadata in the payload.
-    pub fn from_document(doc: &RagDocument, vector: Vec<f32>) -> Self {
+    ///
+    /// `dense` is the embedding of [`embedding_input`]; the sparse vector is built from
+    /// the same text, so both searches see the header and the chunk.
+    pub fn from_document(doc: &RagDocument, dense: Vec<f32>) -> Self {
         Self {
             id: point_id(&doc.id),
-            vector,
+            vector: PointVectors {
+                dense,
+                sparse: document_vector(&embedding_input(doc)),
+            },
             payload: payload_from(doc),
         }
     }
@@ -324,41 +430,101 @@ impl Qdrant {
         Ok(v.result.count)
     }
 
-    pub async fn search(
+    /// Creates the collection with [`collection_config`] for `dim`-dimensional
+    /// embeddings.
+    pub async fn create_collection(&self, dim: usize) -> Result<(), RagError> {
+        let url = format!("{}/collections/{}", self.endpoint, self.collection);
+        let body = collection_config(dim);
+        send_with_retry(&self.retry, "qdrant create collection", || {
+            self.http.put(&url).json(&body)
+        })
+        .await
+        .map_err(|f| RagError::upstream(Stage::Indexing, f))?;
+        Ok(())
+    }
+
+    /// Whether the collection exists. An existing collection must have the layout of
+    /// [`collection_config`]; one without it (for example the old single unnamed
+    /// vector) is an error, because it cannot be migrated in place.
+    pub async fn check_collection(&self) -> Result<bool, RagError> {
+        #[derive(Deserialize)]
+        struct Resp {
+            result: Info,
+        }
+        #[derive(Deserialize)]
+        struct Info {
+            config: Config,
+        }
+        #[derive(Deserialize)]
+        struct Config {
+            params: serde_json::Value,
+        }
+        let url = format!("{}/collections/{}", self.endpoint, self.collection);
+        let r = match send_with_retry(&self.retry, "qdrant collection info", || {
+            self.http.get(&url)
+        })
+        .await
+        {
+            Ok(r) => r,
+            Err(f) if matches!(f.error, UpstreamError::Status { status: 404, .. }) => {
+                return Ok(false);
+            }
+            Err(f) => return Err(RagError::upstream(Stage::Indexing, f)),
+        };
+        let info: Resp = r
+            .json()
+            .await
+            .map_err(|e| RagError::failed(Stage::Indexing, UpstreamError::from_reqwest(e)))?;
+        check_collection_params(&info.result.config.params).map_err(|why| {
+            RagError::failed(
+                Stage::Indexing,
+                UpstreamError::InvalidResponse(format!(
+                    "collection {} is not a hybrid search collection: {why}. Index into a new \
+                     collection (QDRANT_COLLECTION); older layouts are not migrated",
+                    self.collection
+                )),
+            )
+        })?;
+        Ok(true)
+    }
+
+    /// Hybrid search: dense and keyword search for every query, each restricted by
+    /// `filter`, fused by Qdrant with reciprocal rank fusion (see [`hybrid_query_body`]).
+    ///
+    /// Returns at most `limit` hits. A hit's score is its fused RRF score divided by the
+    /// best possible one (first in every prefetch list), so it lies in (0, 1]: 1 means
+    /// ranked first by every search, 0.667 second by all, 0.5 first by half of them or
+    /// third by all (with [`RRF_K`] = 2). Only ranks count, not the raw similarities, so
+    /// scores of different questions are comparable and the reranker's kind priors and
+    /// recency weight ([`crate::reranker::recency_weight`]) scale them like before.
+    pub async fn hybrid_search(
         &self,
-        vector: Vec<f32>,
+        queries: &[SearchQuery],
         limit: usize,
         filter: Option<serde_json::Value>,
     ) -> Result<Vec<Hit>, RagError> {
-        #[derive(Serialize)]
-        struct Req<'a> {
-            vector: &'a [f32],
-            limit: usize,
-            with_payload: bool,
-            filter: Option<serde_json::Value>,
-        }
         #[derive(Deserialize)]
         struct Resp {
-            result: Vec<Item>,
+            result: Points,
+        }
+        #[derive(Deserialize)]
+        struct Points {
+            points: Vec<Item>,
         }
         #[derive(Deserialize)]
         struct Item {
             score: f32,
             payload: QdrantPayload,
-            #[allow(dead_code)]
-            id: serde_json::Value,
         }
-        let url = format!(
-            "{}/collections/{}/points/search",
-            self.endpoint, self.collection
-        );
-        let req = Req {
-            vector: &vector,
-            limit,
-            with_payload: true,
-            filter,
-        };
-        let r = send_with_retry(&self.retry, "qdrant search", || {
+        let (req, lists) = hybrid_query_body(queries, limit, filter.as_ref());
+        if lists == 0 {
+            return Err(RagError::failed(
+                Stage::Retrieval,
+                UpstreamError::InvalidResponse("hybrid search without a query".into()),
+            ));
+        }
+        let url = self.points_url("/query");
+        let r = send_with_retry(&self.retry, "qdrant query", || {
             self.http.post(&url).json(&req)
         })
         .await
@@ -368,11 +534,13 @@ impl Qdrant {
             .json()
             .await
             .map_err(|e| RagError::failed(Stage::Retrieval, UpstreamError::from_reqwest(e)))?;
+        let best = lists as f32 / RRF_K as f32;
         Ok(v.result
+            .points
             .into_iter()
             .map(|it| Hit {
                 doc: it.payload.into(),
-                score: it.score,
+                score: (it.score / best).min(1.0),
             })
             .collect())
     }
@@ -449,14 +617,117 @@ mod tests {
         let mut payload = serde_json::to_value(payload_from(&contract_document())).unwrap();
         payload.as_object_mut().unwrap().remove("Text");
         Mock::given(method("POST"))
-            .and(path("/collections/test/points/search"))
+            .and(path("/collections/test/points/query"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "result": [{"id": 1, "score": 0.9, "payload": payload}]
+                "result": {"points": [{"id": 1, "score": 0.9, "payload": payload}]}
             })))
             .mount(&server)
             .await;
         let qdrant = Qdrant::new(server.uri(), "test".into());
-        assert!(qdrant.search(vec![1.0], 10, None).await.is_err());
+        assert!(
+            qdrant
+                .hybrid_search(&[query(&[1.0], "x")], 10, None)
+                .await
+                .is_err()
+        );
+    }
+
+    fn query(dense: &[f32], text: &str) -> SearchQuery {
+        SearchQuery {
+            dense: dense.to_vec(),
+            sparse: crate::sparse::query_vector(text),
+        }
+    }
+
+    #[test]
+    fn collection_config_names_a_dense_and_an_idf_sparse_vector() {
+        let config = collection_config(1536);
+        assert_eq!(
+            config,
+            serde_json::json!({
+                "vectors": {"dense": {"size": 1536, "distance": "Cosine"}},
+                "sparse_vectors": {"sparse": {"modifier": "idf"}}
+            })
+        );
+        // What Qdrant reports back for it passes the check.
+        assert_eq!(check_collection_params(&config), Ok(()));
+    }
+
+    #[test]
+    fn collections_without_the_hybrid_layout_are_rejected() {
+        let old = serde_json::json!({"vectors": {"size": 1536, "distance": "Cosine"}});
+        assert!(check_collection_params(&old).unwrap_err().contains("dense"));
+        let mut dot = collection_config(3);
+        dot["vectors"]["dense"]["distance"] = "Dot".into();
+        assert!(
+            check_collection_params(&dot)
+                .unwrap_err()
+                .contains("Cosine")
+        );
+        let mut no_sparse = collection_config(3);
+        no_sparse.as_object_mut().unwrap().remove("sparse_vectors");
+        assert!(
+            check_collection_params(&no_sparse)
+                .unwrap_err()
+                .contains("sparse")
+        );
+        let mut no_idf = collection_config(3);
+        no_idf["sparse_vectors"]["sparse"] = serde_json::json!({});
+        assert!(
+            check_collection_params(&no_idf)
+                .unwrap_err()
+                .contains("idf")
+        );
+    }
+
+    #[tokio::test]
+    async fn check_collection_reports_missing_valid_and_old_collections() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let info = |params: serde_json::Value| {
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": {"status": "green", "config": {"params": params}}, "status": "ok"
+            }))
+        };
+        Mock::given(method("GET"))
+            .and(path("/collections/hybrid"))
+            .respond_with(info(collection_config(3)))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/collections/old"))
+            .respond_with(info(
+                serde_json::json!({"vectors": {"size": 3, "distance": "Cosine"}}),
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/collections/missing"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/collections/missing"))
+            .and(wiremock::matchers::body_json(collection_config(3)))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": true, "status": "ok"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let named = |c: &str| {
+            let mut q = mock_qdrant(server.uri());
+            q.collection = c.into();
+            q
+        };
+        assert!(named("hybrid").check_collection().await.unwrap());
+        assert!(!named("missing").check_collection().await.unwrap());
+        named("missing").create_collection(3).await.unwrap();
+        let err = named("old").check_collection().await.unwrap_err();
+        assert!(matches!(err, RagError::IndexingFailed { .. }), "{err:?}");
+        assert!(err.to_string().contains("new"), "{err}");
     }
 
     #[test]
@@ -566,48 +837,94 @@ mod tests {
         assert!(payload.get("Timestamp").unwrap().is_null());
     }
 
+    #[test]
+    fn hybrid_query_prefetches_dense_and_sparse_per_query_with_the_filter() {
+        let filter = serde_json::json!({"must": [{"key": "Service", "match": {"value": "api"}}]});
+        let queries = [
+            query(&[0.5, 0.25], "ERR_CONN_RESET"),
+            query(&[0.125, 0.75], "?"),
+        ];
+        let (body, lists) = hybrid_query_body(&queries, 10, Some(&filter));
+        // The second query has no tokens, so it only searches the dense vector.
+        assert_eq!(lists, 3);
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "prefetch": [
+                    {"query": [0.5, 0.25], "using": "dense", "limit": 10, "filter": filter},
+                    {"query": {"indices": [1695364032u32, 1821864748u32, 2747093051u32, 3560979775u32],
+                               "values": [1.0, 1.0, 1.0, 1.0]},
+                     "using": "sparse", "limit": 10, "filter": filter},
+                    {"query": [0.125, 0.75], "using": "dense", "limit": 10, "filter": filter}
+                ],
+                "query": {"rrf": {"k": 2}},
+                "limit": 10,
+                "with_payload": true
+            })
+        );
+        // Without a filter the prefetches carry none.
+        let (body, lists) = hybrid_query_body(&queries[..1], 5, None);
+        assert_eq!(lists, 2);
+        for p in body["prefetch"].as_array().unwrap() {
+            assert!(p.get("filter").is_none(), "{p}");
+            assert_eq!(p["limit"], 5);
+        }
+    }
+
     #[tokio::test]
-    async fn search_sends_vector_limit_and_filter_and_restores_every_field() {
+    async fn hybrid_search_normalizes_fused_scores_and_restores_every_field() {
         use wiremock::matchers::{body_json, method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let mock_server = MockServer::start().await;
         let filter = serde_json::json!({"must": [{"key": "Service", "match": {"value": "api"}}]});
+        let queries = [
+            query(&[0.5, 0.25], "ERR_CONN_RESET"),
+            query(&[0.125, 0.75], "?"),
+        ];
+        let (body, _) = hybrid_query_body(&queries, 10, Some(&filter));
+        let payload = serde_json::json!({
+            "Title": "Test Document",
+            "Text": "Document content",
+            "SourceUri": "http://example.com",
+            "Service": "api",
+            "Environment": "prod",
+            "id": "doc1#c0",
+            "Timestamp": "2025-01-01T00:00:00Z",
+            "Kind": "sLO",
+            "Metadata": {"chunk_of": "doc1", "chunk_index": 0}
+        });
         Mock::given(method("POST"))
-            .and(path("/collections/test/points/search"))
-            .and(body_json(serde_json::json!({
-                "vector": [0.5, 0.25],
-                "limit": 10,
-                "with_payload": true,
-                "filter": filter
-            })))
+            .and(path("/collections/test/points/query"))
+            .and(body_json(body))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "result": [{
-                    "id": "21aca85b-31bc-5c36-bd5f-32403cb008d2",
-                    "score": 0.95,
-                    "payload": {
-                        "Title": "Test Document",
-                        "Text": "Document content",
-                        "SourceUri": "http://example.com",
-                        "Service": "api",
-                        "Environment": "prod",
-                        "id": "doc1#c0",
-                        "Timestamp": "2025-01-01T00:00:00Z",
-                        "Kind": "sLO",
-                        "Metadata": {"chunk_of": "doc1", "chunk_index": 0}
-                    }
-                }]
+                "result": {"points": [
+                    // First in all three lists: 3 × 1/2.
+                    {"id": "21aca85b-31bc-5c36-bd5f-32403cb008d2", "version": 3, "score": 1.5,
+                     "payload": payload},
+                    // Second in one list: 1/3.
+                    {"id": 7, "version": 1, "score": 0.333_333_34,
+                     "payload": {"Title": "t", "Text": "x", "SourceUri": "u", "Service": "",
+                                 "Environment": "", "id": "other", "Timestamp": null,
+                                 "Kind": "logs"}}
+                ]},
+                "status": "ok"
             })))
             .expect(1)
             .mount(&mock_server)
             .await;
 
         let hits = mock_qdrant(mock_server.uri())
-            .search(vec![0.5, 0.25], 10, Some(filter.clone()))
+            .hybrid_search(&queries, 10, Some(filter.clone()))
             .await
             .unwrap();
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].score, 0.95);
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].score, 1.0);
+        assert!(
+            (hits[1].score - 2.0 / 9.0).abs() < 1e-6,
+            "{}",
+            hits[1].score
+        );
         let doc = &hits[0].doc;
         assert_eq!(doc.id, "doc1#c0");
         assert_eq!(doc.parent_id(), "doc1");
@@ -619,6 +936,13 @@ mod tests {
         assert_eq!(
             (doc.service.as_str(), doc.environment.as_str()),
             ("api", "prod")
+        );
+        // No query at all is a caller bug, never an empty result.
+        assert!(
+            mock_qdrant(mock_server.uri())
+                .hybrid_search(&[], 10, None)
+                .await
+                .is_err()
         );
     }
 
@@ -640,6 +964,13 @@ mod tests {
 
         let doc = contract_document();
         let point = QPoint::from_document(&doc, vec![0.1, 0.2, 0.3]);
+        // The sparse vector as sent: f32 values printed, then read back.
+        let sparse: serde_json::Value = serde_json::from_str(
+            &serde_json::to_string(&crate::sparse::document_vector(&embedding_input(&doc)))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(sparse["indices"].as_array().unwrap().len(), 9);
         mock_qdrant(mock_server.uri())
             .upsert(vec![point])
             .await
@@ -651,7 +982,10 @@ mod tests {
             body,
             serde_json::json!({"points": [{
                 "id": "21aca85b-31bc-5c36-bd5f-32403cb008d2",
-                "vector": [0.1, 0.2, 0.3],
+                "vector": {
+                    "dense": [0.1, 0.2, 0.3],
+                    "sparse": sparse
+                },
                 "payload": {
                     "id": "monitor_123#c0",
                     "Title": "Återkommande fel",
@@ -674,7 +1008,7 @@ mod tests {
 
         let mock_server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/collections/test/points/search"))
+            .and(path("/collections/test/points/query"))
             .respond_with(ResponseTemplate::new(404))
             .mount(&mock_server)
             .await;
@@ -686,7 +1020,10 @@ mod tests {
         let qdrant = mock_qdrant(mock_server.uri());
 
         // A missing collection is a retrieval failure, not "no evidence".
-        let err = qdrant.search(vec![0.1], 10, None).await.unwrap_err();
+        let err = qdrant
+            .hybrid_search(&[query(&[0.1], "x")], 10, None)
+            .await
+            .unwrap_err();
         assert!(matches!(err, RagError::RetrievalFailed { .. }), "{err:?}");
 
         let point = QPoint::from_document(&contract_document(), vec![0.1]);
