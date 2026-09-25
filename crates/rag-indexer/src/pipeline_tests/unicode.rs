@@ -113,7 +113,21 @@ fn corpus() -> Corpus {
                       "message": "Kontrollera e\u{0301}tat 👩\u{200D}💻", "tags": ["service:betalning-åäö", "env:prod"]}],
         "incidents": [{"id": "inc-jp", "type": "incidents", "attributes": {
             "public_id": 7, "title": "決済ゲートウェイ タイムアウト 🚨", "created": "2026-03-11T10:00:00+00:00",
-            "customer_impact_scope": "Kunder i Malmö och Tōkyō", "fields": {}}}],
+            "customer_impact_scope": "Kunder i Malmö och Tōkyō", "fields": {
+                "root_cause": {"type": "textbox", "value": "Grundorsak: e\u{0301}tat 決済 👩\u{200D}💻 ".repeat(40)}
+            }}}],
+        // A timeline and postmortem long enough to span chunks, every entry multibyte.
+        "incidentTimelines": {"inc-jp": (0..30).map(|i| json!({"attributes": {
+            "cell_type": "markdown", "created": format!("2026-03-11T10:{i:02}:00+00:00"),
+            "content": {"content": format!("{i}: {}", UNITS.join(" ").repeat(12))}}})).collect::<Vec<_>>()},
+        "incidentAttachments": {"inc-jp": [{"attributes": {"attachment_type": "postmortem",
+            "attachment": {"title": "事後分析 ✅", "documentUrl": "https://app.datadoghq.eu/notebook/77/pm"}}}]},
+        "notebooks": [{"id": 77, "attributes": {"cells": [{"attributes": {"definition": {
+            "type": "markdown", "text": format!("# Åtgärder\n{}", "Förnya certifikat 🔐 決済. ".repeat(300))}}}]}}],
+        "dashboards": [{"id": "dash-sok", "title": "Sökmotor – översikt 🔎", "description": null,
+            "modified_at": "2026-01-01T00:00:00+00:00", "template_variables": null,
+            "widgets": [{"definition": {"type": "timeseries", "title": "Indexering per sida ⏱ 決済",
+                "requests": [{"q": "avg:search.index.duration{service:Sökmotor-Åäö,env:prod}"}]}}]}],
         "logs": logs
     }))
 }
@@ -146,6 +160,33 @@ async fn run_unicode(store: Store) {
     assert_eq!(
         stored["incident_inc-jp#c0"].doc.title,
         "決済ゲートウェイ タイムアウト 🚨"
+    );
+    // The incident with its multibyte timeline and postmortem spans several chunks that
+    // reassemble to its text; the dashboard's service comes from a multibyte query tag.
+    let mut incident = String::new();
+    for i in 0.. {
+        let Some(c) = stored.get(&format!("incident_inc-jp#c{i}")) else {
+            break;
+        };
+        let skip = if i == 0 { 0 } else { CHUNK_OVERLAP };
+        incident.extend(c.doc.text.chars().skip(skip));
+    }
+    assert!(stored.contains_key("incident_inc-jp#c3"));
+    assert!(incident.contains("Postmortem: 事後分析 ✅\n# Åtgärder"));
+    assert!(
+        incident.contains("- 2026-03-11T10:17:00+00:00: 17: åäö"),
+        "{incident}"
+    );
+    // The timeline is cut at its byte budget, on a character boundary.
+    assert!(
+        incident.ends_with(rag_core::text::TRUNCATION_MARKER),
+        "{incident}"
+    );
+    let dash = &stored["dashboard_dash-sok#c0"].doc;
+    assert_eq!(dash.service, "sökmotor-åäö");
+    assert!(
+        dash.text
+            .contains("- Indexering per sida ⏱ 決済: avg:search.index.duration")
     );
 
     // Chunks respect the size limit and reassemble to the document text, whose sample

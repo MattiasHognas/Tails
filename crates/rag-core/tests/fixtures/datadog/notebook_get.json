@@ -1,0 +1,44 @@
+{
+  "data": {
+    "type": "notebooks",
+    "id": 2466033,
+    "attributes": {
+      "name": "Test-Get_a_notebook_returns_OK_response-1652349008",
+      "cells": [
+        {
+          "attributes": {
+            "definition": {
+              "text": "# Test-Get_a_notebook_returns_OK_response-1652349008 notebook text",
+              "type": "markdown"
+            }
+          },
+          "type": "notebook_cells",
+          "id": "hzy6fag9"
+        }
+      ],
+      "time": {
+        "live_span": "1h"
+      },
+      "metadata": {
+        "is_favorite": false,
+        "is_template": false,
+        "type": null,
+        "take_snapshots": false
+      },
+      "template_variables": [],
+      "status": "published",
+      "modified": "2022-05-12T09:50:08.997931+00:00",
+      "created": "2022-05-12T09:50:08.997931+00:00",
+      "author": {
+        "name": null,
+        "handle": "frog@datadoghq.com",
+        "email": "frog@datadoghq.com",
+        "icon": "https://secure.gravatar.com/avatar/28a16dfe36e73b60c1d55872cb0f1172?s=48&d=retro",
+        "title": null,
+        "verified": true,
+        "disabled": false,
+        "status": "Active"
+      }
+    }
+  }
+}

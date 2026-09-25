@@ -1,7 +1,8 @@
 //! A fake Datadog API serving a corpus in the shape of real responses, so the real
-//! adapters (`rag_core::datadog`) parse it: monitors, dashboards, SLOs, metrics,
-//! incidents and logs, each with the pagination the adapter follows, plus the live
-//! time-series and log queries of `/ask`.
+//! adapters (`rag_core::datadog`) parse it: monitors, dashboards (list and definition),
+//! SLOs, metrics, incidents (search, timeline, attachments and postmortem notebooks) and
+//! logs, each with the pagination the adapter follows, plus the live time-series and log
+//! queries of `/ask`.
 
 use chrono::{DateTime, Duration, Utc};
 use rag_core::datadog::Datadog;
@@ -25,6 +26,49 @@ pub struct Corpus {
     pub incidents: Vec<Value>,
     /// Log events (`{"id", "type": "log", "attributes": {...}}`).
     pub logs: Vec<Value>,
+    /// Timeline cells per incident ID (`GET /api/v2/incidents/{id}/timeline`).
+    pub incident_timelines: HashMap<String, Vec<Value>>,
+    /// Attachments per incident ID (`GET /api/v2/incidents/{id}/attachments`).
+    pub incident_attachments: HashMap<String, Vec<Value>>,
+    /// Notebooks (the `data` of `GET /api/v1/notebooks/{id}`).
+    pub notebooks: Vec<Value>,
+    /// Incident IDs whose timeline and attachment requests fail with a 500.
+    pub failing_incident_details: Vec<String>,
+}
+
+/// The keys of a dashboard list entry; the rest of a corpus dashboard (widgets, template
+/// variables) is only returned by `GET /api/v1/dashboard/{id}`.
+const DASHBOARD_SUMMARY_KEYS: [&str; 10] = [
+    "id",
+    "title",
+    "description",
+    "layout_type",
+    "url",
+    "is_read_only",
+    "created_at",
+    "modified_at",
+    "author_handle",
+    "deleted_at",
+];
+
+fn dashboard_summary(d: &Value) -> Value {
+    let mut out = serde_json::Map::new();
+    for k in DASHBOARD_SUMMARY_KEYS {
+        if let Some(v) = d.get(k) {
+            out.insert(k.to_string(), v.clone());
+        }
+    }
+    Value::Object(out)
+}
+
+fn by_incident(v: &Value) -> HashMap<String, Vec<Value>> {
+    v.as_object()
+        .map(|m| {
+            m.iter()
+                .map(|(k, v)| (k.clone(), v.as_array().cloned().unwrap_or_default()))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 pub fn fixture_dir() -> PathBuf {
@@ -50,9 +94,11 @@ impl Corpus {
             .iter()
             .flat_map(|p| array(&f(p)["data"]))
             .collect();
+        let mut dashboards = array(&f("dashboards.json")["dashboards"]);
+        dashboards.push(f("dashboard_get.json"));
         Self {
             monitors: array(&f("monitors.json")),
-            dashboards: array(&f("dashboards.json")["dashboards"]),
+            dashboards,
             slos: array(&f("slos.json")["data"]),
             metrics: array(&f("metrics.json")["metrics"])
                 .iter()
@@ -60,12 +106,14 @@ impl Corpus {
                 .collect(),
             incidents,
             logs,
+            ..Self::default()
         }
     }
 
     /// A corpus file with the same top-level keys (see
     /// `tests/incident_questions/corpus.json`), plus `logBursts`: runs of near-identical
-    /// logs, expanded by [`expand_burst`] and appended to `logs`.
+    /// logs, expanded by [`expand_burst`] and appended to `logs`; `incidentTimelines` and
+    /// `incidentAttachments` (per incident ID) and `notebooks`.
     pub fn from_json(v: &Value) -> Self {
         let array = |k: &str| v[k].as_array().cloned().unwrap_or_default();
         let mut logs = array("logs");
@@ -80,6 +128,10 @@ impl Corpus {
                 .collect(),
             incidents: array("incidents"),
             logs,
+            incident_timelines: by_incident(&v["incidentTimelines"]),
+            incident_attachments: by_incident(&v["incidentAttachments"]),
+            notebooks: array("notebooks"),
+            failing_incident_details: vec![],
         }
     }
 
@@ -106,6 +158,11 @@ impl Corpus {
         self.metrics.extend(other.metrics);
         self.incidents.extend(other.incidents);
         self.logs.extend(other.logs);
+        self.incident_timelines.extend(other.incident_timelines);
+        self.incident_attachments.extend(other.incident_attachments);
+        self.notebooks.extend(other.notebooks);
+        self.failing_incident_details
+            .extend(other.failing_incident_details);
     }
 }
 
@@ -183,7 +240,42 @@ impl IndexApi {
                     param(req, "start").ok_or("start")?,
                     param(req, "count").ok_or("count")?,
                 );
-                json(json!({"dashboards": page(&c.dashboards, start, count)}))
+                let summaries: Vec<Value> = page(&c.dashboards, start, count)
+                    .iter()
+                    .map(dashboard_summary)
+                    .collect();
+                json(json!({"dashboards": summaries}))
+            }
+            ("GET", p) if p.starts_with("/api/v1/dashboard/") => {
+                let id = &p["/api/v1/dashboard/".len()..];
+                match c.dashboards.iter().find(|d| d["id"] == id) {
+                    Some(d) => json(d.clone()),
+                    None => Ok(ResponseTemplate::new(404)),
+                }
+            }
+            ("GET", p) if p.starts_with("/api/v1/notebooks/") => {
+                let id: u64 = p["/api/v1/notebooks/".len()..]
+                    .parse()
+                    .map_err(|_| "notebook id")?;
+                match c.notebooks.iter().find(|n| n["id"] == id) {
+                    Some(n) => json(json!({"data": n})),
+                    None => Ok(ResponseTemplate::new(404)),
+                }
+            }
+            ("GET", p)
+                if p.starts_with("/api/v2/incidents/") && p != "/api/v2/incidents/search" =>
+            {
+                let rest = &p["/api/v2/incidents/".len()..];
+                let (id, what) = rest.split_once('/').ok_or("incident sub-resource")?;
+                if c.failing_incident_details.iter().any(|f| f == id) {
+                    return Ok(ResponseTemplate::new(500));
+                }
+                let items = match what {
+                    "timeline" => c.incident_timelines.get(id),
+                    "attachments" => c.incident_attachments.get(id),
+                    _ => return Err(format!("unsupported incident resource {what}")),
+                };
+                json(json!({"data": items.cloned().unwrap_or_default()}))
             }
             ("GET", "/api/v1/slo") => {
                 let (offset, limit) = (

@@ -1,0 +1,51 @@
+{
+  "data": [
+    {
+      "id": "00000000-0000-0000-0000-00000000c001",
+      "type": "incident_timeline_cells",
+      "attributes": {
+        "cell_type": "markdown",
+        "content": {
+          "content": "Rolled back checkout-api to v2.14.1; p95 recovering."
+        },
+        "important": true,
+        "created": "2026-03-11T10:40:00+00:00",
+        "display_time": "2026-03-11T10:40:00+00:00"
+      }
+    },
+    {
+      "id": "00000000-0000-0000-0000-00000000c000",
+      "type": "incident_timeline_cells",
+      "attributes": {
+        "cell_type": "markdown",
+        "content": {
+          "content": "Paged the payments team: card authorisations timing out at the bank gateway."
+        },
+        "important": false,
+        "created": "2026-03-11T10:12:00+00:00"
+      }
+    },
+    {
+      "id": "00000000-0000-0000-0000-00000000c002",
+      "type": "incident_timeline_cells",
+      "attributes": {
+        "cell_type": "incident_status_change",
+        "content": {
+          "message": "Status changed from active to stable"
+        },
+        "created": "2026-03-11T10:45:00+00:00"
+      }
+    },
+    {
+      "id": "00000000-0000-0000-0000-00000000c003",
+      "type": "incident_timeline_cells",
+      "attributes": {
+        "cell_type": "markdown",
+        "content": {
+          "content": "   "
+        },
+        "created": "2026-03-11T10:46:00+00:00"
+      }
+    }
+  ]
+}
