@@ -9,6 +9,11 @@ on:
 permissions:
   contents: read
 
+# A newer push to the same PR or branch makes the older run pointless.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -22,23 +27,25 @@ jobs:
 
     env:
       QDRANT_TEST_ENDPOINT: http://localhost:6333
+      # Coverage needs no debuginfo; full debuginfo only slows linking and bloats the cache.
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
 
     steps:
     - uses: actions/checkout@v7
 
+    # rust-toolchain.toml selects stable, so that is what cargo runs; installing any other
+    # version here would only be downloaded and never used.
     - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@stable
       with:
-        toolchain: 1.90
-        components: rustfmt, clippy
+        components: rustfmt, clippy, llvm-tools-preview
 
+    # Only main saves: PR runs restore main's cache, and per-PR caches would otherwise
+    # fill the repository's 10 GB cache quota and evict main's.
     - name: Cache cargo dependencies
       uses: Swatinem/rust-cache@v2
       with:
-        cache-all-crates: true
-
-    - name: Build release binaries
-      run: cargo build --workspace --release --locked
+        save-if: ${{ github.ref == 'refs/heads/main' }}
 
     - name: Install cargo-llvm-cov
       uses: taiki-e/install-action@v2
@@ -61,14 +68,16 @@ jobs:
         exit 1
 
     - name: Test against real Qdrant
-      run: cargo llvm-cov --package rag-core --test qdrant_roundtrip --all-features --locked --no-report -- --ignored
+      # --workspace with a target filter (not --package) keeps the feature set of the step
+      # above, so nothing is rebuilt.
+      run: cargo llvm-cov --workspace --test qdrant_roundtrip --all-features --locked --no-report -- --ignored
 
     # Indexer writer -> Qdrant -> /ask reader, including the incident question set, and
     # the fake Qdrant's hybrid query scores checked against the real one.
     # Each test is named exactly; the opt-in OpenAI variant is never selected.
     - name: Test the pipeline against real Qdrant
       run: >-
-        cargo llvm-cov --package rag-indexer --bin rag-indexer --all-features --locked --no-report --
+        cargo llvm-cov --workspace --bin rag-indexer --all-features --locked --no-report --
         --ignored --exact
         pipeline_tests::contract::pipeline_contract_real_qdrant
         pipeline_tests::unicode::unicode_round_trip_real_qdrant
@@ -130,12 +139,13 @@ jobs:
     - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@stable
       with:
-        toolchain: 1.90
+        components: rustfmt, clippy
 
     - name: Cache cargo dependencies
       uses: Swatinem/rust-cache@v2
       with:
         shared-key: e2e
+        save-if: ${{ github.ref == 'refs/heads/main' }}
 
     - name: Build release binaries
       run: cargo build --workspace --release --locked
